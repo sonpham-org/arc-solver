@@ -2,7 +2,6 @@
 
 import json
 
-
 intro = """
 Explain the ARC Challenge in one sentence.
 """
@@ -94,19 +93,75 @@ Return a single JSON object with these fields:
     "2) ..."
   ],
   "pseudocode": "Concise pseudocode representation of the transformation.",
-  "self_check": [
-    "✔ Works on all training pairs.",
-    "✔ Uses roles, not absolute values.",
-    "✔ Defines tie-breaking rules.",
-    "✔ Likely to generalize."
-  ],
 }}
 
 ====================
 Final instruction
 ====================
 Analyze all training pairs together. Identify the invariant transformation pattern.
-Return ONLY the JSON object described above — nothing else.
+Shows your reasoning step-by-step. and at the end, provide the JSON object as specified above
+inside a <json>...</json> block.
     """.strip()
 
     return prompt
+
+
+def build_apply_prompt(final_json: dict, task: dict, task_id: str, include_examples: bool = True) -> str:
+  """Build an APPLY_PROMPT that instructs the LLM to apply the extracted rule
+  to the task's test input(s).
+
+  final_json: parsed JSON produced by the model (dict with rule_summary, step_by_step_rule, pseudocode)
+  task: the ARC task dict containing 'train' and 'test'
+  task_id: the id string
+  """
+  rule_summary = final_json.get("rule_summary", "")
+  step_by_step = final_json.get("step_by_step_rule", [])
+  pseudocode = final_json.get("pseudocode", final_json.get("pseudocode", ""))
+
+  # Format training examples
+  formatted_examples = []
+  if include_examples:
+    for i, ex in enumerate(task.get("train", []), start=1):
+      inp = "\n".join(" ".join(map(str, row)) for row in ex["input"]) if "input" in ex else ""
+      out = "\n".join(" ".join(map(str, row)) for row in ex["output"]) if "output" in ex else ""
+      formatted_examples.append(f"Training Example {i}\nInput:\n{inp}\n\nOutput:\n{out}\n")
+
+  examples_block = "\n".join(formatted_examples)
+
+  # Single test input block
+  tests = task.get("test", [])
+  formatted_tests = []
+  for i, t in enumerate(tests, start=1):
+    inp = "\n".join(" ".join(map(str, row)) for row in t.get("input", []))
+    formatted_tests.append(f"Test Input {i}:\n{inp}\n")
+
+  apply_prompt = f"""
+You are an expert ARC executor.
+
+Below is a concise rule summary, a step-by-step rule, and pseudocode derived from analyzing the training examples for task {task_id}.
+
+Rule summary:
+{rule_summary}
+
+Step-by-step rule:
+{chr(10).join(step_by_step)}
+
+Pseudocode:
+{pseudocode}
+
+Training examples (all):
+{examples_block}
+
+Test inputs:
+{chr(10).join(formatted_tests)}
+
+Instructions:
+1) Apply the above rule EXACTLY, line by line, to each test input.
+2) Show your intermediate reasoning while applying the rule for each test input.
+3) When you produce the final answer for each test input, include ONLY the output grid inside a single pair of tags: <output>...</output>
+4) Do not include any other text outside the <output> tags for the final answer.
+
+Return the reasoning and the final <output> block for each test input.
+""".strip()
+
+  return apply_prompt

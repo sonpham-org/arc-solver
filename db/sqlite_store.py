@@ -23,6 +23,10 @@ CREATE TABLE IF NOT EXISTS responses (
     challenges TEXT,
     solutions TEXT,
     challenge_id TEXT,
+    json_index INTEGER,
+    run_name TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
     apply_output TEXT,
     score_train REAL,
     score_test REAL,
@@ -70,6 +74,54 @@ def init_db():
         if 'prompt_hash' not in cols:
             cur.execute("ALTER TABLE responses ADD COLUMN prompt_hash TEXT")
             conn.commit()
+        if 'run_name' not in cols:
+            cur.execute("ALTER TABLE responses ADD COLUMN run_name TEXT")
+            conn.commit()
+        if 'input_tokens' not in cols:
+            cur.execute("ALTER TABLE responses ADD COLUMN input_tokens INTEGER")
+            conn.commit()
+        if 'output_tokens' not in cols:
+            cur.execute("ALTER TABLE responses ADD COLUMN output_tokens INTEGER")
+            conn.commit()
+        if 'cost_estimate' not in cols:
+            cur.execute("ALTER TABLE responses ADD COLUMN cost_estimate REAL")
+            conn.commit()
+        if 'train_scores' not in cols:
+            cur.execute("ALTER TABLE responses ADD COLUMN train_scores TEXT")
+            conn.commit()
+        if 'json_index' not in cols:
+            cur.execute("ALTER TABLE responses ADD COLUMN json_index INTEGER")
+            conn.commit()
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_response_add_cost(response_id: int, additional_cost: float):
+    """Add additional_cost (USD) to the cost_estimate for a response row."""
+    _ensure_dir()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE responses SET cost_estimate = COALESCE(cost_estimate, 0) + ? WHERE id = ?",
+            (float(additional_cost), response_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_response_train_scores(response_id: int, train_scores_json: str):
+    """Store a JSON string containing the list of per-training-example scores."""
+    _ensure_dir()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE responses SET train_scores = ? WHERE id = ?",
+            (train_scores_json, response_id),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -85,9 +137,13 @@ def insert_response(
     challenge_id: Optional[str],
     score_train: Optional[float],
     score_test: Optional[float],
-    tokens: Optional[int],
-    cost_estimate: Optional[float],
+    cost_estimate: Optional[float] = None,
+    tokens: Optional[int] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    run_name: Optional[str] = None,
     timestamp: Optional[str] = None,
+    json_index: Optional[int] = None,
 ):
     """Insert a response record into the DB.
 
@@ -103,8 +159,8 @@ def insert_response(
         cur.execute(
             """
             INSERT INTO responses
-            (timestamp, model_name, prompt_hash, reasoning, final_json, challenges, solutions, challenge_id, score_train, score_test, tokens, cost_estimate)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (timestamp, model_name, prompt_hash, reasoning, final_json, challenges, solutions, challenge_id, json_index, run_name, input_tokens, output_tokens, score_test, tokens, cost_estimate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 timestamp,
@@ -115,7 +171,10 @@ def insert_response(
                 challenges,
                 solutions,
                 challenge_id,
-                score_train,
+                json_index,
+                run_name,
+                input_tokens,
+                output_tokens,
                 score_test,
                 tokens,
                 cost_estimate,
@@ -145,15 +204,30 @@ def insert_prompt(hash_value: str, prompt_text: str, created_at: Optional[str] =
         conn.close()
 
 
-def update_response_scores(response_id: int, score_train: Optional[float], score_test: Optional[float]):
-    """Update score_train and score_test for an existing response row."""
+def update_response_scores(response_id: int, score_test: Optional[float]):
+    """Update score_test for an existing response row."""
     _ensure_dir()
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE responses SET score_train = ?, score_test = ? WHERE id = ?",
-            (score_train, score_test, response_id),
+            "UPDATE responses SET score_test = ? WHERE id = ?",
+            (score_test, response_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_response_train_score(response_id: int, score_train: Optional[float]):
+    """Update score_train for an existing response row."""
+    _ensure_dir()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE responses SET score_train = ? WHERE id = ?",
+            (score_train, response_id),
         )
         conn.commit()
     finally:
@@ -166,8 +240,9 @@ def update_response_tokens(response_id: int, extra_tokens: int):
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
+        # increment output_tokens specifically (newer schema)
         cur.execute(
-            "UPDATE responses SET tokens = COALESCE(tokens, 0) + ? WHERE id = ?",
+            "UPDATE responses SET output_tokens = COALESCE(output_tokens, 0) + ? WHERE id = ?",
             (extra_tokens, response_id),
         )
         conn.commit()

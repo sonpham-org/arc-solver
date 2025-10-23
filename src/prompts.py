@@ -165,3 +165,114 @@ Return the reasoning and the final <output> block for each test input.
 """.strip()
 
   return apply_prompt
+
+
+def build_reflection_prompt(final_json: dict, wrong_cases: list, model_outputs: list, task: dict = None, task_id: str = "") -> str:
+  """Build a REFLECTION prompt that asks the LLM to introspect on failures and
+  produce an improved `final_json` (rule_summary, step_by_step_rule, pseudocode).
+
+  Args:
+    final_json: dict produced previously with keys 'rule_summary',
+      'step_by_step_rule', and 'pseudocode'.
+    wrong_cases: list of tuples (input_grid, expected_output_grid) that the
+      model got wrong when applying the rule.
+    model_outputs: list of grids (or stringified grids) that the model actually
+      produced for the corresponding wrong_cases.
+    task: optional full task dict (with 'train' and 'test') for context.
+    task_id: optional task id string for inclusion in the prompt.
+
+  Returns:
+    A string prompt instructing the LLM to analyze, reflect, and produce a
+    revised JSON `final_json` that corrects the observed failures.
+  """
+
+  # Defensive defaults
+  rule_summary = final_json.get("rule_summary", "")
+  step_by_step = final_json.get("step_by_step_rule", [])
+  pseudocode = final_json.get("pseudocode", "")
+
+  # Format wrong cases
+  formatted_wrong = []
+  for i, (inp, expected) in enumerate(wrong_cases, start=1):
+    inp_str = "\n".join(" ".join(map(str, row)) for row in inp) if inp else ""
+    exp_str = "\n".join(" ".join(map(str, row)) for row in expected) if expected else ""
+    model_out = model_outputs[i-1] if i-1 < len(model_outputs) else None
+    model_out_str = "\n".join(" ".join(map(str, row)) for row in model_out) if isinstance(model_out, list) else str(model_out)
+    formatted_wrong.append(
+      f"Case {i}\n--\nInput:\n{inp_str}\n\nExpected Output:\n{exp_str}\n\nModel Output:\n{model_out_str}\n"
+    )
+
+  wrong_block = "\n\n".join(formatted_wrong)
+
+  # Optional training examples for context
+  examples_block = ""
+  if task and task.get("train"):
+    formatted_examples = []
+    for i, ex in enumerate(task.get("train", []), start=1):
+      inp = "\n".join(" ".join(map(str, row)) for row in ex.get("input", []))
+      out = "\n".join(" ".join(map(str, row)) for row in ex.get("output", []))
+      formatted_examples.append(f"Training Example {i}\nInput:\n{inp}\n\nOutput:\n{out}\n")
+    examples_block = "\n".join(formatted_examples)
+
+  prompt = f"""
+You are a meticulous ARC reasoning assistant with the goal of improving your own
+instruction (the JSON rule) after observing failures.
+
+Context:
+Task ID: {task_id}
+
+Current extracted instruction (the JSON produced earlier):
+Rule summary:
+{rule_summary}
+
+Step-by-step rule:
+{chr(10).join(step_by_step)}
+
+Pseudocode:
+{pseudocode}
+
+Observed failures (cases where your instruction produced an incorrect output):
+{wrong_block}
+
+Instructions for reflection and revision:
+1) For each failure case above, analyze step-by-step how the current
+   Step-by-step rule and Pseudocode would be applied to the Input. Show the
+   exact intermediate steps and where they diverge from the Expected Output.
+2) For each case, explicitly state which assumption, omission, or tie-breaker
+   in the current rule caused the incorrect Model Output. Be concrete (e.g.,
+   "rule assumed background was color X", or "pseudocode filled only single
+   objects instead of grouped objects").
+3) Propose one concise change to the Step-by-step rule or pseudocode that would
+   fix that specific failure. Keep changes minimal and general (no dataset
+   memorization). Show the revised step(s) only for each case.
+4) After analyzing all failure cases, merge the per-case fixes into a single
+   improved JSON instruction. The new JSON must have the same schema as before:
+
+   {{
+     "rule_summary": "2-4 sentences",
+     "step_by_step_rule": ["1) ...","2) ..."],
+     "pseudocode": "concise pseudocode"
+   }}
+
+5) In the new JSON, highlight (inline, in the pseudocode or an added comment)
+   which of the proposed fixes correspond to which failure case numbers.
+6) Ensure the new JSON is general, deterministic, and includes tie-breakers
+   for ambiguous choices.
+7) Finally, for verification, apply the new JSON (conceptually) to each
+   previously-wrong Input and show the expected Output grid produced by the
+   revised rule. If any case still fails, explain why and propose further
+   modification.
+
+Return format (strict):
+1) Your step-by-step reflection and analysis for each failure case.
+2) The final improved JSON object inside a single <json>...</json> block.
+3) After the JSON, for each wrong case, a small block showing the expected
+   output if the new JSON were applied, inside <output_case_i>...</output_case_i>
+   tags (replace i with the case number). Do not include extra text outside
+   these required sections.
+
+Be concise but thorough. Focus on fixable rule-level changes rather than
+ ad-hoc exceptions.
+""".strip()
+
+  return prompt

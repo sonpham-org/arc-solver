@@ -14,11 +14,16 @@ import argparse
 import prompts
 from typing import Tuple
 import asyncio
+import threading
+import signal
+import atexit
+import time
 from dotenv import dotenv_values
 
 # local DB helper
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from db import sqlite_store
+from db_writer import enqueue as db_enqueue, get_global_writer
 
 # Ensure the package's src/ directory is importable when running this file as
 # a script (python src/main.py). This inserts the file's directory onto
@@ -54,14 +59,35 @@ def build_model(model_name: str):
         print(f"Warning: model '{model_name}' is not in model_configs registry")
     return genai.GenerativeModel(model_name)
 
+def _with_retries(func, *args, retries: int = 3, backoff: float = 0.5, **kwargs):
+    """Simple retry/backoff wrapper for synchronous functions.
+
+    Returns the function's return value or raises the last exception.
+    """
+    last_exc = None
+    delay = backoff
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            time.sleep(delay)
+            delay *= 2
+    # final attempt
+    return func(*args, **kwargs)
+
+
 def query_gemini(prompt: str) -> str:
     """Send prompt to Gemini and return the response text.
 
-    Note: the underlying client is synchronous, so callers should run this
-    inside a thread via asyncio.to_thread when used from async code.
+    Note: the underlying client is synchronous. This wrapper adds a small
+    retry/backoff policy. Callers should run this inside a thread via
+    asyncio.to_thread when used from async code.
     """
-    response = model.generate_content(prompt)
-    return response.text.strip()
+    response = _with_retries(model.generate_content, prompt)
+    # depending on SDK, response may be string-like or an object with .text
+    text = getattr(response, "text", response)
+    return text.strip()
 
 
 def _extract_trailing_json(text: str) -> Tuple[str, str]:
@@ -135,13 +161,25 @@ def _estimate_tokens(text: str) -> int:
     """Rough token estimate: split on whitespace and punctuation. This is
     not precise but good for tracking relative costs.
     """
-    import re
+    # Prefer exact tokenizer if available (tiktoken). Fallback to a quick
+    # heuristic if not installed.
+    try:
+        import tiktoken
 
-    if not text:
-        return 0
-    # count words as proxy for tokens
-    words = re.findall(r"\w+", text)
-    return max(1, len(words))
+        # choose an encoding compatible enough; if model name is known we
+        # could map model -> encoding. Using cl100k_base as a reasonable
+        # default for many models.
+        enc = tiktoken.get_encoding("cl100k_base")
+        if not text:
+            return 0
+        return max(1, len(enc.encode(text)))
+    except Exception:
+        import re
+
+        if not text:
+            return 0
+        words = re.findall(r"\w+", text)
+        return max(1, len(words))
 
 async def _process_task(tid: str, challenges: dict, challenges_path: str, selected_model_name: str, solutions_path: str, sem: asyncio.Semaphore, run_name: str = None, run_timestamp: str = None, num_initial_generations: int = 1):
     """Process a single task id: build prompt, query model, store results and optionally run apply prompt.
@@ -157,14 +195,28 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
             print(f"Error building prompt for {tid}: {e}")
             return
 
+        start_build = time.perf_counter()
         print(f"\n🧩 Built prompt for task {tid}:\n")
         print(prompt)
+        build_dur = time.perf_counter() - start_build
+        print(f"(prompt build time: {build_dur:.3f}s)")
 
-        # Send to Gemini n times
-        for i in range(num_initial_generations):
+    # track simple per-task metrics to report back to the runner
+    task_model_calls = 0
+    task_input_tokens = 0
+    task_output_tokens = 0
+    task_start_time = time.perf_counter()
+
+    # Send to Gemini n times
+    for i in range(num_initial_generations):
+            # call model (synchronous SDK call wrapped in a thread)
             try:
+                t0 = time.perf_counter()
                 text = await asyncio.to_thread(query_gemini, prompt)
                 text = text.strip()
+                call_dur = time.perf_counter() - t0
+                print(f"(model call time: {call_dur:.3f}s)")
+                task_model_calls += 1
             except Exception as e:
                 print(f"Error querying Gemini for {tid} generation {i}: {e}")
                 continue
@@ -179,12 +231,27 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                 output_tokens = _estimate_tokens(text)
                 # estimate input tokens from the prompt
                 input_tokens = _estimate_tokens(prompt)
+                task_input_tokens += int(input_tokens or 0)
+                task_output_tokens += int(output_tokens or 0)
                 import hashlib
 
                 prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
                 try:
-                    # insert prompt and response in thread to avoid blocking the event loop
-                    await asyncio.to_thread(sqlite_store.insert_prompt, prompt_hash, prompt)
+                    # avoid duplicate prompt inserts by enqueuing only if
+                    # it hasn't been enqueued/inserted before. We keep a
+                    # small in-memory cache to avoid redundant writes.
+                    if not hasattr(_process_task, "_prompt_cache"):
+                        _process_task._prompt_cache = set()
+                        _process_task._prompt_cache_lock = threading.Lock()
+
+                    with _process_task._prompt_cache_lock:
+                        if prompt_hash not in _process_task._prompt_cache:
+                            _process_task._prompt_cache.add(prompt_hash)
+                            # enqueue a non-blocking insert
+                            try:
+                                db_enqueue("insert_prompt", prompt_hash, prompt)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -194,7 +261,7 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                 except Exception:
                     cost_est = None
 
-                # insert response and capture row id
+                # insert response synchronously (we need the returned id)
                 try:
                     rid = await asyncio.to_thread(
                         sqlite_store.insert_response,
@@ -224,6 +291,10 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                 rid = None
 
             # If we have a parsed final_json and a solutions file, build APPLY_PROMPT
+            # Only attempt the expensive "apply" flow if we found final_json
+            # and there is a solutions file. Also gate by a simple
+            # heuristic (if parsed confidence >= 0.5 when available) to
+            # reduce wasted model calls.
             if final_json and solutions_path:
                 try:
                     parsed = __import__("json").loads(final_json)
@@ -238,8 +309,25 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                         print(f"Warning: failed to load solutions file: {e}")
                         solutions = {}
 
+                    # heuristic: prefer to run apply only when the parsed
+                    # object signals confidence, or when the response size is
+                    # not huge.
+                    run_apply = False
                     try:
-                        # First: apply the extracted rule to each training example (no examples included in prompt)
+                        if isinstance(parsed.get("confidence", None), (int, float)):
+                            run_apply = parsed.get("confidence") >= 0.5
+                    except Exception:
+                        run_apply = False
+                    if not run_apply:
+                        # fallback: don't run apply for very large responses
+                        run_apply = _estimate_tokens(text) < 1200
+
+                    if not run_apply:
+                        # skip apply for this response
+                        continue
+
+                    # First: apply the extracted rule to each training example (no examples included in prompt)
+                    try:
                         train_scores = []
                         train_examples = challenges[tid].get("train", [])
                         for j, ex in enumerate(train_examples):
@@ -248,7 +336,11 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                 apply_prompt_train = prompts.build_apply_prompt(parsed, {"train": [ex], "test": []}, tid, include_examples=False)
                                 apply_resp_train = await asyncio.to_thread(query_gemini, apply_prompt_train)
                                 apply_text_train = apply_resp_train
-                            except Exception as e:
+                                # metrics for this apply call
+                                task_model_calls += 1
+                                task_input_tokens += _estimate_tokens(apply_prompt_train) or 0
+                                task_output_tokens += _estimate_tokens(apply_text_train) or 0
+                            except Exception:
                                 apply_text_train = None
 
                             score_train_example = 0.0
@@ -304,17 +396,27 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                             import json as _json
                             train_scores_json = _json.dumps(train_scores)
                             if rid:
-                                await asyncio.to_thread(sqlite_store.update_response_train_scores, rid, train_scores_json)
-                                # update aggregate mean
-                                mean_train = sum(train_scores) / len(train_scores) if train_scores else 0.0
-                                await asyncio.to_thread(sqlite_store.update_response_train_score, rid, float(mean_train))
+                                # these are non-critical updates; enqueue them to the
+                                # background DB writer rather than blocking the event loop.
+                                try:
+                                    db_enqueue("update_response_train_scores", rid, train_scores_json)
+                                    mean_train = sum(train_scores) / len(train_scores) if train_scores else 0.0
+                                    db_enqueue("update_response_train_score", rid, float(mean_train))
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
 
                         # Now run apply on the test inputs as before
                         apply_prompt = prompts.build_apply_prompt(parsed, challenges[tid], tid)
+                        t_apply0 = time.perf_counter()
                         apply_resp_text = await asyncio.to_thread(query_gemini, apply_prompt)
                         apply_text = apply_resp_text
+                        # metrics for apply
+                        task_model_calls += 1
+                        task_input_tokens += _estimate_tokens(apply_prompt) or 0
+                        task_output_tokens += _estimate_tokens(apply_text) or 0
+                        print(f"(apply call time: {time.perf_counter() - t_apply0:.3f}s)")
                         print(f"=== Apply Response {i} ===\n")
                         print(apply_text)
                     except Exception as e:
@@ -386,19 +488,22 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                 row = cur.fetchone()
                                 if row:
                                     rid = row[0]
-                                    await asyncio.to_thread(sqlite_store.update_response_scores, rid, float(score))
+                                    # non-critical updates: enqueue
+                                    try:
+                                        db_enqueue("update_response_scores", rid, float(score))
+                                    except Exception:
+                                        pass
                                     try:
                                         if parsed_out is not None:
                                             import json as _json
-
-                                            await asyncio.to_thread(sqlite_store.update_response_apply_output, rid, _json.dumps(parsed_out))
+                                            db_enqueue("update_response_apply_output", rid, _json.dumps(parsed_out))
                                     except Exception:
                                         pass
                                 conn.close()
                                 if apply_text and row:
                                     apply_tokens = _estimate_tokens(apply_text)
                                     try:
-                                        await asyncio.to_thread(sqlite_store.update_response_tokens, rid, apply_tokens)
+                                        db_enqueue("update_response_tokens", rid, apply_tokens)
                                     except Exception:
                                         pass
                                     try:
@@ -407,11 +512,21 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                             apply_cost = model_configs.estimate_cost(selected_model_name, input_tokens=0, output_tokens=apply_tokens)
                                         except Exception:
                                             apply_cost = 0.0
-                                        await asyncio.to_thread(sqlite_store.update_response_add_cost, rid, float(apply_cost))
+                                        db_enqueue("update_response_add_cost", rid, float(apply_cost))
                                     except Exception:
                                         pass
                             except Exception as e:
                                 print(f"Warning: failed to update scores for {tid} generation {i}: {e}")
+
+                task_duration = time.perf_counter() - task_start_time
+                # return simple metrics for aggregation by the caller
+                return {
+                    "task_id": tid,
+                    "duration": task_duration,
+                    "model_calls": int(task_model_calls),
+                    "input_tokens": int(task_input_tokens),
+                    "output_tokens": int(task_output_tokens),
+                }
 
 
 def _gather_task_ids(challenges: dict, limit: int | None):
@@ -512,6 +627,27 @@ if __name__ == "__main__":
         sqlite_store.init_db()
     except Exception as e:
         print(f"Warning: failed to initialize DB: {e}")
+    # start background DB writer so enqueue() calls have a running worker
+    try:
+        get_global_writer()
+    except Exception:
+        pass
+
+    # ensure graceful shutdown flushes queued DB writes
+    def _graceful_shutdown(*_args):
+        try:
+            w = get_global_writer()
+            w.stop_and_flush()
+        except Exception:
+            pass
+
+    atexit.register(_graceful_shutdown)
+    try:
+        signal.signal(signal.SIGINT, lambda *_: _graceful_shutdown())
+        signal.signal(signal.SIGTERM, lambda *_: _graceful_shutdown())
+    except Exception:
+        # signal may not be available on some platforms (or when running in certain environments)
+        pass
 
     # Load challenges json
     try:

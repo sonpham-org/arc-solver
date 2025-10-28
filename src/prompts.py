@@ -50,6 +50,19 @@ def build_arc_prompt(task_data: dict, task_id: str) -> str:
 
     examples_block = "\n".join(formatted_examples)
 
+    # === Format test inputs into neat grids (instead of raw JSON dump) ===
+    formatted_tests = []
+    for i, t in enumerate(test, start=1):
+        # test items are expected to be dicts with an 'input' key
+        if isinstance(t, dict) and t.get("input") is not None:
+            inp = "\n".join(" ".join(map(str, row)) for row in t.get("input", []))
+        else:
+            # fallback: stringify the test item
+            inp = json.dumps(t)
+        formatted_tests.append(f"Test Input {i}\n--\nInput:\n{inp}\n")
+
+    tests_block = "\n".join(formatted_tests) if formatted_tests else json.dumps(test, indent=2)
+
     # === Construct prompt ===
     prompt = f"""
 You are an expert in reasoning about Abstract Reasoning Corpus (ARC) puzzles.
@@ -66,6 +79,7 @@ Guidelines
 - The SAME rule must apply consistently to all training pairs.
 - Describe the rule conceptually: refer to roles such as “background color,” “largest object,” or “most frequent color,” not numeric IDs.
 - Avoid referencing coordinates, dimensions, or color numbers.
+- Treat numerical color or value identifiers as categorical labels: the exact numeric value does not matter and should be interpreted only as a distinct category (e.g., "background", "foreground", "marker").
 - Prefer object-level reasoning: components, symmetries, translations, fills, mirrors, rotations, bounding boxes, etc.
 - Include deterministic tie-breakers (e.g., topmost-leftmost if sizes tie).
 - Avoid vague phrasing or direct number substitution.
@@ -79,7 +93,7 @@ Training Examples
 ====================
 Test Input(s)
 ====================
-{json.dumps(test, indent=2)}
+{tests_block}
 
 ====================
 Output format (strict JSON schema)

@@ -12,6 +12,23 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 DB_DIR = os.path.join(ROOT, "db")
 DB_PATH = os.path.join(DB_DIR, "responses.db")
 
+# separate DB for run-level metrics
+RUNS_DB_PATH = os.path.join(DB_DIR, "runs.db")
+
+RUNS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_name TEXT,
+    start_timestamp TEXT,
+    end_timestamp TEXT,
+    duration_seconds REAL,
+    total_queries INTEGER,
+    total_input_tokens INTEGER,
+    total_output_tokens INTEGER,
+    total_cost REAL
+);
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS responses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,6 +70,13 @@ def init_db():
     _ensure_dir()
     conn = sqlite3.connect(DB_PATH)
     try:
+        # Improve concurrent write throughput
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            # Best-effort: if PRAGMA not supported, continue
+            pass
         conn.executescript(SCHEMA)
         conn.executescript(PROMPTS_TABLE)
         # migration: ensure `challenges`, `solutions` and `prompt_hash` columns exist for older DBs
@@ -93,6 +117,16 @@ def init_db():
             cur.execute("ALTER TABLE responses ADD COLUMN json_index INTEGER")
             conn.commit()
         conn.commit()
+        # also ensure runs DB/table exists
+        try:
+            rconn = sqlite3.connect(RUNS_DB_PATH)
+            try:
+                rconn.executescript(RUNS_SCHEMA)
+                rconn.commit()
+            finally:
+                rconn.close()
+        except Exception:
+            pass
     finally:
         conn.close()
 
@@ -261,5 +295,42 @@ def update_response_apply_output(response_id: int, apply_json: str):
             (apply_json, response_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_run_metrics(
+    run_name: str,
+    start_timestamp: str,
+    end_timestamp: str,
+    duration_seconds: float,
+    total_queries: int,
+    total_input_tokens: int,
+    total_output_tokens: int,
+    total_cost: float | None = None,
+):
+    """Insert a run-level metrics row into the runs DB."""
+    _ensure_dir()
+    conn = sqlite3.connect(RUNS_DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO runs (run_name, start_timestamp, end_timestamp, duration_seconds, total_queries, total_input_tokens, total_output_tokens, total_cost)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_name,
+                start_timestamp,
+                end_timestamp,
+                float(duration_seconds),
+                int(total_queries),
+                int(total_input_tokens),
+                int(total_output_tokens),
+                float(total_cost) if total_cost is not None else None,
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
     finally:
         conn.close()

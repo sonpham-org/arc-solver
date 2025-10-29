@@ -1,2 +1,15 @@
+# Requirements for arc-solver local LLaMA testing
+# NOTE: For GPU acceleration install a PyTorch wheel that matches your CUDA toolkit.
+# Example (CUDA 11.8):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+# Then install the remaining packages:
+#   pip install -r requirements.txt
+
+torch
+transformers>=4.30.0
+accelerate>=0.20.3
+bitsandbytes>=0.39.0
+llama-cpp-python>=0.1.51
+sentencepiece>=0.1.98
 python-dotenv
 google-generativeai

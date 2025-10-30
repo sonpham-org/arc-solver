@@ -181,7 +181,35 @@ def _estimate_tokens(text: str) -> int:
         words = re.findall(r"\w+", text)
         return max(1, len(words))
 
-async def _process_task(tid: str, challenges: dict, challenges_path: str, selected_model_name: str, solutions_path: str, sem: asyncio.Semaphore, run_name: str = None, run_timestamp: str = None, num_initial_generations: int = 1):
+
+def _estimate_cost(tokens: int, model_name: str | None = None, kind: str = "input") -> float:
+    """Estimate cost in USD for given tokens using model_configs pricing.
+
+    kind should be 'input' or 'output'. Falls back to a simple env-based
+    rate when model pricing is unavailable.
+    """
+    if not tokens:
+        return 0.0
+    try:
+        # Use model_configs.estimate_cost which accepts both input and output
+        # token counts; call with tokens placed in the appropriate bucket.
+        if model_name:
+            if kind == "input":
+                return float(model_configs.estimate_cost(model_name, input_tokens=int(tokens), output_tokens=0))
+            else:
+                return float(model_configs.estimate_cost(model_name, input_tokens=0, output_tokens=int(tokens)))
+    except Exception:
+        # fallback: env-configured per-1k rate
+        try:
+            rate = float(os.getenv("COST_PER_1K", _env.get("COST_PER_1K", 0.001) or 0.001))
+        except Exception:
+            rate = 0.001
+        try:
+            return float(tokens) * (rate / 1000.0)
+        except Exception:
+            return 0.0
+
+async def _process_task(tid: str, challenges: dict, challenges_path: str, selected_model_name: str, solutions_path: str, sem: asyncio.Semaphore, run_name: str = None, run_timestamp: str = None, run_output_dir: str = None, num_initial_generations: int = 1, max_reflections: int = 3):
     """Process a single task id: build prompt, query model, store results and optionally run apply prompt.
 
     This function is safe to run concurrently up to the provided semaphore.
@@ -196,16 +224,32 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
             return
 
         start_build = time.perf_counter()
-        print(f"\n🧩 Built prompt for task {tid}:\n")
-        print(prompt)
+        # print a concise status instead of the full prompt to avoid flooding
+        print(f"\n🧩 Built prompt for task {tid} (lines={len(prompt.splitlines())})")
         build_dur = time.perf_counter() - start_build
         print(f"(prompt build time: {build_dur:.3f}s)")
+
+    # ensure run output dir exists (if provided) and track per-generation records
+    try:
+        if run_output_dir:
+            os.makedirs(run_output_dir, exist_ok=True)
+    except Exception:
+        pass
 
     # track simple per-task metrics to report back to the runner
     task_model_calls = 0
     task_input_tokens = 0
     task_output_tokens = 0
+    task_total_cost = 0.0
     task_start_time = time.perf_counter()
+
+    # prepare storage for per-generation records to persist to JSON file
+    gen_records = []
+    # temporary storage for results computed during the run; we'll merge
+    # these into gen_records after the full per-task loop completes so
+    # train/test comparisons are written only once everything is done.
+    gen_results = {}
+    prompt_hash = None
 
     # Send to Gemini n times
     for i in range(num_initial_generations):
@@ -221,97 +265,206 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                 print(f"Error querying Gemini for {tid} generation {i}: {e}")
                 continue
 
-            print(f"=== Gemini Response {i} ===\n")
-            print(text)
-
-            # store response in local sqlite DB (blocking -> thread)
+            # create a generation record immediately so we always capture the
+            # response even if later processing fails. Try to extract any
+            # trailing JSON (final_json) from the response so downstream
+            # apply/reflection logic can run. Ensure local variables are
+            # defined to avoid NameError in exceptional control paths.
             try:
                 body, final_json = _extract_trailing_json(text)
-                reasoning = text
-                output_tokens = _estimate_tokens(text)
-                # estimate input tokens from the prompt
-                input_tokens = _estimate_tokens(prompt)
-                task_input_tokens += int(input_tokens or 0)
-                task_output_tokens += int(output_tokens or 0)
-                import hashlib
+            except Exception:
+                body, final_json = (text, None)
 
-                prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-                try:
-                    # avoid duplicate prompt inserts by enqueuing only if
-                    # it hasn't been enqueued/inserted before. We keep a
-                    # small in-memory cache to avoid redundant writes.
-                    if not hasattr(_process_task, "_prompt_cache"):
-                        _process_task._prompt_cache = set()
-                        _process_task._prompt_cache_lock = threading.Lock()
+            in_tokens = _estimate_tokens(prompt) or 0
+            out_tokens = _estimate_tokens(text) or 0
+            gen_cost = _estimate_cost(in_tokens, selected_model_name, kind="input") + _estimate_cost(out_tokens, selected_model_name, kind="output")
+            gen_rec = {
+                "generation_index": i,
+                "timestamp": __import__('datetime').datetime.utcnow().isoformat() + "Z",
+                "prompt_response": text.splitlines() if text else None,
+                # attach prompt_text later when writing out the file
+                "prompt_text": None,
+                "final_json": final_json,
+                "input_tokens": in_tokens,
+                "output_tokens": out_tokens,
+                "cost_estimate": gen_cost,
+                "train_scores": None,
+                "training_comparison": None,
+                "test_score": None,
+                "testing_comparison": None,
+                "apply_cost": None,
+                "response_row_id": None,
+            }
+            gen_records.append(gen_rec)
+            # accumulate into task-wide totals
+            task_input_tokens += in_tokens
+            task_output_tokens += out_tokens
+            task_total_cost += gen_cost
 
-                    with _process_task._prompt_cache_lock:
-                        if prompt_hash not in _process_task._prompt_cache:
-                            _process_task._prompt_cache.add(prompt_hash)
-                            # enqueue a non-blocking insert
-                            try:
-                                db_enqueue("insert_prompt", prompt_hash, prompt)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-                # estimate monetary cost for this response using model pricing
-                try:
-                    cost_est = model_configs.estimate_cost(selected_model_name, input_tokens=input_tokens, output_tokens=output_tokens)
-                except Exception:
-                    cost_est = None
-
-                # insert response synchronously (we need the returned id)
-                try:
-                    rid = await asyncio.to_thread(
-                        sqlite_store.insert_response,
-                        selected_model_name,
-                        prompt_hash,
-                        reasoning,
-                        final_json if final_json else None,
-                        challenges_path,
-                        solutions_path,
-                        str(tid),
-                        None,
-                        None,
-                        cost_est,
-                        None,
-                        input_tokens,
-                        output_tokens,
-                        run_name,
-                        run_timestamp,
-                        i,  # prompt_index
-                    )
-                except Exception:
-                    rid = None
-            except Exception as e:
-                print(f"Warning: failed to save response {i} to DB: {e}")
-                body = None
-                final_json = None
-                rid = None
-
-            # If we have a parsed final_json and a solutions file, build APPLY_PROMPT
-            # Only attempt the expensive "apply" flow if we found final_json
-            # and there is a solutions file. Also gate by a simple
-            # heuristic (if parsed confidence >= 0.5 when available) to
-            # reduce wasted model calls.
-            if final_json and solutions_path:
-                try:
-                    parsed = __import__("json").loads(final_json)
-                except Exception:
-                    parsed = None
-
-                if isinstance(parsed, dict) and parsed.get("step_by_step_rule"):
+            # parsed form of final_json (if any) for apply logic below
+            try:
+                parsed = None
+                if final_json:
                     try:
-                        with open(solutions_path, "r") as sf:
-                            solutions = __import__("json").load(sf)
-                    except Exception as e:
-                        print(f"Warning: failed to load solutions file: {e}")
-                        solutions = {}
+                        parsed = __import__("json").loads(final_json)
+                    except Exception:
+                        parsed = None
+            except Exception:
+                parsed = None
 
-                    # heuristic: prefer to run apply only when the parsed
-                    # object signals confidence, or when the response size is
-                    # not huge.
+            if isinstance(parsed, dict):
+                    try:
+                        # load solutions file if provided (optional)
+                        try:
+                            solutions = {}
+                            if solutions_path:
+                                with open(solutions_path, "r") as sf:
+                                    solutions = __import__("json").load(sf)
+                        except Exception:
+                            solutions = {}
+
+                        # First: apply the extracted rule to each training example
+                        train_scores = []
+                        train_examples = challenges[tid].get("train", [])
+                        for j, ex in enumerate(train_examples):
+                            try:
+                                # build an apply prompt that applies the rule to this single training input
+                                apply_prompt_train = prompts.build_apply_prompt(parsed, {"train": [ex], "test": []}, tid, include_examples=False)
+                                apply_resp_train = await asyncio.to_thread(query_gemini, apply_prompt_train)
+                                apply_text_train = apply_resp_train
+                                # metrics for this apply call
+                                task_model_calls += 1
+                                _incr_in = _estimate_tokens(apply_prompt_train) or 0
+                                _incr_out = _estimate_tokens(apply_text_train) or 0
+                                task_input_tokens += _incr_in
+                                task_output_tokens += _incr_out
+                                task_total_cost += _estimate_cost(_incr_in, selected_model_name, kind="input") + _estimate_cost(_incr_out, selected_model_name, kind="output")
+                            except Exception:
+                                apply_text_train = None
+
+                            score_train_example = 0.0
+                            parsed_out_t = None
+                            if apply_text_train:
+                                import re
+                                m_t = re.search(r"<output>([\s\S]*?)</output>", apply_text_train, flags=re.IGNORECASE)
+                                if m_t:
+                                    out_blob_t = m_t.group(1).strip()
+                                    try:
+                                        try:
+                                            parsed_out_t = __import__("json").loads(out_blob_t)
+                                        except Exception:
+                                            lines = [ln.strip() for ln in out_blob_t.splitlines() if ln.strip()]
+                                            if lines:
+                                                grid = []
+                                                ok = True
+                                                for ln in lines:
+                                                    nums = re.findall(r"-?\d+", ln)
+                                                    if not nums:
+                                                        ok = False
+                                                        break
+                                                    grid.append([int(x) for x in nums])
+                                                if ok:
+                                                    parsed_out_t = grid
+
+                                        if parsed_out_t is not None and tid in challenges:
+                                            # compare to expected training output
+                                            try:
+                                                expected_grid = train_examples[j]["output"]
+                                                er = len(expected_grid)
+                                                ec = len(expected_grid[0]) if er > 0 else 0
+                                                total = er * ec if er and ec else 0
+                                                if total > 0:
+                                                    matches = 0
+                                                    for r in range(er):
+                                                        for c in range(ec):
+                                                            try:
+                                                                if parsed_out_t[r][c] == expected_grid[r][c]:
+                                                                    matches += 1
+                                                            except Exception:
+                                                                pass
+                                                    score_train_example = matches / total
+                                            except Exception:
+                                                score_train_example = 0.0
+                                    except Exception:
+                                        score_train_example = 0.0
+
+                            train_scores.append(float(score_train_example))
+
+                        # store train_scores list JSON into DB and update score_train mean
+                        try:
+                            import json as _json
+                            train_scores_json = _json.dumps(train_scores)
+                            if rid:
+                                try:
+                                    db_enqueue("update_response_train_scores", rid, train_scores_json)
+                                    mean_train = sum(train_scores) / len(train_scores) if train_scores else 0.0
+                                    db_enqueue("update_response_train_score", rid, float(mean_train))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # collect training comparison entries for this generation
+                        try:
+                            comps = []
+                            for j, ex in enumerate(train_examples):
+                                try:
+                                    expected_grid = ex.get("output")
+                                except Exception:
+                                    expected_grid = None
+                                try:
+                                    if isinstance(expected_grid, list) and expected_grid and isinstance(expected_grid[0], list):
+                                        expected_lines = [" ".join(str(x) for x in row) for row in expected_grid]
+                                    else:
+                                        expected_lines = expected_grid
+                                except Exception:
+                                    expected_lines = expected_grid
+                                try:
+                                    generated_val = None
+                                    # we may have parsed_out_t from the loop for the last example only; best-effort
+                                except Exception:
+                                    generated_val = None
+                                try:
+                                    score_val = train_scores[j] if j < len(train_scores) else None
+                                except Exception:
+                                    score_val = None
+                                comps.append({
+                                    "example_index": j,
+                                    "expected": expected_lines,
+                                    "generated": None,
+                                    "score": score_val,
+                                })
+                            gen_results.setdefault(i, {})["train_scores"] = train_scores
+                            gen_results.setdefault(i, {})["training_comparison"] = comps
+                        except Exception:
+                            pass
+
+                        # Now run apply on the test inputs
+                        try:
+                            apply_prompt = prompts.build_apply_prompt(parsed, challenges[tid], tid)
+                        except Exception as e:
+                            print(f"\033[91m[{tid} gen {i}] failed to build apply_prompt: {e}\033[0m")
+                            apply_text = None
+                        else:
+                            t_apply0 = time.perf_counter()
+                            apply_resp_text = await asyncio.to_thread(query_gemini, apply_prompt)
+                            apply_text = apply_resp_text
+                            # metrics for apply
+                            task_model_calls += 1
+                            _incr_in = _estimate_tokens(apply_prompt) or 0
+                            _incr_out = _estimate_tokens(apply_text) or 0
+                            task_input_tokens += _incr_in
+                            task_output_tokens += _incr_out
+                            task_total_cost += _estimate_cost(_incr_in, selected_model_name, kind="input") + _estimate_cost(_incr_out, selected_model_name, kind="output")
+                            print(f"(apply call time: {time.perf_counter() - t_apply0:.3f}s)")
+                            if apply_text:
+                                print(f"\033[92m[{tid} gen {i}] apply_prompt executed successfully\033[0m")
+                            else:
+                                print(f"\033[91m[{tid} gen {i}] apply_prompt execution failed\033[0m")
+                        
+                    except Exception as e:
+                        print(f"Warning: failed to run apply prompt for {tid} generation {i}: {e}")
+                        apply_text = None
                     run_apply = False
                     try:
                         if isinstance(parsed.get("confidence", None), (int, float)):
@@ -338,8 +491,11 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                 apply_text_train = apply_resp_train
                                 # metrics for this apply call
                                 task_model_calls += 1
-                                task_input_tokens += _estimate_tokens(apply_prompt_train) or 0
-                                task_output_tokens += _estimate_tokens(apply_text_train) or 0
+                                _incr_in = _estimate_tokens(apply_prompt_train) or 0
+                                _incr_out = _estimate_tokens(apply_text_train) or 0
+                                task_input_tokens += _incr_in
+                                task_output_tokens += _incr_out
+                                task_total_cost += _estimate_cost(_incr_in, selected_model_name, kind="input") + _estimate_cost(_incr_out, selected_model_name, kind="output")
                             except Exception:
                                 apply_text_train = None
 
@@ -407,18 +563,76 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                         except Exception:
                             pass
 
+                        # collect training comparison entries for this generation
+                        try:
+                            comps = []
+                            # for each training example try to capture expected vs generated
+                            for j, ex in enumerate(train_examples):
+                                try:
+                                    expected_grid = ex.get("output")
+                                except Exception:
+                                    expected_grid = None
+                                # convert expected_grid (2D array) to list of space-separated lines
+                                try:
+                                    if isinstance(expected_grid, list) and expected_grid and isinstance(expected_grid[0], list):
+                                        expected_lines = [" ".join(str(x) for x in row) for row in expected_grid]
+                                    else:
+                                        expected_lines = expected_grid
+                                except Exception:
+                                    expected_lines = expected_grid
+                                # parsed_out_t may only be populated for the most recent example
+                                try:
+                                    generated_val = locals().get("parsed_out_t", None)
+                                except Exception:
+                                    generated_val = None
+                                # convert generated_val grids to list of lines when possible
+                                try:
+                                    if isinstance(generated_val, list) and generated_val and isinstance(generated_val[0], list):
+                                        generated_lines = [" ".join(str(x) for x in row) for row in generated_val]
+                                    else:
+                                        generated_lines = generated_val
+                                except Exception:
+                                    generated_lines = generated_val
+                                try:
+                                    score_val = train_scores[j] if j < len(train_scores) else None
+                                except Exception:
+                                    score_val = None
+                                comps.append({
+                                    "example_index": j,
+                                    "expected": expected_lines,
+                                    "generated": generated_lines,
+                                    "score": score_val,
+                                })
+                            gen_results.setdefault(i, {})["train_scores"] = train_scores
+                            gen_results.setdefault(i, {})["training_comparison"] = comps
+                        except Exception:
+                            pass
+
                         # Now run apply on the test inputs as before
-                        apply_prompt = prompts.build_apply_prompt(parsed, challenges[tid], tid)
-                        t_apply0 = time.perf_counter()
-                        apply_resp_text = await asyncio.to_thread(query_gemini, apply_prompt)
-                        apply_text = apply_resp_text
+                            # attempt to build apply_prompt and report status
+                            try:
+                                apply_prompt = prompts.build_apply_prompt(parsed, challenges[tid], tid)
+                                print(f"\033[92m[{tid} gen {i}] apply_prompt built\033[0m")
+                            except Exception as e:
+                                print(f"\033[91m[{tid} gen {i}] failed to build apply_prompt: {e}\033[0m")
+                                # skip apply if we can't build the prompt
+                                continue
+
+                            t_apply0 = time.perf_counter()
+                            apply_resp_text = await asyncio.to_thread(query_gemini, apply_prompt)
+                            apply_text = apply_resp_text
+                            if apply_text:
+                                print(f"\033[92m[{tid} gen {i}] apply_prompt executed successfully\033[0m")
+                            else:
+                                print(f"\033[91m[{tid} gen {i}] apply_prompt execution failed\033[0m")
                         # metrics for apply
                         task_model_calls += 1
-                        task_input_tokens += _estimate_tokens(apply_prompt) or 0
-                        task_output_tokens += _estimate_tokens(apply_text) or 0
+                        _incr_in = _estimate_tokens(apply_prompt) or 0
+                        _incr_out = _estimate_tokens(apply_text) or 0
+                        task_input_tokens += _incr_in
+                        task_output_tokens += _incr_out
+                        task_total_cost += _estimate_cost(_incr_in, selected_model_name, kind="input") + _estimate_cost(_incr_out, selected_model_name, kind="output")
                         print(f"(apply call time: {time.perf_counter() - t_apply0:.3f}s)")
-                        print(f"=== Apply Response {i} ===\n")
-                        print(apply_text)
                     except Exception as e:
                         print(f"Warning: failed to run apply prompt for {tid} generation {i}: {e}")
                         apply_text = None
@@ -515,18 +729,520 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                         db_enqueue("update_response_add_cost", rid, float(apply_cost))
                                     except Exception:
                                         pass
+                                # collect testing comparison and per-generation values
+                                try:
+                                    comps_t = []
+                                    try:
+                                        expected_grid = solutions.get(tid)[0] if (solutions and tid in solutions) else None
+                                    except Exception:
+                                        expected_grid = None
+                                    # convert expected and generated grids to list of space-separated lines
+                                    try:
+                                        if isinstance(expected_grid, list) and expected_grid and isinstance(expected_grid[0], list):
+                                            expected_lines_t = [" ".join(str(x) for x in row) for row in expected_grid]
+                                        else:
+                                            expected_lines_t = expected_grid
+                                    except Exception:
+                                        expected_lines_t = expected_grid
+                                    try:
+                                        if isinstance(parsed_out, list) and parsed_out and isinstance(parsed_out[0], list):
+                                            parsed_out_lines = [" ".join(str(x) for x in row) for row in parsed_out]
+                                        else:
+                                            parsed_out_lines = parsed_out
+                                    except Exception:
+                                        parsed_out_lines = parsed_out
+                                    comps_t.append({
+                                        "expected": expected_lines_t,
+                                        "generated": parsed_out_lines,
+                                        "score": score,
+                                    })
+                                    g = gen_results.setdefault(i, {})
+                                    g["test_score"] = score
+                                    g["testing_comparison"] = comps_t
+                                    g["apply_cost"] = apply_cost if 'apply_cost' in locals() else None
+                                    g["response_row_id"] = rid
+                                except Exception:
+                                    pass
                             except Exception as e:
                                 print(f"Warning: failed to update scores for {tid} generation {i}: {e}")
+                # generation record was created earlier; any per-generation metrics
+                # are updated in-place on that record as they become available.
 
-                task_duration = time.perf_counter() - task_start_time
-                # return simple metrics for aggregation by the caller
-                return {
-                    "task_id": tid,
-                    "duration": task_duration,
-                    "model_calls": int(task_model_calls),
-                    "input_tokens": int(task_input_tokens),
-                    "output_tokens": int(task_output_tokens),
-                }
+    # end for generations
+
+    task_duration = time.perf_counter() - task_start_time
+
+    # If we ran any apply/update flows, attempt to attach train/test scores and apply_cost
+    # (They may have been enqueued asynchronously; we include what we captured above.)
+    # Persist a per-task JSON file in the run output directory with collected data.
+    try:
+        import json as _json
+        # merge any deferred per-generation results (train/test comparisons,
+        # apply_cost, response_row_id) into the gen_records entries now that
+        # the full task loop has completed.
+        try:
+            for rec in gen_records:
+                idx = rec.get("generation_index")
+                g = gen_results.get(idx, {})
+                # ensure final_json is a parsed JSON object when possible
+                try:
+                    if rec.get("final_json"):
+                        try:
+                            parsed_obj = _json.loads(rec.get("final_json"))
+                        except Exception:
+                            parsed_obj = rec.get("final_json")
+                        rec["final_json"] = parsed_obj
+                except Exception:
+                    pass
+                # attach prompt details into the generation record
+                try:
+                    rec["prompt_hash"] = prompt_hash
+                    rec["prompt_text"] = prompt.splitlines()
+                except Exception:
+                    pass
+                # attach deferred comparison and scoring data
+                try:
+                    if g:
+                        rec["train_scores"] = g.get("train_scores")
+                        rec["training_comparison"] = g.get("training_comparison")
+                        rec["test_score"] = g.get("test_score")
+                        rec["testing_comparison"] = g.get("testing_comparison")
+                        rec["apply_cost"] = g.get("apply_cost")
+                        # prefer response_row_id from gen_results if present
+                        rec["response_row_id"] = g.get("response_row_id", rec.get("response_row_id"))
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        # Reflection flow: iteratively attempt to refine any generation that
+        # produced incorrect training outputs. Repeat up to max_reflections
+        # times per generation or until all training examples score 1.0.
+        try:
+            for rec in list(gen_records):
+                try:
+                    idx = rec.get("generation_index")
+                    # only consider generations that have training_comparison
+                    tcomp = rec.get("training_comparison")
+                    if not tcomp:
+                        continue
+
+                    # find any wrong cases (score < 1.0)
+                    wrong_idxs = [e.get("example_index") for e in tcomp if (e.get("score") is not None and float(e.get("score")) < 1.0)]
+                    if not wrong_idxs:
+                        continue
+
+                    # We'll iteratively reflect up to max_reflections times.
+                    # Start with the original final_json (from the generation) as base.
+                    base_final_json = rec.get("final_json")
+                    try:
+                        if isinstance(base_final_json, str):
+                            base_final_json = _json.loads(base_final_json)
+                    except Exception:
+                        pass
+
+                    current_final_json = base_final_json or {}
+                    # For collecting per-iteration averages for summary
+                    iteration = 0
+                    while iteration < max_reflections:
+                        iteration += 1
+
+                        # Build wrong_cases and model_outputs from the latest training comparison
+                        wrong_cases = []
+                        model_outputs = []
+                        train_examples = challenges.get(tid, {}).get("train", [])
+                        # refresh tcomp from the most recent comparison if available
+                        tcomp = rec.get("training_comparison") or []
+                        for j in [e for e in range(len(train_examples)) if any(tc.get('example_index') == e and (tc.get('score') is not None and float(tc.get('score')) < 1.0) for tc in tcomp)]:
+                            try:
+                                ex = train_examples[j]
+                            except Exception:
+                                ex = None
+                            if ex:
+                                inp = ex.get("input")
+                                expected = ex.get("output")
+                            else:
+                                inp = None
+                                expected = None
+                            wrong_cases.append((inp, expected))
+                            # try to recover model output from the training_comparison entry
+                            gen_entry = next((e for e in tcomp if e.get("example_index") == j), None)
+                            gen_val = gen_entry.get("generated") if gen_entry is not None else None
+                            # convert list-of-lines back to grid if needed
+                            def _lines_to_grid(v):
+                                try:
+                                    if isinstance(v, list) and v and isinstance(v[0], str):
+                                        grid = []
+                                        for ln in v:
+                                            parts = [p for p in ln.split() if p]
+                                            grid.append([int(x) for x in parts])
+                                        return grid
+                                except Exception:
+                                    pass
+                                return v
+                            model_outputs.append(_lines_to_grid(gen_val))
+
+                        # build reflection prompt using the current_final_json
+                        try:
+                            reflection_prompt = prompts.build_reflection_prompt(current_final_json or {}, wrong_cases, model_outputs, task=challenges.get(tid), task_id=tid)
+                        except Exception:
+                            reflection_prompt = None
+
+                        if not reflection_prompt:
+                            break
+
+                        # query the model for reflection (the actual reflection prompt)
+                        try:
+                            refl_text = await asyncio.to_thread(query_gemini, reflection_prompt)
+                            refl_text = refl_text.strip()
+                        except Exception:
+                            refl_text = None
+
+                        # attempt to extract trailing JSON from the reflection response
+                        refl_body, refl_final_json = (None, None)
+                        try:
+                            if refl_text:
+                                refl_body, refl_final_json = _extract_trailing_json(refl_text)
+                                if refl_final_json:
+                                    try:
+                                        refl_final_json = _json.loads(refl_final_json)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+                        try:
+                            if refl_final_json:
+                                print(f"[{tid} reflection {idx} iter={iteration}] final_json extracted")
+                            else:
+                                print(f"[{tid} reflection {idx} iter={iteration}] no final_json found")
+                        except Exception:
+                            pass
+
+                        # If we have a revised final_json, apply it to all training and test examples
+                        refl_train_scores = None
+                        refl_training_comparison = None
+                        refl_test_score = None
+                        refl_testing_comparison = None
+                        refl_apply_cost = None
+                        if refl_final_json and isinstance(refl_final_json, dict):
+                            try:
+                                # apply to each training example
+                                refl_train_scores = []
+                                refl_training_comparison = []
+                                train_examples = challenges.get(tid, {}).get("train", [])
+                                for j, ex in enumerate(train_examples):
+                                    try:
+                                        apply_prompt_train = prompts.build_apply_prompt(refl_final_json, {"train": [ex], "test": []}, tid, include_examples=False)
+                                        apply_resp_train = await asyncio.to_thread(query_gemini, apply_prompt_train)
+                                        apply_text_train = apply_resp_train
+                                    except Exception:
+                                        apply_text_train = None
+
+                                    parsed_out_t = None
+                                    score_train_example = 0.0
+                                    if apply_text_train:
+                                        import re as _re
+                                        m_t = _re.search(r"<output>([\s\S]*?)</output>", apply_text_train, flags=_re.IGNORECASE)
+                                        if m_t:
+                                            out_blob_t = m_t.group(1).strip()
+                                            try:
+                                                parsed_out_t = None
+                                                try:
+                                                    parsed_out_t = __import__("json").loads(out_blob_t)
+                                                except Exception:
+                                                    lines = [ln.strip() for ln in out_blob_t.splitlines() if ln.strip()]
+                                                    if lines:
+                                                        grid = []
+                                                        ok = True
+                                                        for ln in lines:
+                                                            nums = _re.findall(r"-?\d+", ln)
+                                                            if not nums:
+                                                                ok = False
+                                                                break
+                                                            grid.append([int(x) for x in nums])
+                                                        if ok:
+                                                            parsed_out_t = grid
+                                                if parsed_out_t is not None and tid in challenges:
+                                                    try:
+                                                        expected_grid = train_examples[j]["output"]
+                                                        er = len(expected_grid)
+                                                        ec = len(expected_grid[0]) if er > 0 else 0
+                                                        total = er * ec if er and ec else 0
+                                                        if total > 0:
+                                                            matches = 0
+                                                            for r in range(er):
+                                                                for c in range(ec):
+                                                                    try:
+                                                                        if parsed_out_t[r][c] == expected_grid[r][c]:
+                                                                            matches += 1
+                                                                    except Exception:
+                                                                        pass
+                                                            score_train_example = matches / total
+                                                    except Exception:
+                                                        score_train_example = 0.0
+                                            except Exception:
+                                                score_train_example = 0.0
+                                    refl_train_scores.append(float(score_train_example))
+                                    # format expected/generated as list of space-joined lines
+                                    try:
+                                        expected_grid = ex.get("output")
+                                        if isinstance(expected_grid, list) and expected_grid and isinstance(expected_grid[0], list):
+                                            expected_lines = [" ".join(str(x) for x in row) for row in expected_grid]
+                                        else:
+                                            expected_lines = expected_grid
+                                    except Exception:
+                                        expected_lines = None
+                                    try:
+                                        gen_lines = None
+                                        if isinstance(parsed_out_t, list) and parsed_out_t and isinstance(parsed_out_t[0], list):
+                                            gen_lines = [" ".join(str(x) for x in row) for row in parsed_out_t]
+                                        else:
+                                            gen_lines = parsed_out_t
+                                    except Exception:
+                                        gen_lines = parsed_out_t
+                                    refl_training_comparison.append({
+                                        "example_index": j,
+                                        "expected": expected_lines,
+                                        "generated": gen_lines,
+                                        "score": float(score_train_example),
+                                    })
+
+                                # apply to test inputs (single apply across tests)
+                                try:
+                                    apply_prompt = prompts.build_apply_prompt(refl_final_json, challenges[tid], tid)
+                                    apply_resp_text = await asyncio.to_thread(query_gemini, apply_prompt)
+                                    apply_text = apply_resp_text
+                                except Exception:
+                                    apply_text = None
+                                if apply_text:
+                                    import re as _re
+                                    m = _re.search(r"<output>([\s\S]*?)</output>", apply_text, flags=_re.IGNORECASE)
+                                    if m:
+                                        out_blob = m.group(1).strip()
+                                        try:
+                                            parsed_out = None
+                                            try:
+                                                parsed_out = __import__("json").loads(out_blob)
+                                            except Exception:
+                                                lines = [ln.strip() for ln in out_blob.splitlines() if ln.strip()]
+                                                if lines:
+                                                    grid = []
+                                                    ok = True
+                                                    for ln in lines:
+                                                        nums = _re.findall(r"-?\d+", ln)
+                                                        if not nums:
+                                                            ok = False
+                                                            break
+                                                        grid.append([int(x) for x in nums])
+                                                    if ok:
+                                                        parsed_out = grid
+                                        except Exception:
+                                            parsed_out = None
+                                        # compare to solutions if available
+                                        try:
+                                            if solutions_path:
+                                                with open(solutions_path, "r") as sf:
+                                                    solutions = __import__("json").load(sf)
+                                            else:
+                                                solutions = {}
+                                        except Exception:
+                                            solutions = {}
+                                        try:
+                                            if parsed_out is not None and tid in solutions:
+                                                expected_grid = solutions[tid][0]
+                                                er = len(expected_grid)
+                                                ec = len(expected_grid[0]) if er > 0 else 0
+                                                total = er * ec if er and ec else 0
+                                                if total > 0:
+                                                    matches = 0
+                                                    for r in range(er):
+                                                        for c in range(ec):
+                                                            try:
+                                                                if parsed_out[r][c] == expected_grid[r][c]:
+                                                                    matches += 1
+                                                            except Exception:
+                                                                pass
+                                                    refl_test_score = matches / total
+                                                else:
+                                                    refl_test_score = 0.0
+                                            else:
+                                                refl_test_score = None
+                                        except Exception:
+                                            refl_test_score = None
+
+                            except Exception:
+                                pass
+
+                        # build reflection generation record and append
+                        try:
+                            refl_rec = {
+                                "generation_index": f"{idx}_reflection_{iteration}",
+                                "timestamp": __import__('datetime').datetime.utcnow().isoformat() + "Z",
+                                "prompt_response": refl_text.splitlines() if refl_text else None,
+                                "prompt_text": reflection_prompt.splitlines() if reflection_prompt else None,
+                                "final_json": refl_final_json,
+                                "input_tokens": None,
+                                "output_tokens": None,
+                                "cost_estimate": None,
+                                "apply_cost": refl_apply_cost,
+                                "train_scores": refl_train_scores,
+                                "training_comparison": refl_training_comparison,
+                                "test_score": refl_test_score,
+                                "testing_comparison": refl_testing_comparison,
+                                "apply_cost": refl_apply_cost,
+                                "response_row_id": None,
+                            }
+                            gen_records.append(refl_rec)
+                        except Exception:
+                            pass
+
+                        # If the reflection produced full-accuracy training scores, stop
+                        try:
+                            if refl_train_scores and all(float(s) == 1.0 for s in refl_train_scores):
+                                break
+                        except Exception:
+                            pass
+
+                        # prepare for next iteration by updating rec's training_comparison
+                        # so the next loop uses latest errors
+                        try:
+                            if refl_training_comparison:
+                                rec["training_comparison"] = refl_training_comparison
+                                rec["train_scores"] = refl_train_scores
+                                # also update current_final_json for next reflection
+                                if refl_final_json and isinstance(refl_final_json, dict):
+                                    current_final_json = refl_final_json
+                        except Exception:
+                            pass
+
+                    # end while iterations
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        record = {
+            "task_id": tid,
+            "run_name": run_name,
+            "run_timestamp": run_timestamp,
+            "model_name": selected_model_name,
+            "generations": gen_records,
+            "metrics": {
+                "duration": task_duration,
+                "model_calls": int(task_model_calls),
+                "input_tokens": int(task_input_tokens),
+                "output_tokens": int(task_output_tokens),
+                "total_cost_usd": float(task_total_cost),
+            },
+        }
+        if run_output_dir:
+            out_path = os.path.join(run_output_dir, f"{tid}.json")
+            try:
+                with open(out_path, "w") as of:
+                    _json.dump(record, of, indent=2, ensure_ascii=False)
+            except Exception:
+                # non-fatal: don't crash the worker if writing fails
+                pass
+    except Exception:
+        pass
+
+    # Per-task summary: print concise counts and any problematic generations
+    try:
+        total_gens = len(gen_records)
+        final_json_count = sum(1 for r in gen_records if r.get("final_json"))
+        apply_count = sum(1 for r in gen_records if (r.get("test_score") is not None or r.get("testing_comparison")))
+        reflections_count = sum(1 for r in gen_records if isinstance(r.get("generation_index"), str) and "_reflection" in str(r.get("generation_index")))
+
+        # find generations with imperfect training scores
+        gens_with_issues = []
+        for r in gen_records:
+            try:
+                ts = r.get("train_scores")
+                if ts and any((s is None or float(s) < 1.0) for s in ts):
+                    gens_with_issues.append(r.get("generation_index"))
+            except Exception:
+                pass
+
+        print(f"\nSummary for task {tid}: gens={total_gens}, final_jsons={final_json_count}, applies={apply_count}, reflections={reflections_count}")
+        print(f"Metrics: model_calls={int(task_model_calls)}, input_tokens={int(task_input_tokens)}, output_tokens={int(task_output_tokens)}, duration={task_duration:.3f}s")
+
+        # Compute average train/test scores for initial generations
+        try:
+            import statistics as _stats
+            initial_train_means = []
+            initial_test_scores = []
+            for r in gen_records:
+                try:
+                    gi = r.get("generation_index")
+                    # initial gens use integer indices
+                    if isinstance(gi, int):
+                        ts = r.get("train_scores")
+                        if ts:
+                            initial_train_means.append(sum(ts) / len(ts))
+                        if r.get("test_score") is not None:
+                            initial_test_scores.append(float(r.get("test_score")))
+                except Exception:
+                    pass
+
+            if initial_train_means:
+                print(f"Initial average train score (mean over gens) = {_stats.mean(initial_train_means):.3f} (n={len(initial_train_means)})")
+            else:
+                print("Initial average train score: N/A")
+
+            if initial_test_scores:
+                print(f"Initial average test score (mean over gens) = {_stats.mean(initial_test_scores):.3f} (n={len(initial_test_scores)})")
+            else:
+                print("Initial average test score: N/A")
+
+            # For each reflection iteration compute averages across generations
+            for k in range(1, max_reflections + 1):
+                try:
+                    refl_train_means = []
+                    refl_test_scores = []
+                    for r in gen_records:
+                        try:
+                            gi = r.get("generation_index")
+                            if isinstance(gi, str) and f"_reflection_{k}" in gi:
+                                ts = r.get("train_scores")
+                                if ts:
+                                    refl_train_means.append(sum(ts) / len(ts))
+                                if r.get("test_score") is not None:
+                                    refl_test_scores.append(float(r.get("test_score")))
+                        except Exception:
+                            pass
+                    if refl_train_means or refl_test_scores:
+                        tavg = _stats.mean(refl_train_means) if refl_train_means else None
+                        tavgs = _stats.mean(refl_test_scores) if refl_test_scores else None
+                        print(f"Reflection {k} averages: train={tavg:.3f} (n={len(refl_train_means)})" if tavg is not None else f"Reflection {k} averages: train=N/A", end="")
+                        if tavgs is not None:
+                            print(f", test={tavgs:.3f} (n={len(refl_test_scores)})")
+                        else:
+                            print("")
+                    else:
+                        # no reflections of this iteration were produced
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if gens_with_issues:
+            try:
+                print("\033[91mGenerations with imperfect training scores:\033[0m ", ", ".join(map(str, gens_with_issues)))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # return simple metrics for aggregation by the caller
+    return {
+        "task_id": tid,
+        "duration": task_duration,
+        "model_calls": int(task_model_calls),
+        "input_tokens": int(task_input_tokens),
+        "output_tokens": int(task_output_tokens),
+    }
 
 
 def _gather_task_ids(challenges: dict, limit: int | None):
@@ -604,6 +1320,13 @@ if __name__ == "__main__":
         default=1,
         help="Number of initial generations to perform",
     )
+    parser.add_argument(
+        "--max-reflections",
+        dest="max_reflections",
+        type=int,
+        default=3,
+        help="Maximum number of reflection iterations per generation (default: 3)",
+    )
     args = parser.parse_args()
 
     selected_model_name = args.model
@@ -611,6 +1334,7 @@ if __name__ == "__main__":
     solutions_path = args.solutions
     limit = args.limit
     num_initial_generations = args.num_initial_generations
+    max_reflections = args.max_reflections
     # compute a single run-level timestamp and default run_name
     from datetime import datetime, timezone
     run_timestamp = datetime.now(timezone.utc).isoformat() + "Z"
@@ -692,8 +1416,16 @@ if __name__ == "__main__":
         sem = asyncio.Semaphore(max_concurrency)
         num_initial_generations_local = num_initial_generations
         # schedule tasks
+        # create per-run output directory so tasks can write per-id JSON files
+        output_base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "output"))
+        run_output_dir = os.path.join(output_base, run_timestamp)
+        try:
+            os.makedirs(run_output_dir, exist_ok=True)
+        except Exception:
+            pass
+
         coros = [
-            _process_task(tid, challenges_local, challenges_path, selected_model_name_local, solutions_path, sem, run_name, run_timestamp, num_initial_generations_local)
+            _process_task(tid, challenges_local, challenges_path, selected_model_name_local, solutions_path, sem, run_name, run_timestamp, run_output_dir, num_initial_generations_local, max_reflections)
             for tid in task_ids
         ]
         # run them concurrently

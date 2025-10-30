@@ -19,6 +19,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import traceback
 from typing import Optional
@@ -40,7 +41,7 @@ def cuda_info() -> str:
         return "Unable to query CUDA (torch not installed or error)"
 
 
-def try_transformers_4bit(model_name: str, prompt: str = "Write a short haiku about autumn.") -> None:
+def try_transformers_4bit(model_name: str, prompt: str = "Write a short haiku about autumn.", offline: bool = False) -> None:
     """Try to load a HF model in 4-bit using bitsandbytes + transformers.
 
     This approach is suitable for an RTX 4090 when using a 7B model in 4-bit.
@@ -63,6 +64,12 @@ def try_transformers_4bit(model_name: str, prompt: str = "Write a short haiku ab
         print("[hf] torch version:", getattr(torch, "__version__", "<unknown>"))
         print("[hf] Checking CUDA:", cuda_info())
 
+        if offline:
+            # Set environment variables to tell HF libs to avoid network access
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+            os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+            print("[hf] Offline mode: enabling TRANSFORMERS_OFFLINE=1 and HF_DATASETS_OFFLINE=1")
+
         bnb_config = None
         if BitsAndBytesConfig is not None:
             bnb_config = BitsAndBytesConfig(
@@ -73,13 +80,21 @@ def try_transformers_4bit(model_name: str, prompt: str = "Write a short haiku ab
             )
 
         print(f"[hf] Loading tokenizer for {model_name}...")
-        tok = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+        # When offline, instruct transformers to only use local files
+        tf_kwargs = {}
+        if offline:
+            tf_kwargs["local_files_only"] = True
+        tok = AutoTokenizer.from_pretrained(model_name, use_fast=False, **tf_kwargs)
 
         print(f"[hf] Loading model {model_name} in 4-bit (this may download weights)...")
+        # Configure model loading kwargs
         load_kwargs = dict(
             device_map="auto",
-            trust_remote_code=True,
+            # When offline, avoid trusting remote code by default; local repos may still require it.
+            trust_remote_code=not offline,
         )
+        if offline:
+            load_kwargs["local_files_only"] = True
         if bnb_config is not None:
             load_kwargs["quantization_config"] = bnb_config
         else:
@@ -102,6 +117,8 @@ def try_transformers_4bit(model_name: str, prompt: str = "Write a short haiku ab
         print(" - Ensure you installed: pip install -U transformers accelerate bitsandbytes")
         print(" - For model access you may need to login with `huggingface-cli login` or use a local path")
         print(" - If you see CUDA OOM, try a smaller model or confirm quantization settings (4-bit NF4 recommended)")
+        if offline:
+            print(" - Offline mode was requested: ensure the model is available locally (either a local path or in the HF cache) and retry without network access.")
         raise
 
 
@@ -142,6 +159,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--model", default="meta-llama/Llama-2-7b-chat-hf", help="Hugging Face model id or local path (for hf backend)")
     p.add_argument("--ggml", default=None, help="Path to ggml .bin file (for llama_cpp backend)")
     p.add_argument("--prompt", default="Write a short haiku about autumn.", help="Prompt to send to the model")
+    p.add_argument("--offline", action="store_true", help="Run in offline/local-only mode (do not download from HF)")
     args = p.parse_args(argv)
 
     print("Local LLaMA tester starting")
@@ -150,7 +168,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         if args.backend == "hf":
             print("Selecting Hugging Face + bitsandbytes backend")
-            try_transformers_4bit(args.model, args.prompt)
+            try_transformers_4bit(args.model, args.prompt, offline=args.offline)
         else:
             if not args.ggml:
                 print("ERROR: backend 'llama_cpp' requires --ggml /path/to/ggml-model.bin")

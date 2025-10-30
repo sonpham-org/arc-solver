@@ -1,0 +1,1 @@
+python src/main.py -c data/arc-2024/arc-agi_training_challenges.json -s data/arc-2024/arc-agi_training_solutions.json --limit 1 --clear-responses

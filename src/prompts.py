@@ -173,9 +173,10 @@ Instructions:
 1) Apply the above rule EXACTLY, line by line, to each test input.
 2) Show your intermediate reasoning while applying the rule for each test input.
 3) When you produce the final answer for each test input, include ONLY the output grid inside a single pair of tags: <output>...</output>
-4) Do not include any other text outside the <output> tags for the final answer.
+4) Ensure the output grid matches the expected ARC format (2D array of integers).
+5) Do not include any other text outside the <output> tags for the final answer.
 
-Return the reasoning and the final <output> block for each test input.
+Return the reasoning in the <reasoning></reasoning> block and the final output in the <output></output> block for each test input.
 """.strip()
 
   return apply_prompt

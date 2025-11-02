@@ -34,10 +34,10 @@ import model_configs
 DEFAULT_MODEL = model_configs.DEFAULT_MODEL
 is_known_model = model_configs.is_known_model
 
-# Load .env from src/
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+# Load .env from root/
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 # load simple .env values for non-sensitive runtime config
-_env = dotenv_values(os.path.join(os.path.dirname(__file__), ".env"))
+_env = dotenv_values(os.path.join(os.path.dirname(__file__), "..", ".env"))
 # default concurrency if not provided in .env
 DEFAULT_MAX_CONCURRENCY = int(_env.get("MAX_CONCURRENCY", 4) or 4)
 

@@ -22,7 +22,7 @@ def fetch_rows(limit: int = 20):
         cur = conn.cursor()
         # include train_scores column (JSON list) in the output
         cur.execute(
-            "SELECT id, json_index, timestamp, model_name, prompt_hash, reasoning, final_json, train_scores, score_test, tokens, cost_estimate"
+            "SELECT id, json_index, timestamp, model_name, prompt_hash, reasoning, final_json, train_scores, score_test, tokens, cost_estimate, challenge_id"
             " FROM responses ORDER BY id DESC LIMIT ?",
             (limit,),
         )

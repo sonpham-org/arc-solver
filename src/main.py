@@ -19,6 +19,7 @@ import signal
 import atexit
 import time
 from dotenv import dotenv_values
+from collections import Counter
 
 # local DB helper
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -47,6 +48,44 @@ os.environ.setdefault("GRPC_VERBOSITY", "NONE")
 os.environ.setdefault("GRPC_LOG_SEVERITY_LEVEL", "ERROR")
 
 genai.configure(api_key=api_key)
+
+
+def size_score(expected_rows, expected_cols, generated_rows, generated_cols):
+    if expected_rows == generated_rows and expected_cols == generated_cols:
+        return 1.0
+    else:
+        row_frac = min(expected_rows, generated_rows) / max(expected_rows, generated_rows)
+        col_frac = min(expected_cols, generated_cols) / max(expected_cols, generated_cols)
+        return row_frac * col_frac
+
+
+def color_score(expected_grid, generated_grid):
+    if not expected_grid or not generated_grid:
+        return 0.0
+    # Flatten expected_grid to get colors
+    expected_colors = [cell for row in expected_grid for cell in row]
+    color_counts = Counter(expected_colors)
+    # Sort colors by count descending
+    sorted_colors = sorted(color_counts, key=color_counts.get, reverse=True)
+    # Assign weights: least popular (last in sorted) gets 0.5, others 1.0
+    weights = {color: 1.0 for color in sorted_colors}
+    if sorted_colors:
+        weights[sorted_colors[-1]] = 0.5
+    # Now, compute score
+    total_weight = 0.0
+    matched_weight = 0.0
+    for r in range(len(expected_grid)):
+        for c in range(len(expected_grid[0])):
+            if r < len(generated_grid) and c < len(generated_grid[0]):
+                expected_cell = expected_grid[r][c]
+                generated_cell = generated_grid[r][c]
+                weight = weights.get(expected_cell, 1.0)
+                total_weight += weight
+                if expected_cell == generated_cell:
+                    matched_weight += weight
+    if total_weight == 0:
+        return 0.0
+    return matched_weight / total_weight
 
 
 def build_model(model_name: str):
@@ -209,6 +248,530 @@ def _estimate_cost(tokens: int, model_name: str | None = None, kind: str = "inpu
         except Exception:
             return 0.0
 
+async def _process_generation(i, prompt, tid, challenges, solutions, selected_model_name, run_name, run_timestamp, run_output_dir):
+    """Process a single generation i for task tid."""
+    gen_model_calls = 0
+    gen_input_tokens = 0
+    gen_output_tokens = 0
+    gen_total_cost = 0.0
+    gen_result = {}
+
+    # call model (synchronous SDK call wrapped in a thread)
+    try:
+        t0 = time.perf_counter()
+        text = await asyncio.to_thread(query_gemini, prompt)
+        text = text.strip()
+        call_dur = time.perf_counter() - t0
+        print(f"(model call time: {call_dur:.3f}s)")
+        gen_model_calls += 1
+    except Exception as e:
+        print(f"Error querying Gemini for {tid} generation {i}: {e}")
+        return None, 0, 0, 0, 0.0, {}
+
+    # create a generation record immediately so we always capture the
+    # response even if later processing fails. Try to extract any
+    # trailing JSON (final_json) from the response so downstream
+    # apply/reflection logic can run. Ensure local variables are
+    # defined to avoid NameError in exceptional control paths.
+    try:
+        body, final_json = _extract_trailing_json(text)
+    except Exception:
+        body, final_json = (text, None)
+
+    in_tokens = _estimate_tokens(prompt) or 0
+    out_tokens = _estimate_tokens(text) or 0
+    gen_cost = _estimate_cost(in_tokens, selected_model_name, kind="input") + _estimate_cost(out_tokens, selected_model_name, kind="output")
+    gen_rec = {
+        "generation_index": i,
+        "timestamp": __import__('datetime').datetime.utcnow().isoformat() + "Z",
+        "prompt_response": text.splitlines() if text else None,
+        # attach prompt_text later when writing out the file
+        "prompt_text": None,
+        "final_json": final_json,
+        "input_tokens": in_tokens,
+        "output_tokens": out_tokens,
+        "cost_estimate": gen_cost,
+        "train_scores": None,
+        "training_comparison": None,
+        "test_score": None,
+        "testing_comparison": None,
+        "apply_cost": None,
+        "response_row_id": None,
+    }
+    gen_input_tokens += in_tokens
+    gen_output_tokens += out_tokens
+    gen_total_cost += gen_cost
+
+    # parsed form of final_json (if any) for apply logic below
+    try:
+        parsed = None
+        if final_json:
+            try:
+                parsed = __import__("json").loads(final_json)
+            except Exception:
+                parsed = None
+    except Exception:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        try:
+            # First: apply the extracted rule to each training example
+            train_scores = []
+            train_examples = challenges[tid].get("train", [])
+            for j, ex in enumerate(train_examples):
+                try:
+                    # build an apply prompt that applies the rule to this single training input
+                    apply_prompt_train = prompts.build_apply_prompt(parsed, {"train": [ex], "test": []}, tid, include_examples=False)
+                    apply_resp_train = await asyncio.to_thread(query_gemini, apply_prompt_train)
+                    apply_text_train = apply_resp_train
+                    # metrics for this apply call
+                    gen_model_calls += 1
+                    _incr_in = _estimate_tokens(apply_prompt_train) or 0
+                    _incr_out = _estimate_tokens(apply_text_train) or 0
+                    gen_input_tokens += _incr_in
+                    gen_output_tokens += _incr_out
+                    gen_total_cost += _estimate_cost(_incr_in, selected_model_name, kind="input") + _estimate_cost(_incr_out, selected_model_name, kind="output")
+                except Exception:
+                    apply_text_train = None
+
+                score_train_example = 0.0
+                parsed_out_t = None
+                if apply_text_train:
+                    import re
+                    m_t = re.search(r"<output>([\s\S]*?)</output>", apply_text_train, flags=re.IGNORECASE)
+                    if m_t:
+                        out_blob_t = m_t.group(1).strip()
+                        try:
+                            try:
+                                parsed_out_t = __import__("json").loads(out_blob_t)
+                            except Exception:
+                                lines = [ln.strip() for ln in out_blob_t.splitlines() if ln.strip()]
+                                if lines:
+                                    grid = []
+                                    ok = True
+                                    for ln in lines:
+                                        nums = re.findall(r"-?\d+", ln)
+                                        if not nums:
+                                            ok = False
+                                            break
+                                        grid.append([int(x) for x in nums])
+                                    if ok:
+                                        parsed_out_t = grid
+
+                            if parsed_out_t is not None and tid in challenges:
+                                # compare to expected training output
+                                try:
+                                    expected_grid = train_examples[j]["output"]
+                                    er = len(expected_grid)
+                                    ec = len(expected_grid[0]) if er > 0 else 0
+                                    gr = len(parsed_out_t) if isinstance(parsed_out_t, list) else 0
+                                    gc = len(parsed_out_t[0]) if gr > 0 and isinstance(parsed_out_t[0], list) else 0
+                                    total = er * ec if er and ec else 0
+                                    if total > 0:
+                                        matches = 0
+                                        for r in range(er):
+                                            for c in range(ec):
+                                                try:
+                                                    if parsed_out_t[r][c] == expected_grid[r][c]:
+                                                        matches += 1
+                                                except Exception:
+                                                    pass
+                                        gr = len(parsed_out_t) if isinstance(parsed_out_t, list) else 0
+                                        gc = len(parsed_out_t[0]) if gr > 0 and isinstance(parsed_out_t[0], list) else 0
+                                        gr = len(parsed_out_t) if isinstance(parsed_out_t, list) else 0
+                                        gc = len(parsed_out_t[0]) if gr > 0 and isinstance(parsed_out_t[0], list) else 0
+                                        size_s = size_score(er, ec, gr, gc)
+                                        color_s = color_score(expected_grid, parsed_out_t)
+                                        score_train_example = size_s * color_s
+                                except Exception:
+                                    score_train_example = 0.0
+                        except Exception:
+                            score_train_example = 0.0
+
+                train_scores.append(float(score_train_example))
+
+            # store train_scores list JSON into DB and update score_train mean
+            try:
+                import json as _json
+                train_scores_json = _json.dumps(train_scores)
+                if 'rid' in locals() and rid:
+                    try:
+                        db_enqueue("update_response_train_scores", rid, train_scores_json)
+                        mean_train = sum(train_scores) / len(train_scores) if train_scores else 0.0
+                        db_enqueue("update_response_train_score", rid, float(mean_train))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # collect training comparison entries for this generation
+            try:
+                comps = []
+                for j, ex in enumerate(train_examples):
+                    try:
+                        expected_grid = ex.get("output")
+                    except Exception:
+                        expected_grid = None
+                    try:
+                        if isinstance(expected_grid, list) and expected_grid and isinstance(expected_grid[0], list):
+                            expected_lines = [" ".join(str(x) for x in row) for row in expected_grid]
+                        else:
+                            expected_lines = expected_grid
+                    except Exception:
+                        expected_lines = expected_grid
+                    try:
+                        generated_val = None
+                        # we may have parsed_out_t from the loop for the last example only; best-effort
+                    except Exception:
+                        generated_val = None
+                    try:
+                        score_val = train_scores[j] if j < len(train_scores) else None
+                    except Exception:
+                        score_val = None
+                    comps.append({
+                        "example_index": j,
+                        "expected": expected_lines,
+                        "generated": None,
+                        "score": score_val,
+                    })
+                gen_result["train_scores"] = train_scores
+                gen_result["training_comparison"] = comps
+            except Exception:
+                pass
+
+            # Now run apply on the test inputs
+            try:
+                apply_prompt = prompts.build_apply_prompt(parsed, challenges[tid], tid)
+            except Exception as e:
+                print(f"\033[91m[{tid} gen {i}] failed to build apply_prompt: {e}\033[0m")
+                apply_text = None
+            else:
+                t_apply0 = time.perf_counter()
+                apply_resp_text = await asyncio.to_thread(query_gemini, apply_prompt)
+                apply_text = apply_resp_text
+                # metrics for apply
+                gen_model_calls += 1
+                _incr_in = _estimate_tokens(apply_prompt) or 0
+                _incr_out = _estimate_tokens(apply_text) or 0
+                gen_input_tokens += _incr_in
+                gen_output_tokens += _incr_out
+                gen_total_cost += _estimate_cost(_incr_in, selected_model_name, kind="input") + _estimate_cost(_incr_out, selected_model_name, kind="output")
+                print(f"(apply call time: {time.perf_counter() - t_apply0:.3f}s)")
+                if apply_text:
+                    print(f"\033[92m[{tid} gen {i}] apply_prompt executed successfully\033[0m")
+                else:
+                    print(f"\033[91m[{tid} gen {i}] apply_prompt execution failed\033[0m")
+            
+        except Exception as e:
+            print(f"Warning: failed to run apply prompt for {tid} generation {i}: {e}")
+            apply_text = None
+        run_apply = False
+        try:
+            if isinstance(parsed.get("confidence", None), (int, float)):
+                run_apply = parsed.get("confidence") >= 0.5
+        except Exception:
+            run_apply = False
+        if not run_apply:
+            # fallback: don't run apply for very large responses
+            run_apply = _estimate_tokens(text) < 1200
+
+        if not run_apply:
+            # skip apply for this response
+            return gen_rec, gen_model_calls, gen_input_tokens, gen_output_tokens, gen_total_cost, gen_result
+
+        # First: apply the extracted rule to each training example (no examples included in prompt)
+        try:
+            train_scores = []
+            train_examples = challenges[tid].get("train", [])
+            for j, ex in enumerate(train_examples):
+                try:
+                    # build an apply prompt that applies the rule to this single training input
+                    apply_prompt_train = prompts.build_apply_prompt(parsed, {"train": [ex], "test": []}, tid, include_examples=False)
+                    apply_resp_train = await asyncio.to_thread(query_gemini, apply_prompt_train)
+                    apply_text_train = apply_resp_train
+                    # metrics for this apply call
+                    gen_model_calls += 1
+                    _incr_in = _estimate_tokens(apply_prompt_train) or 0
+                    _incr_out = _estimate_tokens(apply_text_train) or 0
+                    gen_input_tokens += _incr_in
+                    gen_output_tokens += _incr_out
+                    gen_total_cost += _estimate_cost(_incr_in, selected_model_name, kind="input") + _estimate_cost(_incr_out, selected_model_name, kind="output")
+                except Exception:
+                    apply_text_train = None
+
+                score_train_example = 0.0
+                if apply_text_train:
+                    import re
+                    m_t = re.search(r"<output>([\s\S]*?)</output>", apply_text_train, flags=re.IGNORECASE)
+                    if m_t:
+                        out_blob_t = m_t.group(1).strip()
+                        try:
+                            parsed_out_t = None
+                            try:
+                                parsed_out_t = __import__("json").loads(out_blob_t)
+                            except Exception:
+                                lines = [ln.strip() for ln in out_blob_t.splitlines() if ln.strip()]
+                                if lines:
+                                    grid = []
+                                    ok = True
+                                    for ln in lines:
+                                        nums = re.findall(r"-?\d+", ln)
+                                        if not nums:
+                                            ok = False
+                                            break
+                                        grid.append([int(x) for x in nums])
+                                    if ok:
+                                        parsed_out_t = grid
+
+                            if parsed_out_t is not None and tid in challenges:
+                                # compare to expected training output
+                                try:
+                                    expected_grid = train_examples[j]["output"]
+                                    er = len(expected_grid)
+                                    ec = len(expected_grid[0]) if er > 0 else 0
+                                    total = er * ec if er and ec else 0
+                                    if total > 0:
+                                        matches = 0
+                                        for r in range(er):
+                                            for c in range(ec):
+                                                try:
+                                                    if parsed_out_t[r][c] == expected_grid[r][c]:
+                                                        matches += 1
+                                                except Exception:
+                                                    pass
+                                        score_train_example = matches / total
+                                except Exception:
+                                    score_train_example = 0.0
+                        except Exception:
+                            score_train_example = 0.0
+
+                train_scores.append(float(score_train_example))
+
+            # store train_scores list JSON into DB and update score_train mean
+            try:
+                import json as _json
+                train_scores_json = _json.dumps(train_scores)
+                if 'rid' in locals() and rid:
+                    # these are non-critical updates; enqueue them to the
+                    # background DB writer rather than blocking the event loop.
+                    try:
+                        db_enqueue("update_response_train_scores", rid, train_scores_json)
+                        mean_train = sum(train_scores) / len(train_scores) if train_scores else 0.0
+                        db_enqueue("update_response_train_score", rid, float(mean_train))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # collect training comparison entries for this generation
+            try:
+                comps = []
+                # for each training example try to capture expected vs generated
+                for j, ex in enumerate(train_examples):
+                    try:
+                        expected_grid = ex.get("output")
+                    except Exception:
+                        expected_grid = None
+                    # convert expected_grid (2D array) to list of space-separated lines
+                    try:
+                        if isinstance(expected_grid, list) and expected_grid and isinstance(expected_grid[0], list):
+                            expected_lines = [" ".join(str(x) for x in row) for row in expected_grid]
+                        else:
+                            expected_lines = expected_grid
+                    except Exception:
+                        expected_lines = expected_grid
+                    # parsed_out_t may only be populated for the most recent example
+                    try:
+                        generated_val = locals().get("parsed_out_t", None)
+                    except Exception:
+                        generated_val = None
+                    # convert generated_val grids to list of lines when possible
+                    try:
+                        if isinstance(generated_val, list) and generated_val and isinstance(generated_val[0], list):
+                            generated_lines = [" ".join(str(x) for x in row) for row in generated_val]
+                        else:
+                            generated_lines = generated_val
+                    except Exception:
+                        generated_lines = generated_val
+                    try:
+                        score_val = train_scores[j] if j < len(train_scores) else None
+                    except Exception:
+                        score_val = None
+                    comps.append({
+                        "example_index": j,
+                        "expected": expected_lines,
+                        "generated": generated_lines,
+                        "score": score_val,
+                    })
+                gen_result["train_scores"] = train_scores
+                gen_result["training_comparison"] = comps
+            except Exception:
+                pass
+
+            # Now run apply on the test inputs as before
+                # attempt to build apply_prompt and report status
+                try:
+                    apply_prompt = prompts.build_apply_prompt(parsed, challenges[tid], tid)
+                    print(f"\033[92m[{tid} gen {i}] apply_prompt built\033[0m")
+                except Exception as e:
+                    print(f"\033[91m[{tid} gen {i}] failed to build apply_prompt: {e}\033[0m")
+                    # skip apply if we can't build the prompt
+                    return gen_rec, gen_model_calls, gen_input_tokens, gen_output_tokens, gen_total_cost, gen_result
+
+                t_apply0 = time.perf_counter()
+                apply_resp_text = await asyncio.to_thread(query_gemini, apply_prompt)
+                apply_text = apply_resp_text
+                if apply_text:
+                    print(f"\033[92m[{tid} gen {i}] apply_prompt executed successfully\033[0m")
+                else:
+                    print(f"\033[91m[{tid} gen {i}] apply_prompt execution failed\033[0m")
+            # metrics for apply
+            gen_model_calls += 1
+            _incr_in = _estimate_tokens(apply_prompt) or 0
+            _incr_out = _estimate_tokens(apply_text) or 0
+            gen_input_tokens += _incr_in
+            gen_output_tokens += _incr_out
+            gen_total_cost += _estimate_cost(_incr_in, selected_model_name, kind="input") + _estimate_cost(_incr_out, selected_model_name, kind="output")
+            print(f"(apply call time: {time.perf_counter() - t_apply0:.3f}s)")
+        except Exception as e:
+            print(f"Warning: failed to run apply prompt for {tid} generation {i}: {e}")
+            apply_text = None
+
+        extracted = None
+        if apply_text:
+            import re
+
+            m = re.search(r"<output>([\s\S]*?)</output>", apply_text, flags=re.IGNORECASE)
+            if m:
+                out_blob = m.group(1).strip()
+                try:
+                    expected = solutions.get(tid)
+                    parsed_out = None
+                    try:
+                        parsed_out = __import__("json").loads(out_blob)
+                    except Exception:
+                        lines = [ln.strip() for ln in out_blob.splitlines() if ln.strip()]
+                        if lines:
+                            grid = []
+                            ok = True
+                            for ln in lines:
+                                nums = re.findall(r"-?\d+", ln)
+                                if not nums:
+                                    ok = False
+                                    break
+                                grid.append([int(x) for x in nums])
+                            if ok:
+                                parsed_out = grid
+                except Exception:
+                    parsed_out = None
+
+                match = False
+                score = 0.0
+                if parsed_out is not None and tid in solutions:
+                    try:
+                        expected_grid = solutions[tid][0]
+                        er = len(expected_grid)
+                        ec = len(expected_grid[0]) if er > 0 else 0
+                        gr = len(parsed_out) if isinstance(parsed_out, list) else 0
+                        gc = len(parsed_out[0]) if gr > 0 and isinstance(parsed_out[0], list) else 0
+                        total = er * ec if er and ec else 0
+                        if total > 0:
+                            matches = 0
+                            for r in range(er):
+                                for c in range(ec):
+                                    try:
+                                        if parsed_out[r][c] == expected_grid[r][c]:
+                                            matches += 1
+                                    except Exception:
+                                        pass
+                            size_s = size_score(er, ec, gr, gc)
+                            color_s = color_score(expected_grid, parsed_out)
+                            score = size_s * color_s
+                            match = matches == total
+                        else:
+                            score = 0.0
+                            match = False
+                    except Exception:
+                        match = False
+                        score = 0.0
+
+                try:
+                    # find last inserted row id by selecting max id for this prompt_hash & tid & prompt_index
+                    conn = __import__("sqlite3").connect(sqlite_store.DB_PATH)
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT id FROM responses WHERE prompt_hash = ? AND challenge_id = ? AND json_index = ? ORDER BY id DESC LIMIT 1",
+                        (None, str(tid), i),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        rid = row[0]
+                        # non-critical updates: enqueue
+                        try:
+                            db_enqueue("update_response_scores", rid, float(score))
+                        except Exception:
+                            pass
+                        try:
+                            if parsed_out is not None:
+                                import json as _json
+                                db_enqueue("update_response_apply_output", rid, _json.dumps(parsed_out))
+                        except Exception:
+                            pass
+                    conn.close()
+                    if apply_text and row:
+                        apply_tokens = _estimate_tokens(apply_text)
+                        try:
+                            db_enqueue("update_response_tokens", rid, apply_tokens)
+                        except Exception:
+                            pass
+                        try:
+                            # compute additional monetary cost for apply_text tokens and add to the response cost
+                            try:
+                                apply_cost = model_configs.estimate_cost(selected_model_name, input_tokens=0, output_tokens=apply_tokens)
+                            except Exception:
+                                apply_cost = 0.0
+                            db_enqueue("update_response_add_cost", rid, float(apply_cost))
+                        except Exception:
+                            pass
+                    # collect testing comparison and per-generation values
+                    try:
+                        comps_t = []
+                        try:
+                            expected_grid = solutions.get(tid)[0] if (solutions and tid in solutions) else None
+                        except Exception:
+                            expected_grid = None
+                        # convert expected and generated grids to list of space-separated lines
+                        try:
+                            if isinstance(expected_grid, list) and expected_grid and isinstance(expected_grid[0], list):
+                                expected_lines_t = [" ".join(str(x) for x in row) for row in expected_grid]
+                            else:
+                                expected_lines_t = expected_grid
+                        except Exception:
+                            expected_lines_t = expected_grid
+                        try:
+                            if isinstance(parsed_out, list) and parsed_out and isinstance(parsed_out[0], list):
+                                parsed_out_lines = [" ".join(str(x) for x in row) for row in parsed_out]
+                            else:
+                                parsed_out_lines = parsed_out
+                        except Exception:
+                            parsed_out_lines = parsed_out
+                        comps_t.append({
+                            "expected": expected_lines_t,
+                            "generated": parsed_out_lines,
+                            "score": score,
+                        })
+                        gen_result["test_score"] = score
+                        gen_result["testing_comparison"] = comps_t
+                        gen_result["apply_cost"] = apply_cost if 'apply_cost' in locals() else None
+                        gen_result["response_row_id"] = rid
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"Warning: failed to update scores for {tid} generation {i}: {e}")
+
+    return gen_rec, gen_model_calls, gen_input_tokens, gen_output_tokens, gen_total_cost, gen_result
+
+
 async def _process_task(tid: str, challenges: dict, challenges_path: str, selected_model_name: str, solutions_path: str, sem: asyncio.Semaphore, run_name: str = None, run_timestamp: str = None, run_output_dir: str = None, num_initial_generations: int = 1, max_reflections: int = 3):
     """Process a single task id: build prompt, query model, store results and optionally run apply prompt.
 
@@ -250,6 +813,14 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
     # train/test comparisons are written only once everything is done.
     gen_results = {}
     prompt_hash = None
+
+    solutions = {}
+    if solutions_path:
+        try:
+            with open(solutions_path, "r") as sf:
+                solutions = __import__("json").load(sf)
+        except Exception:
+            solutions = {}
 
     # Send to Gemini n times
     for i in range(num_initial_generations):
@@ -382,7 +953,9 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                                                     matches += 1
                                                             except Exception:
                                                                 pass
-                                                    score_train_example = matches / total
+                                                    size_s = size_score(er, ec, gr, gc)
+                                                color_s = color_score(expected_grid, parsed_out_t)
+                                                score_train_example = size_s * color_s
                                             except Exception:
                                                 score_train_example = 0.0
                                     except Exception:
@@ -499,55 +1072,57 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                             except Exception:
                                 apply_text_train = None
 
-                            score_train_example = 0.0
-                            if apply_text_train:
-                                import re
-                                m_t = re.search(r"<output>([\s\S]*?)</output>", apply_text_train, flags=re.IGNORECASE)
-                                if m_t:
-                                    out_blob_t = m_t.group(1).strip()
+                        score_train_example = 0.0
+                        if apply_text_train:
+                            import re
+                            m_t = re.search(r"<output>([\s\S]*?)</output>", apply_text_train, flags=re.IGNORECASE)
+                            if m_t:
+                                out_blob_t = m_t.group(1).strip()
+                                try:
+                                    parsed_out_t = None
                                     try:
-                                        parsed_out_t = None
-                                        try:
-                                            parsed_out_t = __import__("json").loads(out_blob_t)
-                                        except Exception:
-                                            lines = [ln.strip() for ln in out_blob_t.splitlines() if ln.strip()]
-                                            if lines:
-                                                grid = []
-                                                ok = True
-                                                for ln in lines:
-                                                    nums = re.findall(r"-?\d+", ln)
-                                                    if not nums:
-                                                        ok = False
-                                                        break
-                                                    grid.append([int(x) for x in nums])
-                                                if ok:
-                                                    parsed_out_t = grid
-
-                                        if parsed_out_t is not None and tid in challenges:
-                                            # compare to expected training output
-                                            try:
-                                                expected_grid = train_examples[j]["output"]
-                                                er = len(expected_grid)
-                                                ec = len(expected_grid[0]) if er > 0 else 0
-                                                total = er * ec if er and ec else 0
-                                                if total > 0:
-                                                    matches = 0
-                                                    for r in range(er):
-                                                        for c in range(ec):
-                                                            try:
-                                                                if parsed_out_t[r][c] == expected_grid[r][c]:
-                                                                    matches += 1
-                                                            except Exception:
-                                                                pass
-                                                    score_train_example = matches / total
-                                            except Exception:
-                                                score_train_example = 0.0
+                                        parsed_out_t = __import__("json").loads(out_blob_t)
                                     except Exception:
-                                        score_train_example = 0.0
+                                        lines = [ln.strip() for ln in out_blob_t.splitlines() if ln.strip()]
+                                        if lines:
+                                            grid = []
+                                            ok = True
+                                            for ln in lines:
+                                                nums = re.findall(r"-?\d+", ln)
+                                                if not nums:
+                                                    ok = False
+                                                    break
+                                                grid.append([int(x) for x in nums])
+                                            if ok:
+                                                parsed_out_t = grid
 
-                            train_scores.append(float(score_train_example))
+                                    if parsed_out_t is not None and tid in challenges:
+                                        # compare to expected training output
+                                        try:
+                                            expected_grid = train_examples[j]["output"]
+                                            er = len(expected_grid)
+                                            ec = len(expected_grid[0]) if er > 0 else 0
+                                            gr = len(parsed_out_t) if isinstance(parsed_out_t, list) else 0
+                                            gc = len(parsed_out_t[0]) if gr > 0 and isinstance(parsed_out_t[0], list) else 0
+                                            total = er * ec if er and ec else 0
+                                            if total > 0:
+                                                matches = 0
+                                                for r in range(er):
+                                                    for c in range(ec):
+                                                        try:
+                                                            if parsed_out_t[r][c] == expected_grid[r][c]:
+                                                                matches += 1
+                                                        except Exception:
+                                                            pass
+                                                size_s = size_score(er, ec, gr, gc)
+                                                color_s = color_score(expected_grid, parsed_out_t)
+                                                score_train_example = size_s * color_s
+                                        except Exception:
+                                            score_train_example = 0.0
+                                except Exception:
+                                    score_train_example = 0.0
 
-                        # store train_scores list JSON into DB and update score_train mean
+                        train_scores.append(float(score_train_example))                        # store train_scores list JSON into DB and update score_train mean
                         try:
                             import json as _json
                             train_scores_json = _json.dumps(train_scores)
@@ -682,7 +1257,11 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                                         matches += 1
                                                 except Exception:
                                                     pass
-                                        score = matches / total
+                                        gr = len(parsed_out) if isinstance(parsed_out, list) else 0
+                                        gc = len(parsed_out[0]) if gr > 0 and isinstance(parsed_out[0], list) else 0
+                                        size_s = size_score(er, ec, gr, gc)
+                                        color_s = color_score(expected_grid, parsed_out)
+                                        score = size_s * color_s
                                         match = matches == total
                                     else:
                                         score = 0.0
@@ -969,6 +1548,8 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                                         expected_grid = train_examples[j]["output"]
                                                         er = len(expected_grid)
                                                         ec = len(expected_grid[0]) if er > 0 else 0
+                                                        gr = len(parsed_out_t) if isinstance(parsed_out_t, list) else 0
+                                                        gc = len(parsed_out_t[0]) if gr > 0 and isinstance(parsed_out_t[0], list) else 0
                                                         total = er * ec if er and ec else 0
                                                         if total > 0:
                                                             matches = 0
@@ -979,7 +1560,11 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                                                             matches += 1
                                                                     except Exception:
                                                                         pass
-                                                            score_train_example = matches / total
+                                                            gr = len(parsed_out_t) if isinstance(parsed_out_t, list) else 0
+                                                            gc = len(parsed_out_t[0]) if gr > 0 and isinstance(parsed_out_t[0], list) else 0
+                                                            size_s = size_score(er, ec, gr, gc)
+                                                            color_s = color_score(expected_grid, parsed_out_t)
+                                                            score_train_example = size_s * color_s
                                                     except Exception:
                                                         score_train_example = 0.0
                                             except Exception:
@@ -1054,6 +1639,8 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                                 expected_grid = solutions[tid][0]
                                                 er = len(expected_grid)
                                                 ec = len(expected_grid[0]) if er > 0 else 0
+                                                gr = len(parsed_out) if isinstance(parsed_out, list) else 0
+                                                gc = len(parsed_out[0]) if gr > 0 and isinstance(parsed_out[0], list) else 0
                                                 total = er * ec if er and ec else 0
                                                 if total > 0:
                                                     matches = 0
@@ -1064,7 +1651,9 @@ async def _process_task(tid: str, challenges: dict, challenges_path: str, select
                                                                     matches += 1
                                                             except Exception:
                                                                 pass
-                                                    refl_test_score = matches / total
+                                                    size_s = size_score(er, ec, gr, gc)
+                                                    color_s = color_score(expected_grid, parsed_out)
+                                                    refl_test_score = size_s * color_s
                                                 else:
                                                     refl_test_score = 0.0
                                             else:
@@ -1339,6 +1928,12 @@ if __name__ == "__main__":
     from datetime import datetime, timezone
     run_timestamp = datetime.now(timezone.utc).isoformat() + "Z"
     run_name = args.run_name if args.run_name else run_timestamp
+
+    # create per-run output directory and set DB path
+    output_base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "output"))
+    run_output_dir = os.path.join(output_base, run_timestamp)
+    os.makedirs(run_output_dir, exist_ok=True)
+    sqlite_store.DB_PATH = os.path.join(run_output_dir, "responses.db")
 
     # optionally remove existing DB
     if args.clear_responses:

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS responses (
     challenges TEXT,
     solutions TEXT,
     challenge_id TEXT,
+    task_id TEXT,
     json_index INTEGER,
     run_name TEXT,
     input_tokens INTEGER,
@@ -116,8 +117,10 @@ def init_db():
         if 'json_index' not in cols:
             cur.execute("ALTER TABLE responses ADD COLUMN json_index INTEGER")
             conn.commit()
+        if 'task_id' not in cols:
+            cur.execute("ALTER TABLE responses ADD COLUMN task_id TEXT")
+            conn.commit()
         conn.commit()
-        # also ensure runs DB/table exists
         try:
             rconn = sqlite3.connect(RUNS_DB_PATH)
             try:
@@ -178,6 +181,7 @@ def insert_response(
     run_name: Optional[str] = None,
     timestamp: Optional[str] = None,
     json_index: Optional[int] = None,
+    task_id: Optional[str] = None,
 ):
     """Insert a response record into the DB.
 
@@ -193,8 +197,8 @@ def insert_response(
         cur.execute(
             """
             INSERT INTO responses
-            (timestamp, model_name, prompt_hash, reasoning, final_json, challenges, solutions, challenge_id, json_index, run_name, input_tokens, output_tokens, score_test, tokens, cost_estimate)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (timestamp, model_name, prompt_hash, reasoning, final_json, challenges, solutions, challenge_id, task_id, json_index, run_name, input_tokens, output_tokens, score_test, tokens, cost_estimate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 timestamp,
@@ -205,6 +209,7 @@ def insert_response(
                 challenges,
                 solutions,
                 challenge_id,
+                task_id,
                 json_index,
                 run_name,
                 input_tokens,

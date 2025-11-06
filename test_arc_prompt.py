@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import numpy as np
 import requests
@@ -366,7 +367,7 @@ def ask_model_for_refinement(model, provider, original_json, error_details, fail
     return response
 
 
-def run_single_task(task_id, task_data, solutions, model, provider):
+def run_single_task(task_id, task_data, solutions, model, provider, output_dir=None):
     """Run a single task and return results."""
     print(f"\n{'='*80}")
     print(f"PROCESSING TASK: {task_id}")
@@ -545,20 +546,207 @@ def run_single_task(task_id, task_data, solutions, model, provider):
     else:
         print(f"{RED}❌ Both training and test examples failed.{RESET}")
     
+    # Extract predicted outputs from the solution if available
+    predicted_outputs = []
+    if extracted_json:
+        steps = extracted_json.get("step_by_step_transformations", [])
+        if steps:
+            last_step = steps[-1]
+            python_code = last_step["python_code"]
+            test_examples = task_data.get("test", [])
+            
+            for test_example in test_examples:
+                predicted_output, _ = execute_transformation_code(python_code, test_example["input"])
+                predicted_outputs.append(predicted_output)
+    
+    # Save results to output directory if specified
+    if output_dir:
+        try:
+            save_task_results(task_id, task_data, solutions, predicted_outputs, output_dir)
+            print(f"{GREEN}Results saved to: {output_dir}/{task_id}{RESET}")
+        except Exception as e:
+            print(f"{RED}Failed to save results: {e}{RESET}")
+    
     return {
         'task_id': task_id,
         'success': overall_success,
         'training_success': training_success,
         'test_success': test_success,
         'test_overlap': test_overlap,
+        'predicted_outputs': predicted_outputs,
         'error': None
     }
 
 
 def run_single_task_wrapper(args):
     """Wrapper function for parallel execution."""
-    task_id, task_data, solutions, model, provider = args
-    return run_single_task(task_id, task_data, solutions, model, provider)
+    task_id, task_data, solutions, model, provider, output_dir = args
+    return run_single_task(task_id, task_data, solutions, model, provider, output_dir)
+
+
+def save_task_results(task_id, task_data, solutions, predicted_outputs, output_dir):
+    """Save test inputs, expected outputs, and predicted outputs for a task."""
+    task_output_dir = Path(output_dir) / task_id
+    task_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    test_examples = task_data.get("test", [])
+    task_solutions = solutions.get(task_id, [])
+    
+    # Save each test example
+    for i, (test_example, expected_output) in enumerate(zip(test_examples, task_solutions)):
+        test_input = test_example["input"]
+        predicted_output = predicted_outputs[i] if i < len(predicted_outputs) else None
+        
+        # Create result data
+        result_data = {
+            "task_id": task_id,
+            "test_index": i,
+            "test_input": test_input,
+            "test_output": expected_output,
+            "produced_output": predicted_output,
+            "input_size": [len(test_input), len(test_input[0]) if test_input else 0],
+            "expected_size": [len(expected_output), len(expected_output[0]) if expected_output else 0],
+            "produced_size": [len(predicted_output), len(predicted_output[0]) if predicted_output else 0] if predicted_output else None
+        }
+        
+        # Save to JSON file
+        output_file = task_output_dir / f"test_{i}.json"
+        with open(output_file, 'w') as f:
+            json.dump(result_data, f, indent=2)
+    
+    return task_output_dir
+
+
+def calculate_matching_criteria(predicted, expected):
+    """Calculate various matching criteria between predicted and expected outputs."""
+    if not predicted or not expected:
+        return {
+            'overlap_percent': 0.0,
+            'exact_match': False,
+            'size_match': False,
+            'shape_match': False
+        }
+    
+    # Size matching
+    pred_height, pred_width = len(predicted), len(predicted[0]) if predicted else 0
+    exp_height, exp_width = len(expected), len(expected[0]) if expected else 0
+    size_match = (pred_height == exp_height and pred_width == exp_width)
+    shape_match = size_match  # Same as size match for 2D grids
+    
+    if not size_match:
+        return {
+            'overlap_percent': 0.0,
+            'exact_match': False,
+            'size_match': False,
+            'shape_match': False
+        }
+    
+    # Calculate overlap
+    total_cells = pred_height * pred_width
+    matching_cells = 0
+    
+    for i in range(pred_height):
+        for j in range(pred_width):
+            if predicted[i][j] == expected[i][j]:
+                matching_cells += 1
+    
+    overlap_percent = (matching_cells / total_cells) * 100.0 if total_cells > 0 else 0.0
+    exact_match = overlap_percent >= 100.0
+    
+    return {
+        'overlap_percent': overlap_percent,
+        'exact_match': exact_match,
+        'size_match': size_match,
+        'shape_match': shape_match
+    }
+
+
+def test_summary(output_dir):
+    """Generate summary from saved test results."""
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        print(f"{RED}Output directory not found: {output_dir}{RESET}")
+        return
+    
+    print(f"\n{'='*100}")
+    print(f"TEST SUMMARY FROM: {output_dir}")
+    print(f"{'='*100}")
+    
+    # Find all task directories
+    task_dirs = [d for d in output_path.iterdir() if d.is_dir()]
+    if not task_dirs:
+        print(f"{RED}No task directories found in {output_dir}{RESET}")
+        return
+    
+    all_results = []
+    
+    for task_dir in task_dirs:
+        task_id = task_dir.name
+        test_files = sorted(task_dir.glob("test_*.json"))
+        
+        task_results = {
+            'task_id': task_id,
+            'test_results': [],
+            'overall_exact_match': True,
+            'overall_size_match': True,
+            'overall_overlap': 0.0
+        }
+        
+        total_overlap = 0.0
+        
+        for test_file in test_files:
+            with open(test_file, 'r') as f:
+                test_data = json.load(f)
+            
+            predicted = test_data.get('produced_output')
+            expected = test_data.get('test_output')
+            
+            criteria = calculate_matching_criteria(predicted, expected)
+            test_data['matching_criteria'] = criteria
+            task_results['test_results'].append(test_data)
+            
+            if not criteria['exact_match']:
+                task_results['overall_exact_match'] = False
+            if not criteria['size_match']:
+                task_results['overall_size_match'] = False
+            
+            total_overlap += criteria['overlap_percent']
+        
+        if test_files:
+            task_results['overall_overlap'] = total_overlap / len(test_files)
+        
+        all_results.append(task_results)
+    
+    # Calculate overall statistics
+    total_tasks = len(all_results)
+    exact_match_tasks = sum(1 for r in all_results if r['overall_exact_match'])
+    size_match_tasks = sum(1 for r in all_results if r['overall_size_match'])
+    completed_tasks = sum(1 for r in all_results if any(tr.get('produced_output') for tr in r['test_results']))
+    
+    total_overlap_sum = sum(r['overall_overlap'] for r in all_results)
+    overall_avg_overlap = total_overlap_sum / total_tasks if total_tasks > 0 else 0.0
+    
+    # Display summary
+    print(f"\n{BLUE}SUMMARY STATISTICS:{RESET}")
+    print(f"  Total tasks analyzed: {total_tasks}")
+    print(f"  Tasks with completed predictions: {completed_tasks}")
+    print(f"  Completion rate: {(completed_tasks / total_tasks * 100):.1f}%")
+    print(f"  Tasks with exact matches (100%): {exact_match_tasks}")
+    print(f"  Exact match rate: {(exact_match_tasks / total_tasks * 100):.1f}%")
+    print(f"  Tasks with matching sizes: {size_match_tasks}")
+    print(f"  Size match rate: {(size_match_tasks / total_tasks * 100):.1f}%")
+    print(f"  Overall average overlap: {overall_avg_overlap:.1f}%")
+    
+    # Detailed task results
+    print(f"\n{BLUE}DETAILED TASK RESULTS:{RESET}")
+    for result in all_results:
+        status_exact = "✓" if result['overall_exact_match'] else "✗"
+        status_size = "✓" if result['overall_size_match'] else "✗"
+        overlap = result['overall_overlap']
+        
+        print(f"  {status_exact} {result['task_id']} - Exact:{status_exact} Size:{status_size} Overlap:{overlap:.1f}%")
+    
+    return all_results
 
 # ============================================================================
 # CONFIGURATION VARIABLES - Modify these as needed
@@ -568,10 +756,10 @@ def run_single_task_wrapper(args):
 TASK_INDEX = None  # Example: 0, 42, 150, or None
 
 # Number of tasks to run (if TASK_INDEX is None, will run this many random tasks)
-NUMBER_OF_TASKS = 1  # Set to 1 for single task, or higher for multiple tasks
+NUMBER_OF_TASKS = 400  # Set to 1 for single task, or higher for multiple tasks
 
 # Model selection: Choose from available models in model_configs.py
-MODEL = "gemini-2.5-flash-lite-preview-06-17"  # Example: "llama3.1", "gemini-2.5-flash", etc.
+MODEL = "qwen2.5:32b"  # Example: "llama3.1", "gemini-2.5-flash", etc.
 
 # Path to the ARC challenges and solutions JSON files
 CHALLENGES_PATH = "data/arc-2024/arc-agi_training_challenges.json"
@@ -591,7 +779,7 @@ SANITIZE_TASK = False  # Set to False to use original task representation
 SANITIZE_ID = True  # Set to False to keep original task ID even when using sanitized data
 
 # Execution settings
-PARALLEL = True  # Set to True to run tasks in parallel (faster but less readable output)
+PARALLEL = False  # Set to True to run tasks in parallel (faster but less readable output)
 PRINT_INPUT = False  # Set to False to hide prompts sent to the language model
 PRINT_OUTPUT = False  # Set to False to hide model responses and detailed output
 
@@ -803,6 +991,13 @@ def main():
     load_dotenv()
     print("Loaded environment variables from .env file")
     
+    # Create output directory with timestamp
+    timestamp = datetime.now().isoformat().replace(':', '-').replace('.', '-')
+    output_dir = Path("output") / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Created output directory: {output_dir}")
+    print(f"Results will be saved to: {output_dir.absolute()}")
+    
     # Debug: Check if API key is loaded
     gemini_key = os.getenv('GEMINI_API_KEY')
     if gemini_key:
@@ -864,14 +1059,15 @@ def main():
     
     # Process all tasks
     all_results = []
-    successful_tasks = 0
+    completed_tasks = 0
+    correct_tasks = 0  # 100% overlap only
     total_test_overlap = 0.0
     
     if PARALLEL and len(selected_tasks) > 1:
         print(f"\n{BLUE}Running {len(selected_tasks)} tasks in parallel...{RESET}")
         
         # Prepare arguments for parallel execution
-        task_args = [(task_id, task_data, solutions, MODEL, provider) 
+        task_args = [(task_id, task_data, solutions, MODEL, provider, output_dir) 
                     for task_id, task_data in selected_tasks]
         
         # Execute tasks in parallel
@@ -888,8 +1084,10 @@ def main():
                     all_results.append(result)
                     
                     if result['test_success']:
-                        successful_tasks += 1
+                        completed_tasks += 1
                         total_test_overlap += result['test_overlap']
+                        if result['test_overlap'] >= 100.0:
+                            correct_tasks += 1
                     
                     # Show progress
                     status = "✓" if result['test_success'] else "✗"
@@ -916,12 +1114,14 @@ def main():
             print(f"TASK {i+1}/{len(selected_tasks)}")
             print(f"{'='*100}")
             
-            result = run_single_task(task_id, task_data, solutions, MODEL, provider)
+            result = run_single_task(task_id, task_data, solutions, MODEL, provider, output_dir)
             all_results.append(result)
             
             if result['test_success']:
-                successful_tasks += 1
+                completed_tasks += 1
                 total_test_overlap += result['test_overlap']
+                if result['test_overlap'] >= 100.0:
+                    correct_tasks += 1
     
     # Print final statistics
     print(f"\n{'='*100}")
@@ -930,12 +1130,14 @@ def main():
     
     print(f"\n{BLUE}TASK PERFORMANCE:{RESET}")
     print(f"  Total tasks processed: {len(selected_tasks)}")
-    print(f"  Tasks with successful test predictions: {successful_tasks}")
-    print(f"  Success rate: {(successful_tasks / len(selected_tasks) * 100):.1f}%")
+    print(f"  Tasks with completed test predictions: {completed_tasks}")
+    print(f"  Completion rate: {(completed_tasks / len(selected_tasks) * 100):.1f}%")
+    print(f"  Tasks with perfect correctness (100%): {correct_tasks}")
+    print(f"  Correctness rate: {(correct_tasks / len(selected_tasks) * 100):.1f}%")
     
-    if successful_tasks > 0:
-        avg_test_overlap = total_test_overlap / successful_tasks
-        print(f"  Average test overlap (successful tasks): {avg_test_overlap:.1f}%")
+    if completed_tasks > 0:
+        avg_test_overlap = total_test_overlap / completed_tasks
+        print(f"  Average test overlap (completed tasks): {avg_test_overlap:.1f}%")
     
     overall_test_overlap = total_test_overlap / len(selected_tasks) if selected_tasks else 0
     print(f"  Overall average test overlap: {overall_test_overlap:.1f}%")
@@ -953,19 +1155,26 @@ def main():
         overlap_str = f"({result['test_overlap']:.1f}%)" if result['test_success'] else "(Failed)"
         print(f"  {status} {result['task_id']} {overlap_str}")
     
-    # Overall success message
-    if successful_tasks == len(selected_tasks):
-        print(f"\n{GREEN}🎉 ALL TASKS PASSED! Perfect success rate!{RESET}")
-    elif successful_tasks > len(selected_tasks) * 0.7:
-        print(f"\n{GREEN}🟢 EXCELLENT PERFORMANCE! {successful_tasks}/{len(selected_tasks)} tasks passed.{RESET}")
-    elif successful_tasks > len(selected_tasks) * 0.3:
-        print(f"\n{BLUE}🟡 MODERATE PERFORMANCE. {successful_tasks}/{len(selected_tasks)} tasks passed.{RESET}")
+    # Overall performance message
+    if correct_tasks == len(selected_tasks):
+        print(f"\n{GREEN}🎉 ALL TASKS CORRECT! Perfect accuracy!{RESET}")
+    elif completed_tasks == len(selected_tasks):
+        print(f"\n{GREEN}🟢 ALL TASKS COMPLETED! {correct_tasks}/{len(selected_tasks)} fully correct.{RESET}")
+    elif completed_tasks > len(selected_tasks) * 0.7:
+        print(f"\n{GREEN}🟢 EXCELLENT PERFORMANCE! {completed_tasks}/{len(selected_tasks)} completed, {correct_tasks} fully correct.{RESET}")
+    elif completed_tasks > len(selected_tasks) * 0.3:
+        print(f"\n{BLUE}🟡 MODERATE PERFORMANCE. {completed_tasks}/{len(selected_tasks)} completed, {correct_tasks} fully correct.{RESET}")
     else:
-        print(f"\n{RED}🔴 POOR PERFORMANCE. Only {successful_tasks}/{len(selected_tasks)} tasks passed.{RESET}")
+        print(f"\n{RED}🔴 POOR PERFORMANCE. Only {completed_tasks}/{len(selected_tasks)} completed, {correct_tasks} fully correct.{RESET}")
+    
+    # Generate comprehensive test summary from saved files
+    print(f"\n{BLUE}Generating comprehensive test summary from saved results...{RESET}")
+    test_summary(output_dir)
     
     print(f"\n{'='*100}")
     print("RUN COMPLETED")
     print(f"{'='*100}")
+    print(f"Results saved in: {output_dir.absolute()}")
 
 
 if __name__ == "__main__":

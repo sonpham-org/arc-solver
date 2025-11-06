@@ -88,7 +88,14 @@ Training Examples
 ====================
 Output Format
 ====================
-You MUST return a JSON object inside ```json ``` block:
+First, show your reasoning process inside ```reasoning ``` block:
+- Analyze each training example carefully
+- Look for patterns, transformations, and commonalities
+- Identify the core transformation rule(s)
+
+Be concise in your reasoning. Keep it short but informative.
+
+Then you MUST return a JSON object inside ```json ``` block:
 {{
   "step_by_step_transformations": [{{
       "step_number": 1,
@@ -390,4 +397,46 @@ Return Format
 - Step-by-step reflection for each case will be inside the <reasoning>...</reasoning> block.
 - Final improved JSON inside <json>...</json>.
 - For each wrong case, show expected fixed output inside <output_case_i>...</output_case_i>.
+""".strip()
+
+
+def build_arc_baseline_prompt(task_data: dict, task_id: str) -> str:
+    """Build a minimal prompt that asks the model to output the test outputs.
+
+    The prompt includes the training examples for context but then asks the model
+    explicitly to return ONLY the final test output arrays in a ```json ``` block
+    as a plain 2D array or list of 2D arrays (if multiple test inputs).
+    """
+    task = task_data[task_id]
+    train, test = task.get("train", []), task.get("test", [])
+
+    examples_block = "\n\n".join(
+        f"Training Example {i}\nInput:\n" + "\n".join(" ".join(map(str, r)) for r in ex["input"]) +
+        "\n\nOutput:\n" + "\n".join(" ".join(map(str, r)) for r in ex["output"]) 
+        for i, ex in enumerate(train, 1)
+    )
+
+    tests_block = "\n\n".join(
+        f"Test Input {i}\nInput:\n" + "\n".join(" ".join(map(str, r)) for r in t["input"]) 
+        for i, t in enumerate(test, 1)
+    )
+
+    return f"""
+You are an assistant that given ARC training examples should provide the
+final transformed grid(s) for the TEST input(s) only.
+
+Task: {task_id}
+
+Training examples (for context):
+{examples_block}
+
+Test inputs:
+{tests_block}
+
+Instruction:
+Return ONLY a JSON block (delimited with ```json ... ```). The JSON MUST be
+either a single 2D array (if there is one test input) or a list of 2D arrays
+(if there are multiple test inputs). Each 2D array should be composed of integers
+matching ARC grid format. No extra text, reasoning, or explanation should be
+included outside the ```json ``` block.
 """.strip()

@@ -65,6 +65,12 @@ MODEL_CONFIGS: Dict[str, Dict[str, object]] = {
         "description": "Llama 3.1 via Ollama",
         "pricing": {"input_per_m": 0.0, "output_per_m": 0.0},  # Free local model
     },
+    # Qwen 2.5 32B via Ollama
+    "qwen2.5:32b": {
+        "provider": "ollama",
+        "description": "Qwen 2.5 32B via Ollama",
+        "pricing": {"input_per_m": 0.0, "output_per_m": 0.0},  # Free local model
+    },
 }
 
 

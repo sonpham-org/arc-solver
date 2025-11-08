@@ -24,10 +24,10 @@ from prompts import build_arc_prompt, build_arc_baseline_prompt
 
 # We reuse many configuration variables from test_arc_prompt.py for consistency
 TASK_INDEX = None
-NUMBER_OF_TASKS = 20
+NUMBER_OF_TASKS = -1  # Set to -1 to run ALL tasks
 MODEL = "qwen2.5:32b"
-CHALLENGES_PATH = "data/arc-2024/arc-agi_training_challenges.json"
-SOLUTIONS_PATH = "data/arc-2024/arc-agi_training_solutions.json"
+CHALLENGES_PATH = "data/arc-2025/arc-agi_training_challenges.json"
+SOLUTIONS_PATH = "data/arc-2025/arc-agi_training_solutions.json"
 RANDOM_SEED = 42
 TEMPERATURE = 0.70
 NUM_PREDICT = -1
@@ -138,8 +138,13 @@ def main():
     all_task_ids = list(tasks.keys())
 
     if TASK_INDEX is None:
-        n = min(NUMBER_OF_TASKS, len(all_task_ids))
-        selected_ids = random.sample(all_task_ids, n)
+        if NUMBER_OF_TASKS == -1:
+            # Use all tasks when NUMBER_OF_TASKS is -1
+            selected_ids = all_task_ids
+            print(f"Running ALL tasks ({len(all_task_ids)} tasks)")
+        else:
+            n = min(NUMBER_OF_TASKS, len(all_task_ids))
+            selected_ids = random.sample(all_task_ids, n)
     else:
         # If TASK_INDEX provided, run that single task (keeps backward compatibility)
         if TASK_INDEX < 0 or TASK_INDEX >= len(all_task_ids):

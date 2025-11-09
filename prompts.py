@@ -97,17 +97,28 @@ Be concise in your reasoning. Keep it short but informative.
 
 Then you MUST return a JSON object inside ```json ``` block:
 {{
+  # Python compatible code that describes
+  # any helper functions needed to implement the rule.
+  # Each rule will run this code before applying the transformation code.
+  "helper_python_functions": [
+    "...",
+  ],
   "step_by_step_transformations": [{{
       "step_number": 1,
       "description": [
         "...",
-      ], # Desribe the transformation conceptually
+      ], # Describe the transformation conceptually
+      # CRITICAL: Each step MUST have a complete, standalone `def transform(grid):` function
+      # that can be executed independently and returns a complete grid.
+      # DO NOT split transformation logic across multiple steps.
+      # If a step has no code logic, return the input grid unchanged: `return grid`
       "python_code": [
         "def transform(grid):",
-        "  # implementation details",
-        "  ...",
-        "  return processed_grid",
-      ],  # Python compatible code implementing the step. Must be executable and there has to be a `def transform(grid)` function. Even if no processing, still return the grid. If it needs to refer to other methods, make sure that implementation is included in here.
+        "    # Complete transformation implementation",
+        "    # This function must be fully executable on its own",
+        "    # and return a complete transformed grid",
+        "    return processed_grid"
+      ],
       "example_input": [...],  # Example input grid
       "example_output": [...]  # Corresponding output grid
   }},

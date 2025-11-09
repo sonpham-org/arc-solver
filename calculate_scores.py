@@ -4,6 +4,8 @@ import os
 import json
 import sys
 from typing import Dict, List, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 
 try:
     import termios
@@ -111,7 +113,10 @@ def load_json_file(file_path: str) -> Dict[str, Any]:
 
 
 def compare_arrays(output: Any, produce: Any) -> bool:
-    """Compare two arrays for exact match, handling NoneType and other edge cases"""
+    """
+    Compare two arrays for exact match, handling NoneType and other edge cases.
+    Only returns True for 100% exact matches - enforces strict scoring.
+    """
     try:
         # Handle NoneType cases
         if output is None or produce is None:
@@ -223,7 +228,7 @@ def calculate_score_for_file(file_path: str) -> Tuple[int, int]:
 
 
 def calculate_scores_for_folder(folder_path: str) -> None:
-    """Calculate and display scores for all JSON files in the selected folder"""
+    """Calculate and display scores for all JSON files in the selected folder using parallel processing"""
     if not os.path.exists(folder_path):
         print(f"Folder '{folder_path}' does not exist!")
         return
@@ -235,23 +240,48 @@ def calculate_scores_for_folder(folder_path: str) -> None:
         print(f"No JSON files found in '{folder_path}'")
         return
     
+    print(f"\nCalculating scores for folder: {os.path.basename(folder_path)}")
+    print("=" * 60)
+    print(f"Processing {len(json_files)} files in parallel...")
+    
+    # Determine optimal number of workers
+    max_workers = min(len(json_files), multiprocessing.cpu_count())
+    
+    file_results = {}
     total_correct = 0
     total_tests = 0
     
-    print(f"\nCalculating scores for folder: {os.path.basename(folder_path)}")
-    print("=" * 60)
-    
-    for json_file in sorted(json_files):
-        file_path = os.path.join(folder_path, json_file)
-        correct, total = calculate_score_for_file(file_path)
-        total_correct += correct
-        total_tests += total
+    # Process files in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all file processing tasks
+        future_to_file = {
+            executor.submit(calculate_score_for_file, os.path.join(folder_path, json_file)): json_file
+            for json_file in json_files
+        }
         
-        if total > 0:
-            percentage = (correct / total) * 100
-            print(f"{json_file:<30} {correct:>3}/{total:<3} ({percentage:>5.1f}%)")
-        else:
-            print(f"{json_file:<30} No valid test data found")
+        # Collect results as they complete
+        for future in as_completed(future_to_file):
+            json_file = future_to_file[future]
+            try:
+                correct, total = future.result()
+                file_results[json_file] = (correct, total)
+                total_correct += correct
+                total_tests += total
+            except Exception as e:
+                print(f"Error processing {json_file}: {e}")
+                file_results[json_file] = (0, 0)
+    
+    # Display results in sorted order
+    print("\nResults:")
+    print("=" * 60)
+    for json_file in sorted(json_files):
+        if json_file in file_results:
+            correct, total = file_results[json_file]
+            if total > 0:
+                percentage = (correct / total) * 100
+                print(f"{json_file:<30} {correct:>3}/{total:<3} ({percentage:>5.1f}%)")
+            else:
+                print(f"{json_file:<30} No valid test data found")
     
     print("=" * 60)
     if total_tests > 0:
@@ -261,6 +291,7 @@ def calculate_scores_for_folder(folder_path: str) -> None:
         print("No valid test data found in any files")
     
     print(f"\nOverall Score: {total_correct} / {total_tests}")
+    print(f"Files processed in parallel using {max_workers} workers")
 
 
 def main():

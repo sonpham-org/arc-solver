@@ -13,3 +13,4 @@ llama-cpp-python>=0.1.51
 sentencepiece>=0.1.98
 python-dotenv
 google-generativeai
+google-cloud-storage

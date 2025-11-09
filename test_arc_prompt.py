@@ -36,10 +36,10 @@ TASK_INDEX = None  # Example: 0, 42, 150, "00d62c1b", or None
 NUMBER_OF_TASKS = -1  # Set to 1 for single task, or higher for multiple tasks
 
 # Model selection: Choose from available models in model_configs.py
-MODEL = "gemini-2.5-flash-lite-preview-06-17"  # The other is "qwen2.5:32b"
+MODEL = "qwen2.5:32b"  # The other is "qwen2.5:32b"
 
 # Path to the ARC challenges and solutions JSON files
-YEAR = 2025
+YEAR = 2024
 if YEAR == 2024:
     TRAINING_CHALLENGES_PATH = "data/arc-2024/arc-agi_training_challenges.json"
     TRAINING_SOLUTIONS_PATH = "data/arc-2024/arc-agi_training_solutions.json"

@@ -103,27 +103,24 @@ Then you MUST return a JSON object inside ```json ``` block:
   "helper_python_functions": [
     "...",
   ],
+  "python_code": [
+    "def transform(grid):",
+    "    # Complete transformation implementation",
+    "    # This function must be fully executable on its own",
+    "    # and return a complete transformed grid",
+    "    return processed_grid"
+  ],
   "step_by_step_transformations": [{{
       "step_number": 1,
       "description": [
         "...",
       ], # Describe the transformation conceptually
-      # CRITICAL: Each step MUST have a complete, standalone `def transform(grid):` function
-      # that can be executed independently and returns a complete grid.
-      # DO NOT split transformation logic across multiple steps.
-      # If a step has no code logic, return the input grid unchanged: `return grid`
-      "python_code": [
-        "def transform(grid):",
-        "    # Complete transformation implementation",
-        "    # This function must be fully executable on its own",
-        "    # and return a complete transformed grid",
-        "    return processed_grid"
+      "pseudo_code": [
       ],
       "example_input": [...],  # Example input grid
       "example_output": [...]  # Corresponding output grid
   }},
-  ...],
-  "confidence": "high|medium|low - how confident you are in this solution"
+  ...]
 }}""".strip()
 
 

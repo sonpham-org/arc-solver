@@ -19,6 +19,144 @@ creative = """
 Propose a novel strategy to improve ARC reasoning using multimodal embeddings.
 """
 
+def build_arc_with_helpers_prompt(task_data: dict, task_id: str, top_helpers: list, random_helpers: list) -> str:
+    """
+    Builds a comprehensive prompt for an ARC task that includes helper functions from previous successful tasks.
+
+    This function constructs a detailed prompt that instructs an AI model to reason about
+    and solve an ARC puzzle, enhanced with helper functions learned from previous tasks.
+
+    Args:
+        task_data (dict): A dictionary containing all ARC tasks, where keys are task IDs
+            and values are task dictionaries with 'train' and 'test' keys.
+        task_id (str): The unique identifier of the specific task to build a prompt for.
+        top_helpers (list): List of top-performing helper functions (tuples of function info).
+        random_helpers (list): List of random helper functions for diversity.
+
+    Returns:
+        str: A formatted string containing the complete prompt for the ARC task, including
+            task description, training examples, test inputs, helper functions, guidelines, 
+            and output format instructions.
+    """
+    task = task_data[task_id]
+    train, test = task.get("train", []), task.get("test", [])
+
+    examples_block = "\n\n".join(
+        f"Training Example {i}\n--\nInput:\n" +
+        "\n".join(" ".join(map(str, r)) for r in ex["input"]) +
+        "\n\nOutput:\n" +
+        "\n".join(" ".join(map(str, r)) for r in ex["output"])
+        for i, ex in enumerate(train, 1)
+    )
+    tests_block = "\n\n".join(
+        f"Test Input {i}\n--\nInput:\n" +
+        "\n".join(" ".join(map(str, r)) for r in t["input"])
+        for i, t in enumerate(test, 1)
+    )
+
+    # Format helper functions
+    helpers_block = ""
+    if top_helpers or random_helpers:
+        helpers_block = "\n====================\nAvailable Helper Functions\n====================\n"
+        helpers_block += "You can use any of these previously successful helper functions in your solution:\n\n"
+        
+        if top_helpers:
+            helpers_block += "TOP PERFORMING HELPERS (most successful):\n"
+            for i, helper in enumerate(top_helpers, 1):
+                func_name, func_code, func_signature, description, success_count, usage_count = helper
+                helpers_block += f"\n{i}. {func_name} (used {success_count} times successfully)\n"
+                if description:
+                    helpers_block += f"   Description: {description}\n"
+                helpers_block += f"   Signature: {func_signature}\n"
+                helpers_block += f"   Code:\n{func_code}\n"
+        
+        if random_helpers:
+            helpers_block += "\nOTHER AVAILABLE HELPERS:\n"
+            for i, helper in enumerate(random_helpers, 1):
+                func_name, func_code, func_signature, description, success_count, usage_count = helper
+                helpers_block += f"\n{i + len(top_helpers)}. {func_name} (used {success_count} times successfully)\n"
+                if description:
+                    helpers_block += f"   Description: {description}\n"
+                helpers_block += f"   Signature: {func_signature}\n"
+                helpers_block += f"   Code:\n{func_code}\n"
+        
+        helpers_block += "\nNOTE: You can use, modify, or be inspired by any of these helpers, or create entirely new ones.\n"
+
+    return f"""
+You are an expert in reasoning about Abstract Reasoning Corpus (ARC) puzzles.
+
+====================
+Task {task_id}
+====================
+
+Your goal:
+Given the training pairs and test inputs, infer a general transformation rule that:
+1. Correctly maps every training input to its output.
+2. Is general and intuitive (no memorization or hard-coded values).
+3. Is logical, reproducible, and object-level.
+{helpers_block}
+====================
+Guidelines
+====================
+- The SAME rule must successfully transform all training pairs.
+- Treat all grid values (numbers/characters) as categorical labels, not magnitudes. Do not use arithmetic operations.
+- Avoid rules that depend on specific values or characters. 
+- Make rules in a general manner using object-level reasoning (movements, shapes, fills, mirrors, rotations, bounding boxes, duplicates, etc.).
+- Take as many rules as you need to achieve your goals.
+- LEVERAGE AVAILABLE HELPERS: Look at the available helper functions above - they represent patterns that have worked successfully on other tasks. Consider whether any of them (or modified versions) could be useful for this task.
+
+====================
+Training Examples
+====================
+{examples_block}
+
+====================
+Test Inputs
+====================
+{tests_block}
+
+====================
+Output Format
+====================
+First, show your reasoning process inside ```reasoning ``` block:
+- Analyze each training example carefully
+- Look for patterns, transformations, and commonalities
+- Consider which available helper functions might be useful
+- Identify the core transformation rule(s)
+
+Be concise in your reasoning. Keep it short but informative.
+
+Then you MUST return a JSON object inside ```json ``` block:
+{{
+  # Python compatible code that describes
+  # any helper functions needed to implement the rule.
+  # You can use the available helpers above, modify them, or create new ones.
+  # Each rule will run this code before applying the transformation code.
+  "helper_python_functions": [
+    "...",
+  ],
+  "python_code": [
+    "def transform(grid):",
+    "    # Complete transformation implementation",
+    "    # This function must be fully executable on its own",
+    "    # and return a complete transformed grid",
+    "    # Consider using available helper functions",
+    "    return processed_grid"
+  ],
+  "step_by_step_transformations": [{{
+      "step_number": 1,
+      "description": [
+        "...",
+      ], # Describe the transformation conceptually
+      "pseudo_code": [
+      ],
+      "example_input": [...],  # Example input grid
+      "example_output": [...]  # Corresponding output grid
+  }},
+  ...]
+}}""".strip()
+
+
 def build_arc_prompt(task_data: dict, task_id: str) -> str:
     """
     Builds a comprehensive prompt for an ARC (Abstraction and Reasoning Corpus) task.
@@ -103,13 +241,6 @@ Then you MUST return a JSON object inside ```json ``` block:
   "helper_python_functions": [
     "...",
   ],
-  "python_code": [
-    "def transform(grid):",
-    "    # Complete transformation implementation",
-    "    # This function must be fully executable on its own",
-    "    # and return a complete transformed grid",
-    "    return processed_grid"
-  ],
   "step_by_step_transformations": [{{
       "step_number": 1,
       "description": [
@@ -120,6 +251,13 @@ Then you MUST return a JSON object inside ```json ``` block:
       "example_input": [...],  # Example input grid
       "example_output": [...]  # Corresponding output grid
   }},
+  "python_code": [
+    "def transform(grid):",
+    "    # Complete transformation implementation",
+    "    # This function must be fully executable on its own",
+    "    # and return a complete transformed grid",
+    "    return processed_grid"
+  ],
   ...]
 }}""".strip()
 

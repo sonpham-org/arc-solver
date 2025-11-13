@@ -19,144 +19,6 @@ creative = """
 Propose a novel strategy to improve ARC reasoning using multimodal embeddings.
 """
 
-def build_arc_with_helpers_prompt(task_data: dict, task_id: str, top_helpers: list, random_helpers: list) -> str:
-    """
-    Builds a comprehensive prompt for an ARC task that includes helper functions from previous successful tasks.
-
-    This function constructs a detailed prompt that instructs an AI model to reason about
-    and solve an ARC puzzle, enhanced with helper functions learned from previous tasks.
-
-    Args:
-        task_data (dict): A dictionary containing all ARC tasks, where keys are task IDs
-            and values are task dictionaries with 'train' and 'test' keys.
-        task_id (str): The unique identifier of the specific task to build a prompt for.
-        top_helpers (list): List of top-performing helper functions (tuples of function info).
-        random_helpers (list): List of random helper functions for diversity.
-
-    Returns:
-        str: A formatted string containing the complete prompt for the ARC task, including
-            task description, training examples, test inputs, helper functions, guidelines, 
-            and output format instructions.
-    """
-    task = task_data[task_id]
-    train, test = task.get("train", []), task.get("test", [])
-
-    examples_block = "\n\n".join(
-        f"Training Example {i}\n--\nInput:\n" +
-        "\n".join(" ".join(map(str, r)) for r in ex["input"]) +
-        "\n\nOutput:\n" +
-        "\n".join(" ".join(map(str, r)) for r in ex["output"])
-        for i, ex in enumerate(train, 1)
-    )
-    tests_block = "\n\n".join(
-        f"Test Input {i}\n--\nInput:\n" +
-        "\n".join(" ".join(map(str, r)) for r in t["input"])
-        for i, t in enumerate(test, 1)
-    )
-
-    # Format helper functions
-    helpers_block = ""
-    if top_helpers or random_helpers:
-        helpers_block = "\n====================\nAvailable Helper Functions\n====================\n"
-        helpers_block += "You can use any of these previously successful helper functions in your solution:\n\n"
-        
-        if top_helpers:
-            helpers_block += "TOP PERFORMING HELPERS (most successful):\n"
-            for i, helper in enumerate(top_helpers, 1):
-                func_name, func_code, func_signature, description, success_count, usage_count = helper
-                helpers_block += f"\n{i}. {func_name} (used {success_count} times successfully)\n"
-                if description:
-                    helpers_block += f"   Description: {description}\n"
-                helpers_block += f"   Signature: {func_signature}\n"
-                helpers_block += f"   Code:\n{func_code}\n"
-        
-        if random_helpers:
-            helpers_block += "\nOTHER AVAILABLE HELPERS:\n"
-            for i, helper in enumerate(random_helpers, 1):
-                func_name, func_code, func_signature, description, success_count, usage_count = helper
-                helpers_block += f"\n{i + len(top_helpers)}. {func_name} (used {success_count} times successfully)\n"
-                if description:
-                    helpers_block += f"   Description: {description}\n"
-                helpers_block += f"   Signature: {func_signature}\n"
-                helpers_block += f"   Code:\n{func_code}\n"
-        
-        helpers_block += "\nNOTE: You can use, modify, or be inspired by any of these helpers, or create entirely new ones.\n"
-
-    return f"""
-You are an expert in reasoning about Abstract Reasoning Corpus (ARC) puzzles.
-
-====================
-Task {task_id}
-====================
-
-Your goal:
-Given the training pairs and test inputs, infer a general transformation rule that:
-1. Correctly maps every training input to its output.
-2. Is general and intuitive (no memorization or hard-coded values).
-3. Is logical, reproducible, and object-level.
-{helpers_block}
-====================
-Guidelines
-====================
-- The SAME rule must successfully transform all training pairs.
-- Treat all grid values (numbers/characters) as categorical labels, not magnitudes. Do not use arithmetic operations.
-- Avoid rules that depend on specific values or characters. 
-- Make rules in a general manner using object-level reasoning (movements, shapes, fills, mirrors, rotations, bounding boxes, duplicates, etc.).
-- Take as many rules as you need to achieve your goals.
-- LEVERAGE AVAILABLE HELPERS: Look at the available helper functions above - they represent patterns that have worked successfully on other tasks. Consider whether any of them (or modified versions) could be useful for this task.
-
-====================
-Training Examples
-====================
-{examples_block}
-
-====================
-Test Inputs
-====================
-{tests_block}
-
-====================
-Output Format
-====================
-First, show your reasoning process inside ```reasoning ``` block:
-- Analyze each training example carefully
-- Look for patterns, transformations, and commonalities
-- Consider which available helper functions might be useful
-- Identify the core transformation rule(s)
-
-Be concise in your reasoning. Keep it short but informative.
-
-Then you MUST return a JSON object inside ```json ``` block:
-{{
-  # Python compatible code that describes
-  # any helper functions needed to implement the rule.
-  # You can use the available helpers above, modify them, or create new ones.
-  # Each rule will run this code before applying the transformation code.
-  "helper_python_functions": [
-    "...",
-  ],
-  "python_code": [
-    "def transform(grid):",
-    "    # Complete transformation implementation",
-    "    # This function must be fully executable on its own",
-    "    # and return a complete transformed grid",
-    "    # Consider using available helper functions",
-    "    return processed_grid"
-  ],
-  "step_by_step_transformations": [{{
-      "step_number": 1,
-      "description": [
-        "...",
-      ], # Describe the transformation conceptually
-      "pseudo_code": [
-      ],
-      "example_input": [...],  # Example input grid
-      "example_output": [...]  # Corresponding output grid
-  }},
-  ...]
-}}""".strip()
-
-
 def build_arc_prompt(task_data: dict, task_id: str) -> str:
     """
     Builds a comprehensive prompt for an ARC (Abstraction and Reasoning Corpus) task.
@@ -248,8 +110,6 @@ Then you MUST return a JSON object inside ```json ``` block:
       ], # Describe the transformation conceptually
       "pseudo_code": [
       ],
-      "example_input": [...],  # Example input grid
-      "example_output": [...]  # Corresponding output grid
   }},
   "python_code": [
     "def transform(grid):",
@@ -257,8 +117,7 @@ Then you MUST return a JSON object inside ```json ``` block:
     "    # This function must be fully executable on its own",
     "    # and return a complete transformed grid",
     "    return processed_grid"
-  ],
-  ...]
+  ]
 }}""".strip()
 
 
@@ -543,6 +402,256 @@ Return Format
 - Step-by-step reflection for each case will be inside the <reasoning>...</reasoning> block.
 - Final improved JSON inside <json>...</json>.
 - For each wrong case, show expected fixed output inside <output_case_i>...</output_case_i>.
+""".strip()
+
+
+def build_code_repair_prompt(task_data: dict, task_id: str, previous_json: dict, execution_errors: list) -> str:
+    """
+    Build a code repair prompt for when JSON is valid but Python code fails to execute.
+    
+    Args:
+        task_data: Dictionary containing all ARC tasks
+        task_id: The unique identifier of the task
+        previous_json: The JSON response with failing code
+        execution_errors: List of execution errors for each training example
+    
+    Returns:
+        A formatted prompt that includes the previous JSON, execution errors,
+        and asks for corrected Python code.
+    """
+    task = task_data[task_id]
+    train = task.get("train", [])
+    
+    # We don't need to show training examples again since errors already include input/expected output
+    
+    # Build execution errors block with line-specific information
+    error_details = []
+    for i, error_info in enumerate(execution_errors, 1):
+        error_text = f"EXAMPLE {i} FAILURE:\n"
+        error_text += f"Input: {error_info['input']}\n"
+        error_text += f"Expected: {error_info['expected']}\n"
+        
+        # Add specific error information
+        error_text += f"\nERROR: {error_info.get('error', 'Unknown error')}"
+        
+        # Add line-specific information if available
+        if error_info.get('error_line'):
+            error_text += f"\nFailed at: {error_info['error_line']}"
+        
+        if error_info.get('code_context'):
+            error_text += f"\n{error_info['code_context']}"
+        
+        if 'predicted' in error_info and error_info['predicted'] is not None:
+            error_text += f"\nActual output: {error_info['predicted']}"
+        
+        error_details.append(error_text)
+    
+    errors_block = "\n\n".join(error_details)
+    
+    # Format the previous JSON
+    previous_json_str = json.dumps(previous_json, indent=2) if previous_json else "No previous JSON available"
+    
+    # Extract and format Python code with line numbers for easier reference
+    python_code_with_lines = ""
+    if previous_json and 'python_code' in previous_json:
+        python_lines = previous_json['python_code']
+        python_code_with_lines = "\n".join(f"{i+1:2d}: {line}" for i, line in enumerate(python_lines))
+    
+    return f"""
+You are an expert Python programmer specializing in ARC puzzle transformations.
+Your previous JSON response had valid structure but the Python code failed to execute on the training examples.
+
+====================
+Task {task_id} - CODE REPAIR NEEDED
+====================
+
+Your goal:
+Fix the Python code in your JSON response so that it executes successfully on ALL training examples.
+The JSON structure is correct, but the transformation code has execution errors that need to be resolved.
+
+====================
+Your Previous JSON (with failing code)
+====================
+```json
+{previous_json_str}
+```
+
+====================
+Current Python Code (with line numbers)
+====================
+{python_code_with_lines}
+
+====================
+Detailed Execution Errors
+====================
+{errors_block}
+
+====================
+Instructions for Code Repair
+====================
+Analyze the execution errors above and provide a CORRECTED JSON response with fixed Python code.
+
+Focus on these common issues:
+1. **Index out of range errors**: Check grid dimensions and array bounds (refer to line numbers above)
+2. **Variable/function not defined**: Ensure all variables are properly initialized
+3. **Type errors**: Make sure data types are compatible (lists, integers, etc.)
+4. **Logic errors**: Verify the transformation logic matches the expected pattern
+5. **Edge cases**: Handle special cases like empty grids, single values, etc.
+6. **Line-specific fixes**: Pay attention to the specific lines mentioned in the error details
+
+Provide the corrected JSON in the same format:
+
+```json
+{{
+  "helper_python_functions": [
+    "# Add any helper functions needed",
+  ],
+  "step_by_step_transformations": [{{
+      "step_number": 1,
+      "description": [
+        "Describe what the transformation does",
+      ],
+      "pseudo_code": [
+        "Outline the logic steps"
+      ],
+  }}],
+  "python_code": [
+    "def transform(grid):",
+    "    # CORRECTED implementation that handles all the errors above",
+    "    # Make sure this code executes successfully on all training examples",
+    "    return processed_grid"
+  ]
+}}
+```
+
+CRITICAL: The Python code must execute without errors on ALL training examples. Test your logic carefully!
+""".strip()
+
+
+def build_arc_reflection_prompt(task_data: dict, task_id: str, previous_json: dict, train_results: list) -> str:
+    """
+    Build a reflection prompt for failed tasks that asks the model to analyze 
+    their previous attempt and generate an improved JSON solution.
+    
+    Args:
+        task_data: Dictionary containing all ARC tasks
+        task_id: The unique identifier of the task
+        previous_json: The JSON response from the previous attempt
+        train_results: List of training results showing predicted vs expected outputs
+    
+    Returns:
+        A formatted prompt that includes the previous JSON, failure analysis,
+        and asks for a corrected JSON response.
+    """
+    task = task_data[task_id]
+    train = task.get("train", [])
+    
+    # Build training examples block
+    examples_block = "\n\n".join(
+        f"Training Example {i}\n--\nInput:\n" +
+        "\n".join(" ".join(map(str, r)) for r in ex["input"]) +
+        "\n\nOutput:\n" +
+        "\n".join(" ".join(map(str, r)) for r in ex["output"])
+        for i, ex in enumerate(train, 1)
+    )
+    
+    # Build failure analysis block
+    failure_analysis = []
+    for i, result in enumerate(train_results, 1):
+        if not result.get('correct', False):
+            predicted = result.get('predicted', 'No output generated')
+            expected = result.get('expected', 'Unknown')
+            error = result.get('error', 'No error reported')
+            
+            failure_text = f"Training Example {i} - FAILED\n"
+            failure_text += f"Expected Output:\n"
+            if isinstance(expected, list):
+                failure_text += "\n".join(" ".join(map(str, r)) for r in expected)
+            else:
+                failure_text += str(expected)
+            
+            failure_text += f"\n\nYour Predicted Output:\n"
+            if isinstance(predicted, list):
+                failure_text += "\n".join(" ".join(map(str, r)) for r in predicted)
+            else:
+                failure_text += str(predicted)
+            
+            if error and error != 'No error reported':
+                failure_text += f"\n\nError Encountered:\n{error}"
+            
+            failure_analysis.append(failure_text)
+    
+    failures_block = "\n\n".join(failure_analysis) if failure_analysis else "No specific failure details available"
+    
+    # Format the previous JSON
+    previous_json_str = json.dumps(previous_json, indent=2) if previous_json else "No previous JSON available"
+    
+    return f"""
+You are an expert in reasoning about Abstract Reasoning Corpus (ARC) puzzles. 
+You previously attempted to solve this task but your solution was incorrect on some training examples.
+
+====================
+Task {task_id} - REFLECTION AND CORRECTION
+====================
+
+Your goal:
+Analyze your previous attempt, understand why it failed, and provide a CORRECTED transformation rule that:
+1. Correctly maps every training input to its output.
+2. Is general and intuitive (no memorization or hard-coded values).
+3. Is logical, reproducible, and object-level.
+
+====================
+Original Training Examples
+====================
+{examples_block}
+
+====================
+Your Previous JSON Response
+====================
+```json
+{previous_json_str}
+```
+
+====================
+Analysis of Failures
+====================
+{failures_block}
+
+====================
+Instructions for Reflection
+====================
+First, analyze what went wrong in your previous attempt inside ```reasoning ``` block:
+- Identify which part of your logic was incorrect
+- Understand why the predicted outputs didn't match the expected outputs
+- Determine what pattern or rule you missed or misinterpreted
+- Think about how to fix the transformation logic
+
+Then provide a CORRECTED JSON object inside ```json ``` block with the same format:
+{{
+  # Python compatible code that describes
+  # any helper functions needed to implement the rule.
+  # Each rule will run this code before applying the transformation code.
+  "helper_python_functions": [
+    "...",
+  ],
+  "step_by_step_transformations": [{{
+      "step_number": 1,
+      "description": [
+        "...",
+      ], # Describe the transformation conceptually
+      "pseudo_code": [
+      ],
+  }}],
+  "python_code": [
+    "def transform(grid):",
+    "    # Complete transformation implementation",
+    "    # This function must be fully executable on its own",
+    "    # and return a complete transformed grid",
+    "    return processed_grid"
+  ]
+}}
+
+Make sure your corrected solution addresses all the failures identified above and works correctly on ALL training examples.
 """.strip()
 
 

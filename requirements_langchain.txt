@@ -1,0 +1,8 @@
+# Requirements for run_arc_langchain.py
+langchain-core>=0.1.0
+langchain-google-genai>=1.0.0  # For Gemini models
+langchain-google-vertexai>=1.0.0  # For Vertex AI models  
+langchain-openai>=0.1.0  # For OpenAI models
+langchain-anthropic>=0.1.0  # For Claude models
+langchain-ollama>=0.1.0  # For local Ollama models
+python-dotenv>=1.0.0  # For environment variables

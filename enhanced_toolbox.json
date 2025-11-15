@@ -1,0 +1,112 @@
+{
+  "exported_at": "2025-11-13T23:48:14.688897",
+  "statistics": {
+    "total_functions": 8,
+    "total_usage_records": 0,
+    "categories": {
+      "analysis": {
+        "count": 2,
+        "avg_success": 0.0
+      },
+      "grid_operations": {
+        "count": 5,
+        "avg_success": 0.0
+      },
+      "pattern_detection": {
+        "count": 1,
+        "avg_success": 0.0
+      }
+    },
+    "failed_tasks_available": 3
+  },
+  "functions": [
+    {
+      "name": "rotate_90",
+      "description": "Rotate grid 90 degrees clockwise",
+      "code": "def rotate_90(grid):\n    \"\"\"Rotate grid 90 degrees clockwise.\"\"\"\n    if not grid or not grid[0]:\n        return grid\n    return [[grid[j][i] for j in range(len(grid))] for i in range(len(grid[0]))]",
+      "category": "grid_operations",
+      "usage_count": 0,
+      "success_rate": 0.0,
+      "complexity_score": 2,
+      "dependencies": [],
+      "source_task_id": null
+    },
+    {
+      "name": "flip_horizontal",
+      "description": "Flip grid horizontally",
+      "code": "def flip_horizontal(grid):\n    \"\"\"Flip grid horizontally.\"\"\"\n    return [row[::-1] for row in grid]",
+      "category": "grid_operations",
+      "usage_count": 0,
+      "success_rate": 0.0,
+      "complexity_score": 1,
+      "dependencies": [],
+      "source_task_id": null
+    },
+    {
+      "name": "flip_vertical",
+      "description": "Flip grid vertically",
+      "code": "def flip_vertical(grid):\n    \"\"\"Flip grid vertically.\"\"\"\n    return grid[::-1]",
+      "category": "grid_operations",
+      "usage_count": 0,
+      "success_rate": 0.0,
+      "complexity_score": 1,
+      "dependencies": [],
+      "source_task_id": null
+    },
+    {
+      "name": "find_objects",
+      "description": "Find connected components of the same color",
+      "code": "def find_objects(grid, color=None):\n    \"\"\"Find connected components in grid.\"\"\"\n    if not grid:\n        return []\n    \n    visited = [[False] * len(grid[0]) for _ in range(len(grid))]\n    objects = []\n    \n    def dfs(r, c, target_color):\n        if (r < 0 or r >= len(grid) or c < 0 or c >= len(grid[0]) or \n            visited[r][c] or grid[r][c] != target_color):\n            return []\n        \n        visited[r][c] = True\n        cells = [(r, c)]\n        \n        for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:\n            cells.extend(dfs(r + dr, c + dc, target_color))\n        \n        return cells\n    \n    for r in range(len(grid)):\n        for c in range(len(grid[0])):\n            if not visited[r][c] and (color is None or grid[r][c] == color):\n                if grid[r][c] != 0:  # Skip background\n                    obj = dfs(r, c, grid[r][c])\n                    if obj:\n                        objects.append(obj)\n    \n    return objects",
+      "category": "pattern_detection",
+      "usage_count": 0,
+      "success_rate": 0.0,
+      "complexity_score": 4,
+      "dependencies": [],
+      "source_task_id": null
+    },
+    {
+      "name": "count_colors",
+      "description": "Count occurrences of each color in grid",
+      "code": "def count_colors(grid):\n    \"\"\"Count occurrences of each color in grid.\"\"\"\n    counts = {}\n    for row in grid:\n        for cell in row:\n            counts[cell] = counts.get(cell, 0) + 1\n    return counts",
+      "category": "analysis",
+      "usage_count": 0,
+      "success_rate": 0.0,
+      "complexity_score": 2,
+      "dependencies": [],
+      "source_task_id": null
+    },
+    {
+      "name": "get_grid_bounds",
+      "description": "Get bounding box of non-zero elements",
+      "code": "def get_grid_bounds(grid):\n    \"\"\"Get bounding box of non-zero elements.\"\"\"\n    non_zero_rows = []\n    non_zero_cols = []\n    \n    for r in range(len(grid)):\n        for c in range(len(grid[0])):\n            if grid[r][c] != 0:\n                non_zero_rows.append(r)\n                non_zero_cols.append(c)\n    \n    if not non_zero_rows:\n        return None\n    \n    return {\n        'min_row': min(non_zero_rows),\n        'max_row': max(non_zero_rows),\n        'min_col': min(non_zero_cols),\n        'max_col': max(non_zero_cols)\n    }",
+      "category": "analysis",
+      "usage_count": 0,
+      "success_rate": 0.0,
+      "complexity_score": 3,
+      "dependencies": [],
+      "source_task_id": null
+    },
+    {
+      "name": "create_empty_grid",
+      "description": "Create an empty grid of specified dimensions filled with zeros",
+      "code": "def create_empty_grid(height, width):\n    \"\"\"Create an empty grid of given dimensions.\"\"\"\n    return [[0 for _ in range(width)] for _ in range(height)]",
+      "category": "grid_operations",
+      "usage_count": 0,
+      "success_rate": 0.0,
+      "complexity_score": 1,
+      "dependencies": [],
+      "source_task_id": null
+    },
+    {
+      "name": "copy_grid",
+      "description": "Create a deep copy of a grid",
+      "code": "def copy_grid(grid):\n    \"\"\"Create a deep copy of a grid.\"\"\"\n    return [row[:] for row in grid]",
+      "category": "grid_operations",
+      "usage_count": 0,
+      "success_rate": 0.0,
+      "complexity_score": 1,
+      "dependencies": [],
+      "source_task_id": null
+    }
+  ]
+}

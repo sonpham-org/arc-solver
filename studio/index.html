@@ -1,0 +1,217 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARC LangGraph Studio</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .workflow { display: flex; flex-direction: column; align-items: center; gap: 20px; }
+        .node { 
+            background: white; 
+            border: 2px solid #ddd; 
+            border-radius: 10px; 
+            padding: 20px; 
+            min-width: 200px;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .llm-node { border-color: #4CAF50; background: #E8F5E8; }
+        .exec-node { border-color: #2196F3; background: #E3F2FD; }
+        .decision-node { border-color: #FF9800; background: #FFF3E0; }
+        .arrow { font-size: 24px; color: #666; }
+        .controls { margin: 20px 0; text-align: center; }
+        .btn { 
+            background: #4CAF50; 
+            color: white; 
+            border: none; 
+            padding: 10px 20px; 
+            border-radius: 5px; 
+            cursor: pointer;
+            margin: 5px;
+        }
+        .btn:hover { background: #45a049; }
+        .status { margin: 20px 0; padding: 15px; background: white; border-radius: 5px; }
+        .code-output { 
+            background: #1e1e1e; 
+            color: #d4d4d4; 
+            padding: 20px; 
+            border-radius: 5px; 
+            font-family: 'Courier New', monospace;
+            white-space: pre-wrap;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎯 ARC LangGraph Studio</h1>
+            <p>Visual Development Environment for ARC Problem Solving</p>
+        </div>
+        
+        <div class="workflow">
+            <div class="node llm-node">
+                <h3>🤖 Generate Code</h3>
+                <p>LLM analyzes training examples and generates Python transformation code</p>
+                <small>Input: Training examples<br>Output: Python function</small>
+            </div>
+            
+            <div class="arrow">↓</div>
+            
+            <div class="node exec-node">
+                <h3>⚡ Test Code</h3>
+                <p>Execute generated code against all training examples</p>
+                <small>Input: Python function<br>Output: Success rate</small>
+            </div>
+            
+            <div class="arrow">↓</div>
+            
+            <div class="node decision-node">
+                <h3>🤔 Decision Router</h3>
+                <p>Decide whether to refine or finalize based on results</p>
+                <small>Routes to: Refine (if failed) or Finalize (if success)</small>
+            </div>
+            
+            <div class="arrow">↓</div>
+            
+            <div style="display: flex; gap: 40px;">
+                <div class="node llm-node">
+                    <h3>🔧 Refine Code</h3>
+                    <p>LLM improves code based on test failures</p>
+                    <small>Input: Failed tests<br>Output: Improved code</small>
+                </div>
+                
+                <div class="node exec-node">
+                    <h3>📋 Finalize</h3>
+                    <p>Format final results and create test predictions</p>
+                    <small>Input: Best solution<br>Output: Final prediction</small>
+                </div>
+            </div>
+        </div>
+        
+        <div class="controls">
+            <button class="btn" onclick="runWorkflow()">🚀 Run Workflow</button>
+            <button class="btn" onclick="loadExample()">📝 Load Example</button>
+            <button class="btn" onclick="viewResults()">📊 View Results</button>
+            <button class="btn" onclick="exportConfig()">💾 Export Config</button>
+        </div>
+        
+        <div class="status" id="status">
+            <h3>📈 Status</h3>
+            <p>Ready to run ARC LangGraph workflow. Click "Run Workflow" to start.</p>
+        </div>
+        
+        <div class="code-output" id="output" style="display: none;">
+            <h3>🔍 Execution Output</h3>
+            <pre id="outputText"></pre>
+        </div>
+    </div>
+    
+    <script>
+        function updateStatus(message) {
+            document.getElementById('status').innerHTML = '<h3>📈 Status</h3><p>' + message + '</p>';
+        }
+        
+        function showOutput(text) {
+            document.getElementById('output').style.display = 'block';
+            document.getElementById('outputText').textContent = text;
+        }
+        
+        function runWorkflow() {
+            updateStatus('🚀 Starting workflow execution...');
+            
+            // Simulate workflow execution
+            setTimeout(() => {
+                updateStatus('🤖 Generating code with LLM...');
+                setTimeout(() => {
+                    updateStatus('⚡ Testing generated code...');
+                    setTimeout(() => {
+                        updateStatus('🔧 Refining solution...');
+                        setTimeout(() => {
+                            updateStatus('✅ Workflow completed! Check results below.');
+                            showOutput(`ARC LangGraph Workflow Results:
+
+Task: Random ARC problem
+Success: true
+Success Rate: 87.5%
+Attempts: 2
+Execution Time: 4.2s
+
+Generated Code:
+def transform(input_grid):
+    # Pattern: Invert colors
+    result = []
+    for row in input_grid:
+        new_row = [1-cell for cell in row]
+        result.append(new_row)
+    return result
+
+Helper Functions:
+- copy_grid()
+- get_grid_dimensions()
+
+Test Results:
+✅ Example 1: 100% match
+✅ Example 2: 100% match  
+✅ Example 3: 100% match
+❌ Example 4: 50% match
+
+Final Prediction: [[1, 0, 1], [0, 1, 0]]`);
+                        }, 1000);
+                    }, 1500);
+                }, 1000);
+            }, 500);
+        }
+        
+        function loadExample() {
+            updateStatus('📝 Loading example ARC task...');
+            showOutput(`Example ARC Task Loaded:
+
+Training Examples:
+Example 1:
+Input:  [[0, 1, 0], [1, 0, 1], [0, 1, 0]]
+Output: [[1, 0, 1], [0, 1, 0], [1, 0, 1]]
+
+Example 2:  
+Input:  [[0, 0], [1, 1]]
+Output: [[1, 1], [0, 0]]
+
+Pattern: Invert 0s and 1s
+
+Test Case:
+Input: [[0, 1], [1, 0]]
+Expected Output: ?`);
+        }
+        
+        function viewResults() {
+            updateStatus('📊 Loading latest results...');
+            fetch('/output/langgraph_test_results.json')
+                .then(response => response.json())
+                .then(data => {
+                    showOutput(JSON.stringify(data, null, 2));
+                })
+                .catch(() => {
+                    showOutput('No results found. Run the workflow first.');
+                });
+        }
+        
+        function exportConfig() {
+            updateStatus('💾 Exporting configuration...');
+            const config = {
+                name: "ARC LangGraph Agent",
+                nodes: ["generate_code", "test_code", "refine_code", "finalize"],
+                edges: [
+                    "START → generate_code → test_code → decision",
+                    "decision → refine_code → test_code (if failed)",
+                    "decision → finalize → END (if success)"
+                ]
+            };
+            showOutput(JSON.stringify(config, null, 2));
+        }
+    </script>
+</body>
+</html>

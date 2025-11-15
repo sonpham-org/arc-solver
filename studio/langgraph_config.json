@@ -1,0 +1,104 @@
+{
+  "name": "ARC LangGraph Agent",
+  "description": "Visual workflow for solving ARC problems",
+  "version": "1.0.0",
+  "graphs": {
+    "arc_solver": {
+      "path": "arc_langgraph_agent/workflow.py",
+      "entry_point": "create_arc_workflow",
+      "nodes": [
+        {
+          "id": "generate_code",
+          "type": "llm_node",
+          "description": "Generate Python code using LLM",
+          "inputs": [
+            "task_data",
+            "training_examples"
+          ],
+          "outputs": [
+            "solution_code",
+            "helper_functions"
+          ]
+        },
+        {
+          "id": "test_code",
+          "type": "execution_node",
+          "description": "Test generated code against examples",
+          "inputs": [
+            "solution_code",
+            "training_examples"
+          ],
+          "outputs": [
+            "test_results",
+            "success_rate"
+          ]
+        },
+        {
+          "id": "refine_code",
+          "type": "llm_node",
+          "description": "Refine code based on failures",
+          "inputs": [
+            "current_solution",
+            "failed_tests"
+          ],
+          "outputs": [
+            "improved_solution"
+          ]
+        },
+        {
+          "id": "finalize",
+          "type": "formatting_node",
+          "description": "Create final output",
+          "inputs": [
+            "best_solution"
+          ],
+          "outputs": [
+            "final_prediction"
+          ]
+        }
+      ],
+      "edges": [
+        {
+          "from": "START",
+          "to": "generate_code"
+        },
+        {
+          "from": "generate_code",
+          "to": "test_code"
+        },
+        {
+          "from": "test_code",
+          "to": "decision_router"
+        },
+        {
+          "from": "decision_router",
+          "to": "refine_code",
+          "condition": "needs_refinement"
+        },
+        {
+          "from": "decision_router",
+          "to": "finalize",
+          "condition": "complete"
+        },
+        {
+          "from": "refine_code",
+          "to": "test_code"
+        },
+        {
+          "from": "finalize",
+          "to": "END"
+        }
+      ]
+    }
+  },
+  "environment": {
+    "required_packages": [
+      "langgraph",
+      "langchain-core",
+      "langchain-google-genai"
+    ],
+    "env_variables": [
+      "GEMINI_API_KEY"
+    ]
+  }
+}

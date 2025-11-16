@@ -9,8 +9,84 @@ import time
 from typing import Dict, Any, Optional, List
 import json
 
-from .workflow import compile_workflow, create_initial_state
+from langgraph.graph import StateGraph, START, END
+
+# Import our nodes (moved here from workflow.py for convenience)
+from .nodes import (
+    generate_code_node,
+    test_code_node,
+    refinement_node,
+    extract_helpers_node,
+    should_continue_predicate,
+    finalize_node
+)
+
 from .schema import AgentState, WorkflowOutput
+
+
+def create_arc_workflow(llm) -> StateGraph:
+    """
+    Create the LangGraph workflow for ARC problem solving.
+    """
+    workflow = StateGraph(AgentState)
+
+    # Add nodes with LLM access
+    workflow.add_node("generate_code", lambda state: generate_code_node(state, llm))
+    workflow.add_node("test_code", test_code_node)
+    workflow.add_node("extract_helpers", lambda state: extract_helpers_node(state, llm))
+    workflow.add_node("refine_code", lambda state: refinement_node(state, llm))
+    workflow.add_node("finalize", finalize_node)
+
+    # Add edges
+    workflow.add_edge(START, "generate_code")
+    workflow.add_edge("generate_code", "extract_helpers")
+    workflow.add_edge("extract_helpers", "test_code")
+
+    workflow.add_conditional_edges(
+        "test_code",
+        should_continue_predicate, 
+        # This could be a little bit more sophisticated and human here.
+        # But AgentState needs more stuffs in it.
+        {
+            "refine": "refine_code",
+            "end": "finalize"
+        }
+    )
+
+    workflow.add_edge("refine_code", "test_code")
+    workflow.add_edge("finalize", END)
+
+    return workflow
+
+
+def create_initial_state(task_id: str,
+                        task_data: Dict[str, Any],
+                        max_attempts: int = 5) -> AgentState:
+    """
+    Create the initial state for the workflow.
+    """
+    return {
+        "task_id": task_id,
+        "task_data": task_data,
+        "attempt_number": 1,
+        "max_attempts": max_attempts,
+        "current_solution": None,
+        "previous_solutions": [],
+        "training_results": [],
+        "training_success_rate": 0.0,
+        "testing_results": [],
+        "testing_success_rate": 0.0,
+        "available_helpers": {},
+        "new_helpers": {},
+        "should_continue": True,
+        "metadata": {}
+    }
+
+
+def compile_workflow(llm) -> Any:
+    """Compile the workflow for execution."""
+    workflow = create_arc_workflow(llm)
+    return workflow.compile()
 
 
 class ARCLangGraphAgent:
@@ -20,8 +96,8 @@ class ARCLangGraphAgent:
     This agent uses a workflow-based approach to iteratively generate,
     test, and refine solutions for ARC tasks.
     """
-    
-    def __init__(self, llm, max_attempts: int = 5, initial_helpers: List[Dict] = None):
+
+    def __init__(self, llm, max_attempts: int = 5, available_helpers: Dict[str, Dict] = None):
         """
         Initialize the ARC LangGraph Agent.
         
@@ -32,8 +108,57 @@ class ARCLangGraphAgent:
         """
         self.max_attempts = max_attempts
         self.llm = llm
-        self.initial_helpers = initial_helpers or []
+        
+        # Store pre-loaded helpers under `available_helpers`
+        self.available_helpers = available_helpers or {}
+
+        # Preload and normalize helper functions at initialization so
+        # `solve_task` can simply copy them into the workflow initial state.
+        self._load_default_helpers()
         self.workflow = compile_workflow(llm)
+
+    def _load_default_helpers(self) -> None:
+        """
+        Load and normalize default helper functions from `.tools.FUNCTION_MAP`
+        into `self.available_helpers`. Extracts source, docstring, parameter
+        names and initializes usage metrics.
+        """
+        from inspect import getsource, signature
+
+        # Only load defaults when no helpers were provided at init
+        if self.available_helpers:
+            return
+
+        try:
+            from .tools import FUNCTION_MAP
+        except Exception:
+            FUNCTION_MAP = {}
+
+        processed = {}
+        for name, func in FUNCTION_MAP.items():
+            try:
+                src = getsource(func)
+            except Exception:
+                src = ''
+
+            desc = func.__doc__.strip() if getattr(func, '__doc__', None) else ''
+
+            try:
+                params = list(signature(func).parameters.keys())
+            except Exception:
+                params = []
+
+            processed[name] = {
+                'name': name,
+                'code': src,
+                'description': desc,
+                'parameters': params,
+                'usage_count': 0,
+                'success_rate': 0.0
+            }
+
+        self.available_helpers = processed
+        print(f"  📚 Loaded {len(self.available_helpers)} default helper functions into available_helpers")
         
     def solve_task(self, task_id: str, task_data: Dict[str, Any], max_attempts: int = 5) -> WorkflowOutput:
         """
@@ -52,85 +177,60 @@ class ARCLangGraphAgent:
         # Create initial state with custom max_attempts and helper functions
         initial_state = create_initial_state(task_id, task_data, max_attempts)
         
-        # Pre-load helper functions from toolbox
-        if self.initial_helpers:
-            from .schema import HelperFunction
-            initial_state.helper_functions = [
-                HelperFunction(
-                    name=helper['name'],
-                    description=helper['description'],
-                    code=helper['code'],
-                    usage_count=helper.get('usage_count', 0),
-                    success_rate=helper.get('success_rate', 0.0)
-                )
-                for helper in self.initial_helpers
-            ]
-            print(f"  📚 Loaded {len(self.initial_helpers)} helper functions from toolbox")
+        # Copy the preloaded helper definitions into the workflow initial state
+        initial_state['available_helpers'] = dict(self.available_helpers)
         
         # Initialize final_state to avoid UnboundLocalError
-        final_state = {
-            "success_rate": 0.0,
-            "current_solution": None,
-            "attempt_number": 1,
-            "final_prediction": None,
-            "previous_solutions": [],
-            "helper_functions": initial_state.helper_functions if hasattr(initial_state, 'helper_functions') else []
+        workflow_results = {
+            "task_id": task_id,
+            "workflow_completed": False,
+            "attempts": 0,
+            "solutions": [],
+            "training_results": [],
+            "training_success_rate": 0.0,
+            "testing_results": [],
+            "testing_success_rate": 0.0,
+            "execution_time": 0.0,
+            "new_helpers": {}
         }
 
         try:
             # Run the workflow
-            workflow_result = self.workflow.invoke(initial_state)
-            
-            # Update final_state with workflow results
-            if workflow_result:
-                final_state.update(workflow_result)
-            
-            # Extract results
-            success = final_state.get("success_rate", 0.0) >= 1.0
-            best_solution = final_state.get("current_solution")
-            best_success_rate = final_state.get("success_rate", 0.0)
-            attempts_made = final_state.get("attempt_number", 1)
-            final_prediction = final_state.get("final_prediction")
-            all_solutions = final_state.get("previous_solutions", [])
-            if best_solution:
-                all_solutions.append(best_solution)
+            final_state = self.workflow.invoke(initial_state)
             
         except Exception as e:
-            # Handle workflow execution errors
-            success = False
-            best_solution = None
-            best_success_rate = 0.0
-            attempts_made = 1
-            final_prediction = None
-            all_solutions = []
             print(f"Error running workflow for task {task_id}: {e}")
         
         execution_time = time.time() - start_time
         
-        # Create output
-        # Convert to output format with additional tracking
-        output = WorkflowOutput(
-            task_id=task_id,
-            success=success,
-            attempts=attempts_made,
-            solutions=all_solutions,
-            test_results=[],  # Will be populated by workflow
-            execution_time=time.time() - start_time,
-            reflection_history=[],  # Will be populated by workflow
-            helper_functions=final_state.get("helper_functions", []),
-            
-            # Additional fields for toolbox integration
-            helper_functions_used=[hf.name for hf in final_state.get("helper_functions", []) if getattr(hf, 'usage_count', 0) > 0],
-            new_helper_functions=[],  # Will be populated by helper extraction
-            code=best_solution.get('main_code', '') if best_solution else '',
-            test_success=success
-        )
-        
+        # Create example_results for both training and testing examples
+        testing_examples = task_data.get("test", [])
+
+        training_results = final_state["training_results"]
+        training_success_rate = final_state["training_success_rate"]
+        testing_results, testing_success_rate = _build_example_results(best_solution, testing_examples, include_expected=False)
+
+        execution_time = time.time() - start_time
+
+        # Build WorkflowOutput-compatible dict (matches schema.WorkflowOutput)
+        output: WorkflowOutput = {
+            "task_id": task_id,
+            "workflow_completed": True,
+            "attempts": attempts_made,
+            "solutions": all_solutions,
+            "training_results": training_results,
+            "training_success_rate": training_success_rate,
+            "testing_results": testing_results,
+            "testing_success_rate": testing_success_rate,
+            "execution_time": execution_time,
+            "new_helpers": workflow_results.get("new_helpers", {})
+        }
+
         return output
     
     def solve_multiple_tasks(self, tasks: Dict[str, Dict[str, Any]]) -> Dict[str, WorkflowOutput]:
         """
-        Solve multiple ARC tasks.
+        Solve multiple ARC tasks. Which bascially calls solve_task in a loop or in parallel.
         
         Args:
             tasks: Dictionary mapping task_id to task_data
@@ -146,9 +246,9 @@ class ARCLangGraphAgent:
             results[task_id] = result
             
             # Print summary
-            success_rate = result["best_success_rate"]
-            attempts = result["attempts_made"]
-            time_taken = result["execution_time"]
+            success_rate = result.get("training_success_rate", 0.0)
+            attempts = result.get("attempts", 0)
+            time_taken = result.get("execution_time", 0.0)
             
             print(f"  Success rate: {success_rate:.2%}")
             print(f"  Attempts: {attempts}/{self.max_attempts}")
@@ -167,10 +267,11 @@ class ARCLangGraphAgent:
         Returns:
             The main transformation code, or None if no solution
         """
-        final_solution = result.get("final_solution")
-        if final_solution:
-            return final_solution.get("main_code")
-        return None
+        sols = result.get("solutions", [])
+        if not sols:
+            return None
+        final_solution = sols[-1]
+        return final_solution.get("main_code")
     
     def get_helper_functions(self, result: WorkflowOutput) -> List[Dict[str, Any]]:
         """
@@ -182,10 +283,11 @@ class ARCLangGraphAgent:
         Returns:
             List of helper function definitions
         """
-        final_solution = result.get("final_solution")
-        if final_solution:
-            return final_solution.get("helper_functions", [])
-        return []
+        sols = result.get("solutions", [])
+        if not sols:
+            return []
+        final_solution = sols[-1]
+        return final_solution.get("helper_functions", {})
     
     def export_solution_to_json(self, result: WorkflowOutput) -> Dict[str, Any]:
         """
@@ -197,8 +299,9 @@ class ARCLangGraphAgent:
         Returns:
             Dictionary in ARC solver JSON format
         """
-        final_solution = result.get("final_solution")
-        
+        sols = result.get("solutions", [])
+        final_solution = sols[-1] if sols else None
+
         if not final_solution:
             return {
                 "helper_python_functions": [],
@@ -244,60 +347,79 @@ class ARCLangGraphAgent:
         Returns:
             Dictionary with detailed test results
         """
+        # Return example_results (both train and test) matching schema.ExampleResult
         from .nodes import execute_transformation_code, calculate_grid_overlap
-        
-        final_solution = result.get("final_solution")
+
+        sols = result.get("solutions", [])
+        final_solution = sols[-1] if sols else None
         if not final_solution:
             return {"error": "No solution to test"}
-        
+
         training_examples = task_data.get("train", [])
-        test_results = []
-        
-        for i, example in enumerate(training_examples):
-            input_grid = example["input"]
-            expected_output = example["output"]
-            
-            try:
-                predicted_output = execute_transformation_code(
-                    final_solution["main_code"],
-                    input_grid,
-                    final_solution["helper_functions"]
-                )
-                
-                if predicted_output is not None:
-                    overlap = calculate_grid_overlap(predicted_output, expected_output)
-                    success = overlap >= 100.0
-                else:
-                    overlap = 0.0
-                    success = False
+        testing_examples = task_data.get("test", [])
+
+        def _single_build(examples, include_expected: bool = True):
+            example_results = []
+            for i, example in enumerate(examples):
+                input_grid = example.get("input")
+                expected_output = example.get("output") if include_expected else []
+
+                predicted_output = None
+                overlap = 0.0
+                success_flag = False
+                matching_size = False
+                error_message = None
+
+                try:
+                    predicted_output, error = execute_transformation_code(
+                        final_solution.get("main_code", ""),
+                        input_grid,
+                        final_solution.get("helper_functions", {})
+                    )
+
+                    if error is None and predicted_output is not None and include_expected and expected_output:
+                        matching_size, overlap = calculate_grid_overlap(predicted_output, expected_output)
+                        success_flag = matching_size and overlap >= 100.0
+                    else:
+                        if error is not None:
+                            error_message = str(error)
+                        overlap = 0.0
+                        success_flag = False
+                        matching_size = False
+
+                except Exception as e:
                     predicted_output = None
-                
-                test_results.append({
+                    overlap = 0.0
+                    success_flag = False
+                    matching_size = False
+                    error_message = str(e)
+
+                example_results.append({
                     "example_index": i,
-                    "success": success,
-                    "overlap_percentage": overlap,
+                    "success": success_flag,
+                    "input": input_grid,
                     "predicted_output": predicted_output,
-                    "expected_output": expected_output
+                    "expected_output": expected_output if expected_output is not None else [],
+                    "matching_size": matching_size,
+                    "overlap_percentage": float(overlap),
+                    "error_message": error_message
                 })
-                
-            except Exception as e:
-                test_results.append({
-                    "example_index": i,
-                    "success": False,
-                    "overlap_percentage": 0.0,
-                    "predicted_output": None,
-                    "expected_output": expected_output,
-                    "error": str(e)
-                })
-        
-        # Calculate overall statistics
-        successful_tests = sum(1 for r in test_results if r["success"])
-        total_tests = len(test_results)
-        overall_success_rate = successful_tests / total_tests if total_tests > 0 else 0.0
-        
+
+            successful = sum(1 for r in example_results if r["success"])
+            total = len(example_results)
+            overall = successful / total if total > 0 else 0.0
+            return example_results, overall
+
+        training_results, training_success_rate = _single_build(training_examples, include_expected=True)
+        testing_results, testing_success_rate = _single_build(testing_examples, include_expected=False)
+
         return {
-            "test_results": test_results,
-            "overall_success_rate": overall_success_rate,
-            "successful_examples": successful_tests,
-            "total_examples": total_tests
+            "example_results": {
+                "train": training_results,
+                "test": testing_results
+            },
+            "training_success_rate": training_success_rate,
+            "testing_success_rate": testing_success_rate,
+            "successful_examples": sum(1 for r in training_results if r["success"]),
+            "total_examples": len(training_results)
         }

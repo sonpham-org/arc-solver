@@ -89,7 +89,7 @@ python run_langgraph_agent.py --mode single --task-id "00d62c1b" --model gemini-
 ### State Management
 - **AgentState**: Tracks workflow progress, solutions, test results
 - **CodeSolution**: Stores generated code, helper functions, confidence
-- **TestResult**: Records execution results on training examples
+- **ExampleResult**: Records execution results on training examples
 
 ### Workflow Nodes
 - **generate_code_node**: LLM generates Python transformation code

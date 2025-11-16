@@ -43,9 +43,6 @@ from arc_langgraph_agent import ARCLangGraphAgent
 # Import model configurations and utilities
 from model_configs import MODEL_CONFIGS, find_model_key
 
-# Import persistent toolbox
-from persistent_toolbox import PersistentToolbox, initialize_default_toolbox
-
 
 # ============================================================================
 # CONFIGURATION VARIABLES - Modify these as needed
@@ -55,7 +52,7 @@ from persistent_toolbox import PersistentToolbox, initialize_default_toolbox
 MODEL = "gemini-2.5-flash-lite"
 
 # Test mode configuration
-MODE = "single"  # "single" or "batch"
+MODE = "batch"  # "single" or "batch"
 
 # Task selection for single mode
 TASK_ID = None  # Specific task ID to test (for single mode)
@@ -65,7 +62,7 @@ TASK_INDEX = None  # Task index to test (for single mode)
 NUM_TASKS = 5  # Number of tasks for batch mode
 
 # Processing configuration
-MAX_ATTEMPTS = 5  # Maximum attempts per task
+MAX_ATTEMPTS = 1  # Maximum attempts per task
 RANDOM_SEED = 42  # Random seed for reproducibility
 
 
@@ -81,8 +78,15 @@ def load_arc_solutions(file_path: str) -> Dict[str, List[List[List[int]]]]:
         return json.load(f)
 
 
-def get_task_by_index(tasks: Dict[str, Dict], index: Optional[int] = None) -> Tuple[str, Dict]:
-    """Get task by index or random task if index is None."""
+def get_task_by_index(
+    tasks: Dict[str, Dict],
+    solutions: Optional[Dict[str, List[List[List[int]]]]] = None,
+    index: Optional[int] = None
+) -> Tuple[str, Dict, Optional[Any]]:
+    """Get task by index or random task if index is None.
+
+    Also return the associated solution from `solutions` when available.
+    """
     task_ids = list(tasks.keys())
     if index is not None:
         if 0 <= index < len(task_ids):
@@ -91,7 +95,10 @@ def get_task_by_index(tasks: Dict[str, Dict], index: Optional[int] = None) -> Tu
             raise IndexError(f"Task index {index} out of range [0, {len(task_ids)-1}]")
     else:
         task_id = random.choice(task_ids)
-    return task_id, tasks[task_id]
+
+    task_data = tasks[task_id]
+    task_solution = solutions.get(task_id) if solutions is not None else None
+    return task_id, task_data, task_solution
 
 
 def create_output_directory() -> str:
@@ -406,114 +413,25 @@ def save_summary(output_dir: str, all_results: List[Dict[str, Any]], task_ids: L
     return summary
 
 
-def display_generated_code_with_lines(generated_code, attempt_number):
-    """Display the generated code with line numbers for an attempt."""
-    print(f"\n=== GENERATED CODE - ATTEMPT {attempt_number} ===")
-    if isinstance(generated_code, list):
-        code_lines = generated_code
-    else:
-        code_lines = str(generated_code).split('\n')
-    
-    for i, line in enumerate(code_lines, 1):
-        print(f"{i:3d}: {line}")
-    
-    print(f"=== END GENERATED CODE - ATTEMPT {attempt_number} ===\n")
-
-
-def test_langgraph_agent_on_task(
+def run_langgraph_agent_on_task(
+    agent: ARCLangGraphAgent,
     task_id: str,
     task_data: Dict[str, Any],
-    llm,
-    toolbox: PersistentToolbox,
+    task_solution: Optional[List[List[List[int]]]],
     max_attempts: int = 5
 ) -> Dict[str, Any]:
-    """Test LangGraph agent on a single task with max attempts enforcement."""
-    
+    """Test LangGraph agent on a single task with max attempts enforcement.
+    """
+
     print(f"Processing task {task_id} with max {max_attempts} attempts...")
-    
-    # Get suggested functions from toolbox for this run
-    suggested_functions = toolbox.suggest_functions_for_task(task_data, max_suggestions=15)
-    print(f"Available helper functions: {len(suggested_functions)}")
-    
     start_time = time.time()
     
-    # Create agent instance with toolbox functions
-    initial_helpers = [{
-        'name': func['name'],
-        'description': func['description'],
-        'code': func['code'],
-        'usage_count': func['usage_count'],
-        'success_rate': func['success_rate']
-    } for func in suggested_functions]
-    
-    agent = ARCLangGraphAgent(llm=llm, max_attempts=max_attempts, initial_helpers=initial_helpers)
-    
     # Solve the task with max attempts override
-    result = agent.solve_task(task_id, task_data, max_attempts=max_attempts)
+    result = agent.solve_task(task_id, task_data, max_attempts=max_attempts)    
+    result["execution_time"] = time.time() - start_time
     
-    # Display generated code for final attempt with line numbers
-    generated_code = result.get('code', '') if hasattr(result, 'get') else getattr(result, 'code', '')
-    if generated_code:
-        attempts_made = result.get('attempts', 1) if hasattr(result, 'get') else getattr(result, 'attempts', 1)
-        print(f"\n=== GENERATED CODE - ATTEMPT {attempts_made} ===\n")
-        
-        # Display code with line numbers
-        code_lines = generated_code.split('\n') if isinstance(generated_code, str) else generated_code
-        for i, line in enumerate(code_lines, 1):
-            print(f"{i:3d}: {line}")
-        
-        print(f"\n=== END GENERATED CODE - ATTEMPT {attempts_made} ===\n")
-    else:
-        print(f"⚠️  No generated code available for task {task_id}")
-    
-    execution_time = time.time() - start_time
-    
-    # Count successes (train + test)
-    train_success = sum(1 for example in task_data.get('train', []) 
-                      if example.get('correct', False))
-    test_success = 1 if result.get('test_success', False) else 0
-    
-    total_examples = len(task_data.get('train', [])) + len(task_data.get('test', []))
-    total_success = train_success + test_success
-    
-    success_rate = total_success / total_examples if total_examples > 0 else 0
-    
-    # Record the task attempt in toolbox
-    functions_used = []
-    if result.get('helper_functions_used'):
-        functions_used = result['helper_functions_used']
-        # Track usage of each function
-        for func_name in functions_used:
-            toolbox.update_function_usage(
-                func_name, task_id, result.get('success', False), execution_time
-            )
-    
-    # Record the task attempt in run-specific toolbox (always attempt 1 for fresh runs)
-    toolbox.record_task_attempt(task_id, 1, result.get('success', False), functions_used)
-    
-    # Extract and store any new helper functions discovered
-    if result.get('new_helper_functions'):
-        for new_func in result['new_helper_functions']:
-            added = toolbox.add_helper_function(
-                name=new_func['name'],
-                description=new_func['description'],
-                code=new_func['code'],
-                category=new_func.get('category', 'extracted'),
-                source_task_id=task_id,
-                complexity_score=new_func.get('complexity', 3)
-            )
-            if added:
-                print(f"  💡 New helper function added: {new_func['name']}")
-    
-    return {
-        'success': result.get('success', False),
-        'attempts': result.get('attempts', max_attempts),
-        'execution_time': execution_time,
-        'json_generations_success_rate': success_rate,
-        'test_success': result.get('test_success', False),
-        'generated_code': result.get('code', ''),
-        'final_solution': result
-    }
+    # Add new helper functions if needed, but not here bro.
+    return result
 
 
 def parse_arguments():
@@ -549,19 +467,7 @@ def main():
     output_dir = create_output_directory()
     print(f"Output directory: {output_dir}")
     
-    # Initialize run-specific persistent toolbox
-    toolbox = PersistentToolbox(output_dir)
-    
-    # Initialize with default functions (fresh start each run)
     print("Initializing run-specific toolbox with default helper functions...")
-    initialize_default_toolbox(toolbox)
-    stats = toolbox.get_statistics()
-    
-    print(f"\nRun Toolbox Status:")
-    print(f"  📚 Total functions: {stats['total_functions']}")
-    print(f"  📊 Categories: {list(stats['categories'].keys())}")
-    print(f"  🗂️  Toolbox location: {toolbox.storage_path}")
-    
     # Load tasks and solutions
     try:
         training_tasks = load_arc_tasks("data/arc-2024/arc-agi_training_challenges.json")
@@ -577,6 +483,13 @@ def main():
     
     # Save task IDs
     save_task_ids(output_dir, training_tasks, evaluation_tasks)
+
+    # Build a shared agent for this run using suggested helpers from a representative task
+
+
+    print(f"Initialize the list of helpers for the shared agent...")
+
+    agent = ARCLangGraphAgent(llm=llm, max_attempts=args.max_attempts)
     
     all_results = []
     task_ids_processed = []
@@ -594,15 +507,15 @@ def main():
                 print(f"Error: Task ID '{args.task_id}' not found")
                 return 1
         elif args.task_index is not None:
-            task_id, task_data = get_task_by_index(training_tasks, args.task_index)
+            task_id, task_data, task_solution = get_task_by_index(training_tasks, training_solutions, args.task_index)
         else:
             # Random task
-            task_id, task_data = get_task_by_index(training_tasks, None)
+            task_id, task_data, task_solution = get_task_by_index(training_tasks, training_solutions, None)
         
         print(f"Testing single task: {task_id}")
         
-        # Run LangGraph agent with max attempts
-        langgraph_result = test_langgraph_agent_on_task(task_id, task_data, llm, toolbox, args.max_attempts)
+        # Run LangGraph agent with max attempts (reuse shared agent)
+        langgraph_result = run_langgraph_agent_on_task(agent, task_id, task_data, task_solution, args.max_attempts)
         
         # Create result in run_arc_prompt.py format
         result = create_task_result_format(
@@ -669,9 +582,10 @@ def main():
             print(f"{'='*80}")
             
             task_data = training_tasks[task_id]
-            
-            # Run LangGraph agent with max attempts
-            langgraph_result = test_langgraph_agent_on_task(task_id, task_data, llm, toolbox, args.max_attempts)
+            task_solution = training_solutions.get(task_id)
+
+            # Run LangGraph agent with max attempts (reuse shared agent)
+            langgraph_result = run_langgraph_agent_on_task(agent, task_id, task_data, task_solution, args.max_attempts)
             
             # Create result in run_arc_prompt.py format
             result = create_task_result_format(
@@ -748,26 +662,18 @@ def initialize_llm_from_config(model_name: str):
     try:
         if provider == "google" or provider == "learnlm":
             # Google Gemini models - suppress ALTS warnings during import
-            try:
-                from langchain_google_vertexai import ChatVertexAI
-                return ChatVertexAI(
-                    model_name=model_key,
-                    temperature=0,
-                    max_output_tokens=2000
-                )
-            except ImportError:
-                from langchain_google_genai import ChatGoogleGenerativeAI
-                return ChatGoogleGenerativeAI(
-                    model=model_key,
-                    temperature=0,
-                    max_output_tokens=2000
-                )
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            return ChatGoogleGenerativeAI(
+                model=model_key,
+                temperature=0.6,
+                max_output_tokens=50000
+            )
         
         elif provider == "anthropic":
             from langchain_anthropic import ChatAnthropic
             return ChatAnthropic(
                 model_name=model_key,
-                temperature=0,
+                temperature=0.6,
                 max_tokens=2000
             )
         
@@ -775,7 +681,7 @@ def initialize_llm_from_config(model_name: str):
             from langchain_openai import ChatOpenAI
             return ChatOpenAI(
                 model_name=model_key,
-                temperature=0,
+                temperature=0.6,
                 max_tokens=2000
             )
         
@@ -783,7 +689,7 @@ def initialize_llm_from_config(model_name: str):
             from langchain_ollama import ChatOllama
             return ChatOllama(
                 model=model_key,
-                temperature=0
+                temperature=0.6
             )
         
         else:

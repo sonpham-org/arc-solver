@@ -5,8 +5,7 @@ A LangGraph-based agent for solving ARC (Abstraction and Reasoning Corpus) probl
 """
 
 from .agent import ARCLangGraphAgent
-from .schema import AgentState, WorkflowOutput, ARCTask, CodeSolution, TestResult, HelperFunction
-from .workflow import create_arc_workflow, create_initial_state, compile_workflow
+from .schema import AgentState, WorkflowOutput, ARCTask, CodeSolution, ExampleResult, HelperFunction
 from .nodes import generate_code_node, test_code_node, refinement_node, finalize_node
 from .tools import get_all_tool_definitions, FUNCTION_MAP
 
@@ -18,7 +17,7 @@ __all__ = [
     "WorkflowOutput", 
     "ARCTask",
     "CodeSolution",
-    "TestResult",
+    "ExampleResult",
     "HelperFunction",
     "create_arc_workflow",
     "create_initial_state",

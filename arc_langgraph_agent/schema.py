@@ -47,12 +47,14 @@ class HelperFunction(TypedDict):
     success_rate: Optional[float]  # For tracking performance from toolbox
 
 
-class TestResult(TypedDict):
+class ExampleResult(TypedDict):
     """Result of testing code on a single training example."""
     example_index: int
     success: bool
+    input: List[List[int]]
     predicted_output: Optional[List[List[int]]]
     expected_output: List[List[int]]
+    matching_size: bool
     overlap_percentage: float
     error_message: Optional[str]
 
@@ -60,10 +62,9 @@ class TestResult(TypedDict):
 class CodeSolution(TypedDict):
     """Represents a complete code solution with helper functions."""
     main_code: str
-    helper_functions: List[HelperFunction]
-    reasoning_trace: str  # Full reasoning analysis of patterns
+    helper_functions: Dict[str, HelperFunction]
+    reasoning_trace: str  # Full reasoning analysis of patterns. Maybe should just do some summary.
     step_by_step_transformation: List[str]  # Clear transformation steps
-    confidence_score: float
 
 
 class AgentState(TypedDict):
@@ -81,25 +82,19 @@ class AgentState(TypedDict):
     current_solution: Annotated[Optional[CodeSolution], take_latest]
     previous_solutions: Annotated[List[CodeSolution], lambda x, y: x + y]  # Append new solutions
     
-    # Test results from training examples
-    test_results: Annotated[List[TestResult], lambda x, y: x + y]  # Append new test results
-    success_rate: Annotated[float, take_latest]
+    # Test results from training and testing examples
+    training_results: Annotated[List[ExampleResult], lambda x, y: x + y]  # Append new test results
+    training_success_rate: Annotated[float, take_latest]
+    testing_results: Annotated[List[ExampleResult], lambda x, y: x + y]  # Append new test results
+    testing_success_rate: Annotated[float, take_latest]
+    final_predictions: Annotated[List[List[List[int]]], take_latest]  # Prediction for the test cases
     
     # Available helper functions (accumulated across attempts)
-    available_helpers: Annotated[List[HelperFunction], lambda x, y: x + y]  # Append new helpers
-    extracted_helpers: Annotated[List[HelperFunction], lambda x, y: x + y]  # Append extracted helpers
-    global_helper_library: Annotated[List[HelperFunction], lambda x, y: x + y]  # Append to global library
-    
-    # Messages for LLM interaction
-    messages: Annotated[List[BaseMessage], lambda x, y: x + y]  # Append new messages
-    
+    available_helpers: Annotated[Dict[str, HelperFunction], lambda x, y: {**x, **y}]  # Append new helpers
+    new_helpers: Annotated[Dict[str, HelperFunction], lambda x, y: {**x, **y}]  # Append extracted helpers
+
     # Workflow control
     should_continue: Annotated[bool, take_latest]
-    final_prediction: Annotated[Optional[List[List[int]]], take_latest]
-    
-    # Error tracking
-    errors: Annotated[List[str], lambda x, y: x + y]  # Append new errors
-    reflection_history: Annotated[List[Dict[str, Any]], lambda x, y: x + y]  # Append reflections
     
     # Additional metadata
     metadata: Annotated[Dict[str, Any], lambda x, y: {**x, **y}]  # Merge metadata dicts
@@ -108,19 +103,15 @@ class AgentState(TypedDict):
 class WorkflowOutput(TypedDict):
     """Final output from the ARC agent workflow."""
     task_id: str
-    success: bool
+    workflow_completed: bool
     attempts: int
     solutions: List[CodeSolution]
-    test_results: List[TestResult]
+    training_results: List[ExampleResult]
+    training_success_rate: float
+    testing_results: List[ExampleResult]
+    testing_success_rate: float
     execution_time: float
-    reflection_history: List[Dict[str, Any]]
-    helper_functions: List[HelperFunction]
-    
-    # Additional fields for toolbox integration
-    helper_functions_used: List[str]  # Names of helper functions used
-    new_helper_functions: List[Dict[str, Any]]  # New functions discovered
-    code: str  # Generated code
-    test_success: bool  # Whether test was successful
+    new_helpers: Dict[str,HelperFunction]
 
 
 # Type aliases for common data structures

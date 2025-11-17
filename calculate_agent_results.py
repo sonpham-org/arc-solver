@@ -9,7 +9,12 @@ Usage:
 It scans the chosen run folder for task JSON files and counts how many
 have `testing_success_rate == 1.0`, then divides by total number of task files.
 Skips `params.json` and `summary.json` when scanning.
+
+This updated version also reads `llm_testing_success_rate` (if present) and
+reports both the fraction of full LLM successes and the average LLM success
+probability across tasks.
 """
+
 import argparse
 import curses
 import json
@@ -28,18 +33,20 @@ def list_runs(output_dir: str) -> List[str]:
     return dirs
 
 
-def compute_run_stats(run_path: str) -> Tuple[int, int, float, List[Tuple[str, float]]]:
-    """Return (success_count, total_count, success_rate, list_of_task_rates).
+def compute_run_stats(run_path: str) -> Tuple[int, int, float, int, float, List[Tuple[str, float, float]]]:
+    """Return (success_count, total_count, success_rate, llm_success_count, llm_success_rate, list_of_task_rates).
 
     Only considers .json files in the run folder, excluding `params.json` and `summary.json`.
-    For each task file, reads `testing_success_rate` field (expects numeric). Missing -> 0.0.
+    For each task file, reads `testing_success_rate` and `llm_testing_success_rate` fields (expects numeric). Missing -> 0.0.
+    The `rates` list contains tuples: (filename, testing_success_rate, llm_testing_success_rate).
     """
     files = [f for f in os.listdir(run_path) if f.endswith('.json')]
     files = [f for f in files if f not in ('params.json', 'summary.json')]
 
     total = 0
     success = 0
-    rates = []
+    llm_success = 0
+    rates: List[Tuple[str, float, float]] = []
 
     for fname in sorted(files):
         fpath = os.path.join(run_path, fname)
@@ -50,10 +57,9 @@ def compute_run_stats(run_path: str) -> Tuple[int, int, float, List[Tuple[str, f
             # skip unreadable or non-json
             continue
 
-        # Only consider files that look like task result files by presence of testing_success_rate
+        # Read standard testing_success_rate
         rate = data.get('testing_success_rate') if isinstance(data, dict) else None
         if rate is None:
-            # if field absent, treat as 0.0 but still count the file as a task file
             rate_val = 0.0
         else:
             try:
@@ -61,14 +67,27 @@ def compute_run_stats(run_path: str) -> Tuple[int, int, float, List[Tuple[str, f
             except Exception:
                 rate_val = 0.0
 
+        # Read LLM testing success rate (may be absent)
+        llm_rate = data.get('llm_testing_success_rate') if isinstance(data, dict) else None
+        if llm_rate is None:
+            llm_rate_val = 0.0
+        else:
+            try:
+                llm_rate_val = float(llm_rate)
+            except Exception:
+                llm_rate_val = 0.0
+
         total += 1
         if rate_val == 1.0:
             success += 1
+        if llm_rate_val == 1.0:
+            llm_success += 1
 
-        rates.append((fname, rate_val))
+        rates.append((fname, rate_val, llm_rate_val))
 
     success_rate = (success / total) if total > 0 else 0.0
-    return success, total, success_rate, rates
+    llm_success_rate = (llm_success / total) if total > 0 else 0.0
+    return success, total, success_rate, llm_success, llm_success_rate, rates
 
 
 def draw_menu(stdscr, items: List[tuple], selected_idx: int) -> None:
@@ -92,20 +111,22 @@ def draw_menu(stdscr, items: List[tuple], selected_idx: int) -> None:
     stdscr.refresh()
 
 
-def display_result(stdscr, run_path: str, success: int, total: int, rate: float, rates: List[Tuple[str, float]]) -> None:
+def display_result(stdscr, run_path: str, success: int, total: int, rate: float, llm_success: int, llm_rate: float, rates: List[Tuple[str, float, float]]) -> None:
     stdscr.clear()
     h, w = stdscr.getmaxyx()
     stdscr.addstr(0, 0, f'Results for: {run_path}')
     stdscr.addstr(1, 0, f'Tasks counted: {total}')
     stdscr.addstr(2, 0, f'Full successes (testing_success_rate == 1.0): {success}')
     stdscr.addstr(3, 0, f'Success fraction: {rate:.4f}  ({rate*100:.2f}%)')
+    stdscr.addstr(4, 0, f'LLM full successes (llm_testing_success_rate == 1.0): {llm_success}')
+    stdscr.addstr(5, 0, f'LLM success fraction: {llm_rate:.4f}  ({llm_rate*100:.2f}%)')
 
-    stdscr.addstr(5, 0, 'Per-task testing_success_rate (filename : rate). Press any key to return.')
-    line = 6
-    for fname, r in rates:
+    stdscr.addstr(7, 0, 'Per-task rates (filename : testing_rate , llm_testing_rate). Press any key to return.')
+    line = 8
+    for fname, r, lr in rates:
         if line >= h - 1:
             break
-        stdscr.addstr(line, 0, f'{fname} : {r}')
+        stdscr.addstr(line, 0, f'{fname} : {r} , {lr}')
         line += 1
 
     stdscr.refresh()
@@ -128,6 +149,9 @@ def curses_selector(output_dir: str) -> int:
             count = 0
         runs_with_counts.append((r, count))
 
+    # Sort runs by number of task files (descending) for easier selection of large runs
+    runs_with_counts.sort(key=lambda x: x[1], reverse=True)
+
     def _main(stdscr):
         curses.curs_set(0)
         idx = 0
@@ -141,8 +165,8 @@ def curses_selector(output_dir: str) -> int:
             elif key in (ord('\n'), curses.KEY_ENTER, 10, 13):
                 # compute stats and show
                 run_path = runs_with_counts[idx][0]
-                success, total, rate, rates = compute_run_stats(run_path)
-                display_result(stdscr, run_path, success, total, rate, rates)
+                success, total, rate, llm_success, llm_rate, rates = compute_run_stats(run_path)
+                display_result(stdscr, run_path, success, total, rate, llm_success, llm_rate, rates)
             elif key in (ord('q'), 27):
                 break
 
@@ -166,11 +190,19 @@ def main(argv=None) -> int:
             print(f'Run folder not found: {run_path}')
             return 2
 
-        success, total, rate, rates = compute_run_stats(run_path)
+        success, total, rate, llm_success, llm_rate, rates = compute_run_stats(run_path)
         print(f'Run: {run_path}')
         print(f'Tasks counted: {total}')
         print(f'Full successes (testing_success_rate == 1.0): {success}')
         print(f'Success fraction: {rate:.4f}  ({rate*100:.2f}%)')
+        print(f'LLM full successes (llm_testing_success_rate == 1.0): {llm_success}')
+        print(f'LLM success fraction: {llm_rate:.4f}  ({llm_rate*100:.2f}%)')
+        # Also print average LLM success probability across tasks
+        if total > 0:
+            avg_llm_prob = sum(lr for _, _, lr in rates) / total
+        else:
+            avg_llm_prob = 0.0
+        print(f'Average LLM success probability across tasks: {avg_llm_prob:.4f} ({avg_llm_prob*100:.2f}%)')
         return 0
 
     # Interactive selector

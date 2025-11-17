@@ -301,7 +301,7 @@ def main():
 
     print(f"Initialize the list of helpers for the shared agent...")
 
-    agent = ARCLangGraphAgent(llm=llm, max_attempts=args.max_attempts)
+    agent = ARCLangGraphAgent(llm=llm, code_llm=llm, max_attempts=args.max_attempts)
     # Initialize a thread-safe shared helpers store from the agent's defaults.
     # This will be copied (snapshot) by each worker when it starts and
     # updated by workers when they finish.
@@ -398,6 +398,7 @@ def main():
             # to avoid cross-task helper/state interference.
             local_agent = ARCLangGraphAgent(
                 llm=llm,
+                code_llm=llm,
                 max_attempts=args.max_attempts,
                 available_helpers=helpers_snapshot
             )

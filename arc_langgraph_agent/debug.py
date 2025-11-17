@@ -1,3 +1,5 @@
+from typing import Any
+
 # ANSI color codes for terminal output (used for debugging LLM prompts/responses)
 BLUE = "\033[34m"
 RED = "\033[31m"

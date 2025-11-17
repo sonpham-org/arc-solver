@@ -7,17 +7,125 @@ generation utilities, execution helpers, and refinement logic.
 
 import json
 import copy
-from typing import List, Dict, Optional, Any, TypedDict, Tuple
+from typing import List, Dict, Optional, Any, TypedDict, Tuple, Union
 import traceback
 import sys
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
+import traceback
 import re
 
 # Import schema and tools
 from .schema import AgentState, CodeSolution, ExampleResult, HelperFunction
 from .tools import FUNCTION_MAP
 from .debug import print_prompt_and_response, print_python_code
+
+
+def generate_llm_predicted_output(llm,
+                                  transformation_steps: List[str],
+                                  input_grid: List[List[int]]) -> Tuple[Optional[List[List[int]]], Optional[str]]:
+    """Use the LLM to apply the step-by-step transformation to a single input grid.
+
+    The LLM is instructed to return the transformed grid as a JSON array
+    (list of lists of integers). Returns (grid, None) on success, or
+    (None, error_message) on failure.
+    """
+    try:
+        steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(transformation_steps)) if transformation_steps else "(no steps provided)"
+
+        prompt_parts = [
+            "You are an expert that can execute step-by-step grid transformations.",
+            "Given the following input grid and transformation steps, apply the steps and return the resulting grid.",
+            "Return your application in a ```transformation``` block and the 2D grid inside a fenced block labelled ```llm_predicted_output``` containing only the grid rows as lines of numbers (space-separated or contiguous digits).",
+            "Example:",
+            "```llm_predicted_output",
+            "1 0 0",
+            "0 2 2",
+            "```",
+            "Do NOT return any other text after that block.",
+            "",
+            "INPUT GRID:",
+            format_grid_for_prompt(input_grid),
+            "",
+            "TRANSFORMATION STEPS:",
+            steps_text,
+            "",
+        ]
+
+        prompt = "\n".join(prompt_parts)
+
+        response = llm.invoke(prompt)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        print_prompt_and_response(prompt, response)
+
+        # Prefer a fenced block labelled ```llm_predicted_output``` containing
+        # the grid as lines of numbers (space-separated or run-together digits).
+        import re, json
+        block_match = re.search(r'```llm_predicted_output\s*(.*?)\s*```', response_text, re.DOTALL | re.IGNORECASE)
+        if block_match:
+            block = block_match.group(1).strip()
+            lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+            parsed_grid = []
+            for line in lines:
+                # Split on whitespace; if no whitespace, split into single chars
+                if re.search(r'\s+', line):
+                    parts = re.split(r'\s+', line.strip())
+                else:
+                    parts = list(line.strip())
+                row = []
+                for p in parts:
+                    try:
+                        row.append(int(p))
+                    except Exception:
+                        # If conversion fails, try to strip non-digits then int
+                        digits = re.findall(r'-?\d+', p)
+                        if digits:
+                            row.append(int(digits[0]))
+                        else:
+                            # Give up and return error with raw block
+                            return None, f"Non-numeric token in llm_predicted_output block: '{p}'"
+                parsed_grid.append(row)
+            return parsed_grid, None
+
+        # Fallback: try to find a JSON array in the response
+        json_match = re.search(r'(\[\s*\[.*?\]\s*\])', response_text, re.DOTALL)
+        if json_match:
+            candidate = json_match.group(1)
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list) and all(isinstance(row, list) for row in parsed):
+                    norm = []
+                    for row in parsed:
+                        new_row = []
+                        for cell in row:
+                            try:
+                                new_row.append(int(cell))
+                            except Exception:
+                                new_row.append(cell)
+                        norm.append(new_row)
+                    return norm, None
+            except Exception:
+                pass
+
+        # Fallback: try to parse any Python-style list literal
+        try:
+            parsed2 = eval(response_text, {"__builtins__": {}}, {})
+            if isinstance(parsed2, list) and all(isinstance(r, list) for r in parsed2):
+                return parsed2, None
+        except Exception:
+            pass
+
+        # If response contains an explicit error line, return it as error
+        if isinstance(response_text, str) and ("error" in response_text.lower() or "cannot" in response_text.lower() or "failed" in response_text.lower()):
+            return None, response_text.strip()
+
+        return None, f"Could not parse LLM response as grid. Raw response: {response_text[:1000]}"
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        return None, f"Exception calling LLM for predicted output: {e}\n{tb}"
+
 
 def analyze_training_examples(training_examples: List[Dict]) -> str:
     """Analyze training examples to understand the pattern."""
@@ -55,7 +163,7 @@ def generate_helper_functions(training_examples: List[Dict], existing_helpers: L
     return []  # Simplified - no longer generating new helper functions
 
 
-def extract_helper_functions(llm, main_code: str, training_examples: List[Dict], 
+def extract_helper_functions(llm, code_llm, main_code: str, training_examples: List[Dict], 
                             existing_library: List[HelperFunction]) -> List[HelperFunction]:
     """Use LLM to extract useful helper functions from generated code."""
     
@@ -68,7 +176,64 @@ def extract_helper_functions(llm, main_code: str, training_examples: List[Dict],
         
         # Parse extracted helpers from response
         extracted_helpers = parse_helper_functions_response(response_text)
-        
+
+        # Try executing each extracted helper to ensure it runs. If execution fails
+        # and a `code_llm` is provided, try to refine the helper using the
+        # error traceback and re-attempt execution (up to 3 attempts).
+        for helper in extracted_helpers:
+            helper_code = helper.get("code", "")
+            helper_name = helper.get("name", "<unknown>")
+            success = False
+            attempts = 0
+            last_err = None
+
+            while attempts < 3 and not success:
+                attempts += 1
+                try:
+                    exec_namespace = {"__builtins__": __builtins__}
+                    exec(helper_code, exec_namespace)
+                    # If execution succeeds, keep the (possibly corrected) code
+                    # helper["_exec_namespace"] = exec_namespace
+                    success = True
+                except Exception:
+                    tb = traceback.format_exc()
+                    last_err = tb
+                    print(f"Execution of helper '{helper_name}' failed on attempt {attempts}: {tb}")
+
+                    # If we don't have a code_llm to refine, stop retrying
+                    if code_llm is None:
+                        break
+
+                    # Ask the `code_llm` to fix the helper code. Provide the
+                    # original helper and the traceback. Request only corrected
+                    # Python code in the response.
+                    refine_prompt = (
+                        f"The following Python helper function (or helper code) failed to execute when run.\n"
+                        f"Helper name: {helper_name}\n\n"
+                        f"ORIGINAL HELPER CODE:\n```python\n{helper_code}\n```\n\n"
+                        f"ERROR TRACEBACK:\n{tb}\n\n"
+                        "Please provide a corrected version of the helper code only (no explanations). "
+                        "Include any missing imports and keep function names where possible. Return only valid Python code."
+                    )
+
+                    try:
+                        response = code_llm.invoke(refine_prompt)
+                        response_text = response.content if hasattr(response, 'content') else str(response)
+                        print_prompt_and_response(refine_prompt, response)
+
+                        # Try to extract python from the LLM response, fall back to raw
+                        fixed_code = extract_python_code(response_text) or response_text
+
+                        # Update helper code for next attempt
+                        helper_code = fixed_code
+                        helper["code"] = helper_code
+                    except Exception as llm_e:
+                        print(f"Error invoking code_llm for helper refinement: {llm_e}")
+                        break
+
+            if not success:
+                print(f"Failed to execute helper '{helper_name}' after {attempts} attempts. Last error:\n{last_err}")
+
         return extracted_helpers
         
     except Exception as e:
@@ -150,7 +315,7 @@ def parse_helper_functions_response(response_text: str) -> List[HelperFunction]:
     return []
 
 
-def generate_python_transformation_code_with_reasoning(llm, training_examples: List[Dict], 
+def generate_python_transformation_code_with_reasoning(llm, code_llm, training_examples: List[Dict], 
                                                        helper_functions: List[HelperFunction],
                                                        previous_solutions: List[CodeSolution]) -> Tuple[str, str, List[str]]:
     """Generate Python transformation code using reasoning-first approach.
@@ -163,10 +328,10 @@ def generate_python_transformation_code_with_reasoning(llm, training_examples: L
     reasoning_trace = generate_reasoning_trace(llm, training_examples, helper_functions, previous_solutions)
     
     # Step 2: Extract step-by-step transformation from reasoning
-    transformation_steps = extract_transformation_steps(llm, reasoning_trace, training_examples)
+    transformation_steps = generate_transformation_steps(llm, reasoning_trace, training_examples)
     
     # Step 3: Generate Python code based on reasoning and steps
-    python_code = generate_code_from_reasoning(llm, reasoning_trace, transformation_steps, 
+    python_code = generate_code_from_reasoning(llm, code_llm, reasoning_trace, transformation_steps, 
                                                 training_examples, helper_functions)
     
     return python_code, reasoning_trace, transformation_steps
@@ -245,8 +410,7 @@ def generate_reasoning_trace(llm, training_examples: List[Dict],
 def generate_reflection_reasoning_trace(llm,
                                        current_solution: CodeSolution,
                                        training_results: List[ExampleResult],
-                                       training_examples: List[Dict],
-                                       reflection_history: List[Dict] = None) -> str:
+                                       training_examples: List[Dict]) -> str:
     """Generate a reflection-focused reasoning trace using the ARC-style reflection prompt.
 
     This is intended for refinement: it asks the model to analyze failures, explain
@@ -254,8 +418,7 @@ def generate_reflection_reasoning_trace(llm,
     """
     def build_refinement_reasoning_prompt(current_solution: CodeSolution,
                                         failed_tests: List[ExampleResult],
-                                        training_examples: List[Dict],
-                                        reflection_history: List[Dict]) -> str:
+                                        training_examples: List[Dict]) -> str:
         """Build reflection prompt based on ARC reflection prompt style for deep analysis."""
         
         # Format previous solution
@@ -303,16 +466,6 @@ def generate_reflection_reasoning_trace(llm,
             examples_block += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
             examples_block += f"Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
         
-        # Add reflection context
-        # TODO: Think about this reflection context for now. It is a little bit of an odd-ball at the moment.
-        reflection_context = ""
-        if reflection_history:
-            reflection_context = f"\\nPrevious reflection attempts: {len(reflection_history)}\\n"
-            reflection_context += "Key insights from previous attempts:\\n"
-            for i, refl in enumerate(reflection_history[-2:], 1):  # Show last 2
-                insight = refl.get("key_insight", "No insight recorded")
-                reflection_context += f"{i}. {insight}\\n"
-        
         prompt_parts = [
             "You are an expert mathematician, logistician and pattern recognizier who is solving the"
             "Abstract Reasoning Corpus (ARC) problems.",
@@ -343,7 +496,7 @@ def generate_reflection_reasoning_trace(llm,
             "",
             "Provide a ```reasoning``` block that contains the following information.",
             "",
-            "```reasoning"
+            "```reasoning",
             "LOGIC ERRORS",
             "- Where exactly did your transformation logic fail?",
             "- Is your failure just due to missing edge cases or flawed steps? Or is there a fundamental misunderstanding of the pattern?",
@@ -366,7 +519,7 @@ def generate_reflection_reasoning_trace(llm,
 
         return prompt
     try:
-        prompt = build_refinement_reasoning_prompt(current_solution, training_results, training_examples, reflection_history or [])
+        prompt = build_refinement_reasoning_prompt(current_solution, training_results, training_examples)
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, 'content') else str(response)
         print_prompt_and_response(prompt, response)
@@ -426,7 +579,7 @@ def extract_reasoning_content(response_text: str) -> str:
     return '\n'.join(substantial_lines[:10]) if substantial_lines else response_text[:500]
 
 
-def extract_transformation_steps(llm, reasoning_trace: str, training_examples: List[Dict]) -> List[str]:
+def generate_transformation_steps(llm, reasoning_trace: str, training_examples: List[Dict]) -> List[str]:
     """Extract clear step-by-step transformation from reasoning trace."""
     
     prompt = build_transformation_steps_prompt(reasoning_trace, training_examples)
@@ -509,9 +662,17 @@ def parse_transformation_steps(response_text: str) -> List[str]:
     return steps[:10]  # Limit to reasonable number of steps
 
 
-def generate_code_from_reasoning(llm, reasoning_trace: str, transformation_steps: List[str],
-                               training_examples: List[Dict], helper_functions: Dict[str, HelperFunction]) -> str:
-    """Generate Python code based on reasoning trace and transformation steps."""
+def generate_code_from_reasoning(llm, code_llm, reasoning_trace: str, transformation_steps: List[str],
+                                 training_examples: List[Dict], helper_functions: Dict[str, HelperFunction]) -> str:
+    """Generate Python code based on reasoning trace and transformation steps.
+
+    This function will request code from the LLM, then immediately try to execute
+    the generated `transform(input_grid)` on the first training example (if present).
+    If execution fails and a `code_llm` is provided, it will invoke that
+    LLM up to 3 times to refine the main `transform` function and retry execution.
+    The function returns the (possibly refined) Python source for the transform
+    function (or a fallback template on failure).
+    """
 
     def build_code_from_reasoning_prompt(reasoning_trace: str, transformation_steps: List[str],
                                    training_examples: List[Dict], helper_functions: Dict[str, HelperFunction]) -> str:
@@ -572,24 +733,104 @@ def generate_code_from_reasoning(llm, reasoning_trace: str, transformation_steps
         prompt = "\n".join(prompt_parts)
 
         return prompt
-    
+
     prompt = build_code_from_reasoning_prompt(reasoning_trace, transformation_steps, 
                                             training_examples, helper_functions)
-    
+
     try:
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, 'content') else str(response)
         print_prompt_and_response(prompt, response)
-        
+
         # Extract and validate Python code
         python_code = extract_and_validate_python_code(response_text)
         print_python_code(python_code)
-        
-        if python_code:
-            return python_code
-        else:
+
+        if not python_code:
             return generate_fallback_code_from_steps(transformation_steps)
-        
+
+        # Prepare a test input (first training example) if available
+        test_input = None
+        if training_examples and len(training_examples) > 0:
+            test_input = training_examples[0].get('input')
+
+        # Normalize helper functions to a list
+        helper_list = []
+        if helper_functions:
+            if isinstance(helper_functions, dict):
+                helper_list = list(helper_functions.values())
+            elif isinstance(helper_functions, list):
+                helper_list = helper_functions
+            else:
+                try:
+                    helper_list = list(helper_functions)
+                except Exception:
+                    helper_list = []
+
+        # Execute generated code once; if it fails and a code_refinement_llm is provided,
+        # attempt up to 3 refinement iterations to fix the main transform function.
+        if test_input is not None:
+            result, err = execute_transformation_code(python_code, test_input, helper_list)
+            if err is None:
+                return python_code
+
+            print(f"Initial execution failed: {err}")
+
+            if code_llm is not None:
+                last_err = None
+                for attempt in range(1, 4):
+                    try:
+                        prompt = (
+                            "The following Python transformation function `transform(input_grid)` failed when run.\n"
+                            "Please produce a corrected version of the `transform` function only (no explanations),\n"
+                            "preserving the function name and intent where possible. Include any missing imports.\n\n"
+                            "--- ORIGINAL TRANSFORM FUNCTION ---\n"
+                            f"{python_code}\n\n"
+                            "--- HELPER FUNCTIONS (for context) ---\n"
+                            f"{('\n\n'.join(h.get('code','') for h in helper_list))}\n\n"
+                            "--- ERROR TRACEBACK ---\n"
+                            f"{err}\n\n"
+                            f"Attempt: {attempt} of 3.\n\n"
+                            "Return ONLY the fixed `transform` function wrapped in triple backticks (```)."
+                        )
+
+                        response = code_llm.invoke(prompt)
+                        response_text = response.content if hasattr(response, 'content') else str(response)
+
+                        new_code = extract_python_code(response_text)
+                        if new_code:
+                            # Try executing the refined code
+                            result2, err2 = execute_transformation_code(new_code, test_input, helper_list)
+                            if err2 is None:
+                                print("Code refinement succeeded on attempt", attempt)
+                                print_python_code(new_code)
+                                return new_code
+                            else:
+                                print(f"Refined code attempt {attempt} failed: {err2}")
+                                last_err = err2
+                                python_code = new_code  # try using refined code in next attempt
+                                continue
+                        else:
+                            print(f"code_llm attempt {attempt} did not return code. Response:\n{response_text}")
+                            last_err = f"No code returned on attempt {attempt}."
+                            continue
+
+                    except Exception as llm_e:
+                        tb_llm = traceback.format_exc()
+                        print(f"Error calling code_llm on attempt {attempt}: {llm_e}\n{tb_llm}")
+                        last_err = str(llm_e) + "\n" + tb_llm
+                        continue
+
+                # After retries
+                print(f"Code refinement failed after 3 attempts: {last_err}")
+                return python_code
+
+            else:
+                return python_code
+
+        # No test input available — just return the generated code
+        return python_code
+
     except Exception as e:
         print(f"Error generating code from reasoning: {e}")
         return generate_fallback_code_from_steps(transformation_steps)
@@ -703,7 +944,7 @@ def extract_python_code(response_text: str) -> str:
 
 def execute_transformation_code(main_code: str,
                                input_grid: List[List[int]],
-                               helper_functions: List[HelperFunction]) -> Tuple[Optional[List[List[int]]], Optional[str]]:
+                               helper_functions: Union[List[HelperFunction], Dict[str, HelperFunction]]) -> Tuple[Optional[List[List[int]]], Optional[str]]:
     """Execute the transformation code on an input grid.
 
     Returns:
@@ -714,12 +955,51 @@ def execute_transformation_code(main_code: str,
       a short error description useful for refinement.
     """
     try:
+        # Normalize helper_functions to a list of helper dicts or code strings
+        helper_list = []
+        if helper_functions is None:
+            helper_list = []
+        elif isinstance(helper_functions, dict):
+            try:
+                helper_list = list(helper_functions.values())
+            except Exception:
+                helper_list = []
+        elif isinstance(helper_functions, list):
+            helper_list = helper_functions
+        else:
+            try:
+                helper_list = list(helper_functions)
+            except Exception:
+                helper_list = []
+
         # Create execution namespace
         namespace = {"__builtins__": __builtins__}
 
-        # Add helper functions to namespace
-        for helper in helper_functions:
-            exec(helper["code"], namespace)
+        # Add helper functions to namespace. Support helpers as:
+        # - dict-like with a "code" key
+        # - objects with a .get or attribute access
+        # - raw strings containing Python code
+        for helper in helper_list:
+            try:
+                # If helper is a string, assume it's Python source
+                if isinstance(helper, str):
+                    exec(helper, namespace)
+                # If helper is a dict-like with a "code" key
+                elif isinstance(helper, dict) and "code" in helper:
+                    exec(helper["code"], namespace)
+                # If helper has a 'code' attribute (e.g., TypedDict-like object)
+                elif hasattr(helper, "get") and helper.get("code"):
+                    exec(helper.get("code"), namespace)
+                elif hasattr(helper, "code"):
+                    exec(getattr(helper, "code"), namespace)
+                else:
+                    # Last resort: try to exec the helper directly
+                    exec(helper, namespace)
+            except Exception:
+                # Continue loading other helpers even if one fails; the
+                # error will surface later when running transform.
+                tb = traceback.format_exc()
+                print(f"Error executing helper during setup: {tb}")
 
         # Add built-in helper functions
         for name, func in FUNCTION_MAP.items():
@@ -824,70 +1104,34 @@ def analyze_failures(failed_tests: List[ExampleResult], training_examples: List[
     return analysis
 
 
-def refine_solution_based_on_failures(llm,
+def refine_solution_based_on_failures(llm, code_llm, 
                                       current_solution: CodeSolution,
                                       training_results: List[ExampleResult],
-                                      training_examples: List[Dict],
-                                      reflection_history: List[Dict] = None) -> Tuple[CodeSolution, Dict]:
+                                      training_examples: List[Dict], helper_functions: Dict[str, HelperFunction]) -> CodeSolution:
     """Refine the solution based on test failures using LLM with ARC-style reflection."""
-    
-    if reflection_history is None:
-        reflection_history = []
-    
-    try:
-        # Use the reflection-first flow: generate a reasoning trace, extract steps, then generate code
-        helper_functions = current_solution.get("helper_functions", [])
 
-        # 1) Get reflection reasoning trace (structured analysis only)
-        reasoning = generate_reflection_reasoning_trace(llm, current_solution, training_results, training_examples, reflection_history)
+    # 1) Get reflection reasoning trace (structured analysis only)
+    reasoning = generate_reflection_reasoning_trace(llm, current_solution, training_results, training_examples)
 
-        # 2) Extract transformation steps from the reasoning
-        transformation_steps = extract_transformation_steps(llm, reasoning, training_examples)
+    # 2) Extract transformation steps from the reasoning
+    transformation_steps = generate_transformation_steps(llm, reasoning, training_examples)
 
-        # 3) Generate refined code from reasoning + steps
-        refined_code = generate_code_from_reasoning(llm, reasoning, transformation_steps, training_examples, helper_functions)
+    # 3) Generate refined code from reasoning + steps
+    refined_code = generate_code_from_reasoning(llm, code_llm, reasoning, transformation_steps, training_examples, helper_functions)
 
-        # If code generation succeeded, return the refined solution
-        if refined_code and 'def transform(' in refined_code:
-            refined_solution = {
-                "main_code": refined_code,
-                "helper_functions": helper_functions,
-                "reasoning_trace": reasoning,
-                "step_by_step_transformation": transformation_steps or ["Refined based on failure analysis"],
-            }
-
-            refinement_record = {
-                "attempt_number": len(reflection_history) + 1,
-                "reasoning": reasoning,
-                "key_insight": extract_key_insight_from_reasoning(reasoning),
-                "failed_examples": [t.get("example_index", 0) for t in training_results],
-                "refinement_type": "arc_reflection"
-            }
-
-            return refined_solution, refinement_record
-        else:
-            # LLM produced no usable refined code. Do NOT fallback to rule-based refinement.
-            refinement_record = {
-                "attempt_number": len(reflection_history) + 1,
-                "reasoning": reasoning if reasoning else "LLM failed to produce valid refined code",
-                "key_insight": extract_key_insight_from_reasoning(reasoning) if reasoning else "LLM code-generation failed",
-                "failed_examples": [t.get("example_index", 0) for t in training_results],
-                "refinement_type": "no_refinement"
-            }
-            # Return the original solution unchanged along with the reflection record
-            return current_solution, refinement_record
-            
-    except Exception as e:
-        print(f"Error refining code with LLM: {e}")
-        # Do not perform rule-based fallback here; return original solution and an error reflection record
-        refinement_record = {
-            "attempt_number": len(reflection_history) + 1,
-            "reasoning": f"Error during LLM refinement: {str(e)}",
-            "key_insight": "Technical error prevented LLM refinement",
-            "failed_examples": [t.get("example_index", 0) for t in training_results],
-            "refinement_type": "llm_error"
+    # If code generation succeeded, return the refined solution
+    if refined_code and 'def transform(' in refined_code:
+        refined_solution = {
+            "main_code": refined_code,
+            "helper_functions": helper_functions,
+            "reasoning_trace": reasoning,
+            "step_by_step_transformation": transformation_steps or ["Refined based on failure analysis"],
         }
-        return current_solution, refinement_record
+
+        return refined_solution
+    else:
+        # Return the original solution unchanged
+        return current_solution
 
 
 def extract_reasoning_from_reflection(response_content: str) -> str:

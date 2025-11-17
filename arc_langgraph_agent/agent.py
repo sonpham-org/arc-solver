@@ -24,17 +24,17 @@ from .nodes import (
 from .schema import AgentState, WorkflowOutput
 
 
-def create_arc_workflow(llm) -> StateGraph:
+def create_arc_workflow(llm, code_llm) -> StateGraph:
     """
     Create the LangGraph workflow for ARC problem solving.
     """
     workflow = StateGraph(AgentState)
 
     # Add nodes with LLM access
-    workflow.add_node("generate_code", lambda state: generate_code_node(state, llm))
-    workflow.add_node("test_code", test_code_node)
-    workflow.add_node("extract_helpers", lambda state: extract_helpers_node(state, llm))
-    workflow.add_node("refine_code", lambda state: refinement_node(state, llm))
+    workflow.add_node("generate_code", lambda state: generate_code_node(state, llm, code_llm))
+    workflow.add_node("test_code", lambda state: test_code_node(state, llm, code_llm))
+    workflow.add_node("extract_helpers", lambda state: extract_helpers_node(state, llm, code_llm))
+    workflow.add_node("refine_code", lambda state: refinement_node(state, llm, code_llm))
     workflow.add_node("finalize", finalize_node)
 
     # Add edges
@@ -83,9 +83,9 @@ def create_initial_state(task_id: str,
     }
 
 
-def compile_workflow(llm) -> Any:
+def compile_workflow(llm, code_llm) -> Any:
     """Compile the workflow for execution."""
-    workflow = create_arc_workflow(llm)
+    workflow = create_arc_workflow(llm, code_llm)
     return workflow.compile()
 
 
@@ -97,25 +97,28 @@ class ARCLangGraphAgent:
     test, and refine solutions for ARC tasks.
     """
 
-    def __init__(self, llm, max_attempts: int = 5, available_helpers: Dict[str, Dict] = None):
+    def __init__(self, llm, code_llm, max_attempts: int = 5, available_helpers: Dict[str, Dict] = None):
         """
         Initialize the ARC LangGraph Agent.
         
         Args:
-            llm: The language model to use for code generation (e.g., ChatOpenAI, ChatAnthropic)
+            llm: The language model to use for reasoning and general tasks (e.g., ChatOpenAI, ChatAnthropic)
+            code_llm: The language model to use for code-related tasks (e.g., code generation, extraction)
             max_attempts: Maximum number of refinement attempts
             initial_helpers: Pre-loaded helper functions from persistent toolbox
         """
         self.max_attempts = max_attempts
         self.llm = llm
+        self.code_llm = llm
         
         # Store pre-loaded helpers under `available_helpers`
         self.available_helpers = available_helpers or {}
 
         # Preload and normalize helper functions at initialization so
         # `solve_task` can simply copy them into the workflow initial state.
-        self._load_default_helpers()
-        self.workflow = compile_workflow(llm)
+        # self._load_default_helpers()
+        # Decide to not load default helpers here to allow custom helpers only.
+        self.workflow = compile_workflow(llm, llm)
 
     def update_available_helpers(self, new_helpers: Dict[str, Dict]) -> None:
         """
@@ -224,9 +227,11 @@ class ARCLangGraphAgent:
         # testing_results and testing_success_rate and add to output.
         if task_solution is not None:
             from .nodes import calculate_grid_results, execute_transformation_code
+            from .actions import generate_llm_predicted_output
 
             testing_results = []
             successful = 0
+            llm_successful = 0
             total = len(task_solution)
 
             for i, expected_output in enumerate(task_solution):
@@ -237,6 +242,21 @@ class ARCLangGraphAgent:
                     input_grid,
                     final_state.get("current_solution", {}).get("helper_functions", {})
                 )
+
+                # Also ask the LLM to apply the step-by-step transformation
+                llm_predicted_output = None
+                llm_error_message = None
+                llm_matching_size = False
+                llm_overlap = 0.0
+                try:
+                    transformation_steps = final_state.get("current_solution", {}).get("step_by_step_transformation", [])
+                    llm_predicted_output, llm_error = generate_llm_predicted_output(self.llm, transformation_steps, input_grid)
+                    llm_error_message = llm_error or None
+                    if llm_predicted_output is not None and llm_error is None:
+                        llm_matching_size, llm_overlap = calculate_grid_results(llm_predicted_output, expected_output)
+                except Exception as e:
+                    llm_predicted_output = None
+                    llm_error_message = str(e)
 
                 matching_size = False
                 overlap = 0.0
@@ -253,6 +273,21 @@ class ARCLangGraphAgent:
                 if success_flag:
                     successful += 1
 
+                # Determine whether the LLM's predicted output constitutes a successful prediction
+                llm_success_flag = False
+                try:
+                    llm_success_flag = (
+                        llm_error_message is None
+                        and llm_predicted_output is not None
+                        and llm_matching_size
+                        and llm_overlap >= 100.0
+                    )
+                except Exception:
+                    llm_success_flag = False
+
+                if llm_success_flag:
+                    llm_successful += 1
+
                 testing_results.append({
                     "example_index": i,
                     "success": success_flag,
@@ -261,13 +296,19 @@ class ARCLangGraphAgent:
                     "expected_output": expected_output,
                     "matching_size": matching_size,
                     "overlap_percentage": float(overlap),
-                    "error_message": error_message
+                    "error_message": error_message,
+                    "llm_predicted_output": llm_predicted_output,
+                    "llm_matching_size": llm_matching_size,
+                    "llm_overlap_percentage": float(llm_overlap),
+                    "llm_error_message": llm_error_message,
                 })
 
             testing_success_rate = successful / total if total > 0 else 0.0
+            llm_testing_success_rate = llm_successful / total if total > 0 else 0.0
 
             output["testing_results"] = testing_results
             output["testing_success_rate"] = testing_success_rate
+            output["llm_testing_success_rate"] = llm_testing_success_rate
 
         return output
     

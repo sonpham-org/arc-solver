@@ -16,12 +16,13 @@ from .actions import (
     extract_helper_functions,
     generate_python_transformation_code_with_reasoning,
     execute_transformation_code,
+    generate_llm_predicted_output,
     calculate_grid_results,
     refine_solution_based_on_failures,
 )
 
 
-def extract_helpers_node(state: AgentState, llm) -> AgentState:
+def extract_helpers_node(state: AgentState, llm, code_llm) -> AgentState:
     """
     Extract potential useful helper functions from the generated solution
     and add them to the growing tool set.
@@ -36,6 +37,7 @@ def extract_helpers_node(state: AgentState, llm) -> AgentState:
     # Extract new helper functions from the current code using the actions helper
     extracted_helpers = extract_helper_functions(
         llm,
+        code_llm,
         current_solution["main_code"],
         training_examples,
         global_library,
@@ -60,7 +62,7 @@ def extract_helpers_node(state: AgentState, llm) -> AgentState:
     return new_state
 
 
-def generate_code_node(state: AgentState, llm) -> AgentState:
+def generate_code_node(state: AgentState, llm, code_llm) -> AgentState:
     """
     Generate Python code to solve the ARC problem using reasoning-first approach.
 
@@ -77,6 +79,7 @@ def generate_code_node(state: AgentState, llm) -> AgentState:
     # Generate code using the reasoning-first approach from actions
     main_code, reasoning_trace, transformation_steps = generate_python_transformation_code_with_reasoning(
         llm,
+        code_llm,
         training_examples,
         available_helpers,
         previous_solutions,
@@ -99,7 +102,7 @@ def generate_code_node(state: AgentState, llm) -> AgentState:
     return new_state
 
 
-def test_code_node(state: AgentState) -> AgentState:
+def test_code_node(state: AgentState, llm, code_llm) -> AgentState:
     """
     Test the generated code against training examples.
 
@@ -137,37 +140,67 @@ def test_code_node(state: AgentState) -> AgentState:
         expected_output = example["output"]
 
         # Execute the code (from actions)
-        predicted_output, error = execute_transformation_code(main_code, input_grid, helper_functions)
+        exec_predicted_output, exec_error = execute_transformation_code(main_code, input_grid, helper_functions)
 
-        if error is None and predicted_output is not None:
+        # Ask the LLM to apply the step-by-step transformation to the input
+        transformation_steps = current_solution.get("step_by_step_transformation", []) if current_solution else []
+        llm_predicted_output = None
+        llm_error = None
+        try:
+            llm_predicted_output, llm_error = generate_llm_predicted_output(llm, transformation_steps, input_grid)
+        except Exception as e:
+            llm_predicted_output = None
+            llm_error = str(e)
+
+        # Compute LLM-specific metrics (if LLM produced an output)
+        if llm_predicted_output is not None and llm_error is None:
+            llm_matching_size, llm_overlap_percentage = calculate_grid_results(llm_predicted_output, expected_output)
+        else:
+            llm_matching_size, llm_overlap_percentage = False, 0.0
+
+        llm_error_message = llm_error or None
+
+        # Prefer the LLM-produced prediction for evaluation when available
+        eval_predicted = llm_predicted_output if llm_predicted_output is not None else exec_predicted_output
+        eval_error = exec_error or llm_error
+
+        if eval_predicted is not None and eval_error is None:
             # Calculate overlap percentage
-            matching_size, overlap_percentage = calculate_grid_results(predicted_output, expected_output)
+            matching_size, overlap_percentage = calculate_grid_results(eval_predicted, expected_output)
             success = matching_size and overlap_percentage >= 100.0  # Perfect match required
 
             training_result = {
                 "example_index": i,
                 "success": success,
                 "input": input_grid,
-                "predicted_output": predicted_output,
+                "predicted_output": eval_predicted,
                 "expected_output": expected_output,
                 "matching_size": matching_size,
                 "overlap_percentage": overlap_percentage,
                 "error_message": None,
+                "llm_predicted_output": llm_predicted_output,
+                "llm_matching_size": llm_matching_size,
+                "llm_overlap_percentage": llm_overlap_percentage,
+                "llm_error_message": llm_error_message,
             }
 
             if success:
                 successful_tests += 1
         else:
-            # Execution failed or returned None
+            # Execution and/or LLM prediction failed or returned None
             training_result = {
                 "example_index": i,
                 "success": False,
                 "input": input_grid,
-                "predicted_output": None,
+                "predicted_output": eval_predicted,
+                "llm_predicted_output": llm_predicted_output,
+                "llm_matching_size": llm_matching_size,
+                "llm_overlap_percentage": llm_overlap_percentage,
+                "llm_error_message": llm_error_message,
                 "expected_output": expected_output,
                 "matching_size": False,
                 "overlap_percentage": 0.0,
-                "error_message": error or "Code execution returned None",
+                "error_message": eval_error or "Code execution and LLM prediction returned None",
             }
         training_results.append(training_result)
     success_rate = successful_tests / len(training_examples) if training_examples else 0.0
@@ -179,7 +212,7 @@ def test_code_node(state: AgentState) -> AgentState:
     return new_state
 
 
-def refinement_node(state: AgentState, llm) -> AgentState:
+def refinement_node(state: AgentState, llm, code_llm) -> AgentState:
     """
     Refine the solution based on test failures.
 
@@ -189,15 +222,15 @@ def refinement_node(state: AgentState, llm) -> AgentState:
     current_solution = state.get("current_solution")
     task_data = state["task_data"]
     attempt_number = state.get("attempt_number", 1)
+    helper_functions = state.get("available_helpers", {})
     max_attempts = state.get("max_attempts", 5)
 
     # Analyze failures
     failed_tests = [t for t in training_results if not t.get("success")]
 
     # Generate refinement based on failures using LLM with reflection (from actions)
-    reflection_history = state.get("reflection_history", [])
-    refined_solution, reflection_record = refine_solution_based_on_failures(
-        llm, current_solution, training_results, task_data["train"], reflection_history
+    refined_solution = refine_solution_based_on_failures(
+        llm, code_llm, current_solution, training_results, task_data["train"], helper_functions
     )
 
     # Update state for next attempt

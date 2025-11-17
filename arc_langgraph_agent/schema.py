@@ -52,11 +52,15 @@ class ExampleResult(TypedDict):
     example_index: int
     success: bool
     input: List[List[int]]
-    predicted_output: Optional[List[List[int]]]
     expected_output: List[List[int]]
+    predicted_output: Optional[List[List[int]]]
     matching_size: bool
     overlap_percentage: float
     error_message: Optional[str]
+    llm_predicted_output: Optional[List[List[int]]]
+    llm_matching_size: Optional[bool]
+    llm_overlap_percentage: Optional[float]
+    llm_error_message: Optional[str]
 
 
 class CodeSolution(TypedDict):
@@ -109,6 +113,7 @@ class WorkflowOutput(TypedDict):
     training_success_rate: float
     testing_results: List[ExampleResult]
     testing_success_rate: float
+    llm_testing_success_rate: float
     execution_time: float
     new_helpers: Dict[str,HelperFunction]
 

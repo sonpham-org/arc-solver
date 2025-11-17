@@ -31,6 +31,8 @@ import random
 import datetime
 import sys
 import time
+import concurrent.futures
+import threading
 from typing import Dict, List, Any, Tuple, Optional
 
 # Add the project root to the path for imports
@@ -53,16 +55,17 @@ MODEL = "gemini-2.5-flash-lite"
 
 # Test mode configuration
 MODE = "batch"  # "single" or "batch"
+NUM_WORKERS = 8  # Number of parallel workers for batch mode
 
 # Task selection for single mode
 TASK_ID = None  # Specific task ID to test (for single mode)
 TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
-NUM_TASKS = 5  # Number of tasks for batch mode
+NUM_TASKS = 100  # Number of tasks for batch mode
 
 # Processing configuration
-MAX_ATTEMPTS = 1  # Maximum attempts per task
+MAX_ATTEMPTS = 3  # Maximum attempts per task
 RANDOM_SEED = 42  # Random seed for reproducibility
 
 
@@ -187,251 +190,58 @@ def get_prediction_from_solution(solution: Dict[str, Any], task_data: Dict[str, 
     return None
 
 
-def create_task_result_format(
-    task_id: str, 
-    task_data: Dict[str, Any], 
-    langgraph_result: Dict[str, Any],
-    training_solutions: Dict[str, List[List[List[int]]]],
-    evaluation_solutions: Dict[str, List[List[List[int]]]]
-) -> Dict[str, Any]:
-    """Create result in run_arc_prompt.py format."""
-    
-    trains = []
-    tests = []
-    
-    # Get final solution for prediction generation
-    final_solution = langgraph_result.get('final_solution')
-    
-    # Process training examples
-    for i, example in enumerate(task_data['train']):
-        # Initialize metrics
-        success = False
-        overlap = 0.0
-        iou = 0.0
-        predicted_output = None
-        
-        if final_solution:
-            try:
-                predicted_output = get_prediction_from_solution(final_solution, {"test": [{"input": example["input"]}]})
-                if predicted_output and example["output"]:
-                    # Calculate overlap and IOU
-                    pred_h, pred_w = len(predicted_output), len(predicted_output[0]) if predicted_output else 0
-                    exp_h, exp_w = len(example["output"]), len(example["output"][0]) if example["output"] else 0
-                    
-                    # Calculate intersection (overlapping area)
-                    intersection_h = min(pred_h, exp_h)
-                    intersection_w = min(pred_w, exp_w)
-                    intersection_area = intersection_h * intersection_w
-                    
-                    # Calculate matching cells in intersection area
-                    matching_cells = 0
-                    for i in range(intersection_h):
-                        for j in range(intersection_w):
-                            if predicted_output[i][j] == example["output"][i][j]:
-                                matching_cells += 1
-                    
-                    # Calculate union (total area covered by both grids)
-                    union_area = pred_h * pred_w + exp_h * exp_w - intersection_area
-                    
-                    # Calculate metrics
-                    overlap = (matching_cells / intersection_area * 100.0) if intersection_area > 0 else 0.0
-                    iou = (matching_cells / union_area * 100.0) if union_area > 0 else 0.0
-                    success = (overlap == 100.0 and pred_h == exp_h and pred_w == exp_w)
-            except Exception:
-                pass
-        
-        # Convert grids to string format
-        input_lines = [''.join(map(str, row)) for row in example["input"]]
-        output_lines = [''.join(map(str, row)) for row in example["output"]]
-        predict_lines = [''.join(map(str, row)) for row in predicted_output] if predicted_output else []
-        
-        # Calculate sizes
-        input_size = f"{len(example['input'])}x{len(example['input'][0]) if example['input'] else 0}"
-        output_size = f"{len(example['output'])}x{len(example['output'][0]) if example['output'] else 0}"
-        predict_size = f"{len(predicted_output)}x{len(predicted_output[0]) if predicted_output else 0}" if predicted_output else "0x0"
-        
-        train_entry = {
-            'input': input_lines,
-            'output': output_lines,
-            'valid_predict': predicted_output is not None,
-            'predict': predict_lines,
-            'iou': iou,
-            'overlap': overlap,
-            'correct': success,
-            'transformation_succeed': [predicted_output is not None],
-            'input_size': input_size,
-            'output_size': output_size,
-            'predict_size': predict_size
-        }
-        trains.append(train_entry)
-    
-    # Process test examples
-    for i, example in enumerate(task_data['test']):
-        # Get expected output from solutions
-        expected_output = None
-        if task_id in training_solutions:
-            expected_output = training_solutions[task_id][i] if i < len(training_solutions[task_id]) else None
-        elif task_id in evaluation_solutions:
-            expected_output = evaluation_solutions[task_id][i] if i < len(evaluation_solutions[task_id]) else None
-        
-        # Generate prediction
-        predicted_output = None
-        if final_solution:
-            try:
-                predicted_output = get_prediction_from_solution(final_solution, {"test": [{"input": example["input"]}]})
-            except Exception:
-                pass
-        
-        # Calculate metrics
-        success = False
-        overlap = 0.0
-        iou = 0.0
-        if predicted_output and expected_output:
-            try:
-                # Calculate sizes
-                pred_h, pred_w = len(predicted_output), len(predicted_output[0]) if predicted_output else 0
-                exp_h, exp_w = len(expected_output), len(expected_output[0]) if expected_output else 0
-                
-                # Calculate intersection (overlapping area)
-                intersection_h = min(pred_h, exp_h)
-                intersection_w = min(pred_w, exp_w)
-                intersection_area = intersection_h * intersection_w
-                
-                # Calculate matching cells in intersection area
-                matching_cells = 0
-                for row_i in range(intersection_h):
-                    for col_j in range(intersection_w):
-                        if predicted_output[row_i][col_j] == expected_output[row_i][col_j]:
-                            matching_cells += 1
-                
-                # Calculate union (total area covered by both grids)
-                union_area = pred_h * pred_w + exp_h * exp_w - intersection_area
-                
-                # Calculate metrics
-                overlap = (matching_cells / intersection_area * 100.0) if intersection_area > 0 else 0.0
-                iou = (matching_cells / union_area * 100.0) if union_area > 0 else 0.0
-                success = (overlap == 100.0 and pred_h == exp_h and pred_w == exp_w)
-            except Exception:
-                pass
-        
-        # Convert to string format
-        input_lines = [''.join(map(str, row)) for row in example["input"]]
-        output_lines = [''.join(map(str, row)) for row in expected_output] if expected_output else []
-        predict_lines = [''.join(map(str, row)) for row in predicted_output] if predicted_output else []
-        
-        # Calculate sizes
-        input_size = f"{len(example['input'])}x{len(example['input'][0]) if example['input'] else 0}"
-        output_size = f"{len(expected_output)}x{len(expected_output[0]) if expected_output else 0}" if expected_output else "0x0"
-        predict_size = f"{len(predicted_output)}x{len(predicted_output[0]) if predicted_output else 0}" if predicted_output else "0x0"
-        
-        test_entry = {
-            'input': input_lines,
-            'output': output_lines,
-            'valid_predict': predicted_output is not None,
-            'predict': predict_lines,
-            'iou': iou,
-            'overlap': overlap,
-            'correct': success,
-            'transformation_succeed': [predicted_output is not None],
-            'input_size': input_size,
-            'output_size': output_size,
-            'predict_size': predict_size
-        }
-        tests.append(test_entry)
-    
-    # Calculate summary statistics
-    train_correct = sum(1 for t in trains if t['correct'])
-    test_correct = sum(1 for t in tests if t['correct'])
-    
-    result = {
-        'task_id': task_id,
-        'trains': trains,
-        'tests': tests,
-        'success': langgraph_result['success'],
-        'attempts': langgraph_result['attempts'],
-        'execution_time': langgraph_result['execution_time'],
-        'train_accuracy': (train_correct / len(trains)) * 100 if trains else 0,
-        'test_accuracy': (test_correct / len(tests)) * 100 if tests else 0,
-        'json_generations_success_rate': langgraph_result['json_generations_success_rate']
-    }
-    
-    # Add generated code if available
-    if langgraph_result.get('generated_code'):
-        # Convert string to list of lines for easier review
-        result['generated_code'] = langgraph_result['generated_code'].split('\n')
-    
-    return result
-
-
 def save_task_result(output_dir: str, task_id: str, result: Dict[str, Any]) -> None:
     """Save individual task result to JSON file."""
+    def grid_to_string_lines(grid: Optional[List[List[Any]]]) -> List[str]:
+        """Convert a 2D grid of values into a list of string lines for easy viewing."""
+        if not grid:
+            return []
+        try:
+            return ["".join(str(c) for c in row) for row in grid]
+        except Exception:
+            # Fallback: stringify each row
+            return [str(row) for row in grid]
+
+    # Normalize training_results and testing_results to include
+    # `predicted_output` and `expected_output` as list-of-strings views
+    for key in ("training_results", "testing_results"):
+        entries = result.get(key)
+        if not entries:
+            continue
+        for entry in entries:
+            # Set list-of-strings fields (override or add)
+            entry["expected_output"] = grid_to_string_lines(entry["expected_output"])
+            entry["predicted_output"] = grid_to_string_lines(entry["predicted_output"])
+            entry["input"] = grid_to_string_lines(entry["input"])
+
     with open(os.path.join(output_dir, f"{task_id}.json"), 'w') as f:
         json.dump(result, f, indent=2)
 
 
-def save_summary(output_dir: str, all_results: List[Dict[str, Any]], task_ids: List[str]) -> Dict[str, Any]:
-    """Save summary statistics."""
+def print_summary(agent: ARCLangGraphAgent, all_results: List[Dict[str, Any]], task_ids: List[str]) -> Dict[str, Any]:
+    """Save summary of all task results to summary.json."""
     total_tasks = len(all_results)
-    successful_json_generations = sum(1 for r in all_results if r.get('success', False))
-    
-    # Calculate train/test accuracy
-    train_correct = sum(sum(1 for t in r['trains'] if t['correct']) for r in all_results)
-    train_total = sum(len(r['trains']) for r in all_results)
-    test_correct = sum(sum(1 for t in r['tests'] if t['correct']) for r in all_results)
-    test_total = sum(len(r['tests']) for r in all_results)
-    
-    # Calculate average overlap percentages
-    train_overlaps = []
-    test_overlaps = []
-    
-    for r in all_results:
-        for train_example in r['trains']:
-            if train_example.get('overlap') is not None:
-                train_overlaps.append(train_example['overlap'])
-        for test_example in r['tests']:
-            if test_example.get('overlap') is not None:
-                test_overlaps.append(test_example['overlap'])
-    
-    avg_train_overlap = sum(train_overlaps) / len(train_overlaps) if train_overlaps else 0.0
-    avg_test_overlap = sum(test_overlaps) / len(test_overlaps) if test_overlaps else 0.0
-    
-    summary = {
-        "total_tasks": total_tasks,
-        "successful_json_generations": successful_json_generations,
-        "json_generations_success_rate": (successful_json_generations / total_tasks) * 100 if total_tasks > 0 else 0,
-        "train_accuracy": (train_correct / train_total) * 100 if train_total > 0 else 0,
-        "test_accuracy": (test_correct / test_total) * 100 if test_total > 0 else 0,
-        "avg_train_overlap": avg_train_overlap,
-        "avg_test_overlap": avg_test_overlap,
-        "task_ids": task_ids,
-        "timestamp": datetime.datetime.now().isoformat()
-    }
-    
-    with open(os.path.join(output_dir, "summary.json"), 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    return summary
+    workflow_successes = sum(1 for r in all_results if r.get('workflow_completed'))
+    num_tests_successful = sum(1 for r in all_results if r.get('testing_success_rate', 0) >= 1.0)
+    num_helpers_created = sum(len(r.get('new_helpers', {})) for r in all_results)
+    num_unique_helpers_created = len(set(
+        helper_name 
+        for r in all_results 
+        for helper_name in r.get('new_helpers', {}).keys()
+    ))
 
+    print(f"\n{'='*80}")
+    print(f"FINAL SUMMARY")
+    print(f"{'='*80}")
+    print(f"Total tasks processed: {total_tasks}")
+    print(f"Successful workflows: {workflow_successes}")
+    print(f"Workflow success rate: {workflow_successes / total_tasks * 100:.1f}%")
+    print(f"Number of tests fully successful: {num_tests_successful}")
+    print(f"Test success rate: {num_tests_successful / total_tasks * 100:.1f}%")
+    print(f"Total new helpers created: {num_helpers_created}")
+    print(f"Unique new helpers created: {num_unique_helpers_created}")
+    print(f"{'='*80}\n")
 
-def run_langgraph_agent_on_task(
-    agent: ARCLangGraphAgent,
-    task_id: str,
-    task_data: Dict[str, Any],
-    task_solution: Optional[List[List[List[int]]]],
-    max_attempts: int = 5
-) -> Dict[str, Any]:
-    """Test LangGraph agent on a single task with max attempts enforcement.
-    """
-
-    print(f"Processing task {task_id} with max {max_attempts} attempts...")
-    start_time = time.time()
-    
-    # Solve the task with max attempts override
-    result = agent.solve_task(task_id, task_data, max_attempts=max_attempts)    
-    result["execution_time"] = time.time() - start_time
-    
-    # Add new helper functions if needed, but not here bro.
-    return result
 
 
 def parse_arguments():
@@ -451,6 +261,8 @@ def parse_arguments():
                        help=f"Maximum attempts per task (default: {MAX_ATTEMPTS})")
     parser.add_argument("--random-seed", type=int, default=RANDOM_SEED,
                        help=f"Random seed for reproducibility (default: {RANDOM_SEED})")
+    parser.add_argument("--workers", type=int, default=NUM_WORKERS,
+                       help="Number of parallel workers for batch mode (default: 1 = sequential)")
     
     return parser.parse_args()
 
@@ -490,6 +302,11 @@ def main():
     print(f"Initialize the list of helpers for the shared agent...")
 
     agent = ARCLangGraphAgent(llm=llm, max_attempts=args.max_attempts)
+    # Initialize a thread-safe shared helpers store from the agent's defaults.
+    # This will be copied (snapshot) by each worker when it starts and
+    # updated by workers when they finish.
+    shared_helpers = dict(agent.available_helpers)
+    shared_lock = threading.Lock()
     
     all_results = []
     task_ids_processed = []
@@ -515,127 +332,178 @@ def main():
         print(f"Testing single task: {task_id}")
         
         # Run LangGraph agent with max attempts (reuse shared agent)
-        langgraph_result = run_langgraph_agent_on_task(agent, task_id, task_data, task_solution, args.max_attempts)
+        langgraph_result = agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)  
         
-        # Create result in run_arc_prompt.py format
-        result = create_task_result_format(
-            task_id, task_data, langgraph_result, 
-            training_solutions, evaluation_solutions
-        )
-        
-        all_results.append(result)
+        all_results.append(langgraph_result)
         task_ids_processed.append(task_id)
         
         # Save individual task result
-        save_task_result(output_dir, task_id, result)
+        save_task_result(output_dir, task_id, langgraph_result)
         
         # Display results
         print(f"\n{'='*60}")  
         print(f"LANGGRAPH AGENT RESULTS")
         print(f"{'='*60}")
         print(f"  Task ID: {task_id}")
-        print(f"  Success: {langgraph_result['success']}")
-        print(f"  JSON Generation Success Rate: {langgraph_result['json_generations_success_rate']:.2%}")
-        print(f"  Training Success Rate: {result['train_accuracy']:.1f}%")
+        print(f"  Workflow Completed: {'✓' if langgraph_result['workflow_completed'] else '✗'}")
         
         # Display training example details
-        if result.get('trains'):
-            for i, train_example in enumerate(result['trains']):
-                overlap = train_example.get('overlap', 0)
-                iou = train_example.get('iou', 0)
-                correct = "✓" if train_example.get('correct', False) else "✗"
-                print(f"    Train {i+1}: {correct} Overlap: {overlap:.1f}% IoU: {iou:.1f}%")
+        if langgraph_result.get('training_results'):
+            for i, train_example in enumerate(langgraph_result['training_results']):
+                overlap_percentage = train_example.get('overlap_percentage', 0)
+                matching_size = train_example.get('matching_size', False)
+                success = "✓" if overlap_percentage >= 100 and matching_size else "✗"
+                print(f"    Train {i+1}: {success} Overlap: {overlap_percentage:.1f}% Matching Size: {matching_size}")
+
+        # Display new helpers (name and description)
+        if langgraph_result.get('new_helpers'):
+            print(f"  New Helpers:")
+            for helper_name, helper_info in langgraph_result['new_helpers'].items():
+                print(f"    {helper_name}: {helper_info.get('description', '')}")
         
-        print(f"  Testing Success Rate: {result['test_accuracy']:.1f}%")
+        print(f"  Testing Success Rate: {langgraph_result['testing_success_rate']:.1f}%")
         
         # Display testing example details  
-        if result.get('tests'):
-            for i, test_example in enumerate(result['tests']):
-                overlap = test_example.get('overlap', 0)
-                iou = test_example.get('iou', 0) 
-                correct = "✓" if test_example.get('correct', False) else "✗"
-                print(f"    Test {i+1}: {correct} Overlap: {overlap:.1f}% IoU: {iou:.1f}%")
-        
+        if langgraph_result.get('testing_results'):
+            for i, test_example in enumerate(langgraph_result['testing_results']):
+                overlap_percentage = test_example.get('overlap_percentage', 0)
+                matching_size = test_example.get('matching_size', False)
+                success = "✓" if overlap_percentage >= 100 and matching_size else "✗"
+                print(f"    Test {i+1}: {success} Overlap: {overlap_percentage:.1f}% Matching Size: {matching_size}")
+
         print(f"  Attempts: {langgraph_result['attempts']}")
         print(f"  Execution Time: {langgraph_result['execution_time']:.2f}s")
         
-        if langgraph_result.get('generated_code'):
-            print(f"\n  Generated Code:")
-            if isinstance(langgraph_result['generated_code'], str):
-                code_lines = langgraph_result['generated_code'].split('\n')
-            else:
-                code_lines = langgraph_result['generated_code']
-            for line in code_lines:
-                print(f"    {line}")
-        
     elif args.mode == "batch":
-        # Batch test
-        print(f"Running batch test with {args.num_tasks} tasks")
-        
+        # Batch test (supports parallel execution when --workers > 1)
+        print(f"Running batch test with {args.num_tasks} tasks (workers={args.workers})")
+
         random.seed(args.random_seed)
-        selected_task_ids = random.sample(list(training_tasks.keys()), 
+        selected_task_ids = random.sample(list(training_tasks.keys()),
                                         min(args.num_tasks, len(training_tasks)))
-        
-        for i, task_id in enumerate(selected_task_ids, 1):
-            print(f"\n{'='*80}")  
-            print(f"PROCESSING TASK {i}/{args.num_tasks}: {task_id}")
-            print(f"{'='*80}")
-            
+
+        # Helper to run a single task (creates a fresh agent to avoid shared-state issues)
+        print_lock = threading.Lock()
+
+        def run_single_task(task_id: str):
             task_data = training_tasks[task_id]
             task_solution = training_solutions.get(task_id)
 
-            # Run LangGraph agent with max attempts (reuse shared agent)
-            langgraph_result = run_langgraph_agent_on_task(agent, task_id, task_data, task_solution, args.max_attempts)
-            
-            # Create result in run_arc_prompt.py format
-            result = create_task_result_format(
-                task_id, task_data, langgraph_result, 
-                training_solutions, evaluation_solutions
+            # Snapshot the shared helpers under lock so each worker starts with
+            # a consistent copy of the available helper toolbox.
+            with shared_lock:
+                helpers_snapshot = dict(shared_helpers)
+
+            # Create a per-task agent initialized with the snapshot of helpers
+            # to avoid cross-task helper/state interference.
+            local_agent = ARCLangGraphAgent(
+                llm=llm,
+                max_attempts=args.max_attempts,
+                available_helpers=helpers_snapshot
             )
-            
-            all_results.append(result)
-            task_ids_processed.append(task_id)
-            
-            # Save individual task result
-            save_task_result(output_dir, task_id, result)
-            
-            # Display brief results
-            print(f"  Success: {'✓' if langgraph_result['success'] else '✗'}")
-            print(f"  JSON Generation Success Rate: {langgraph_result['json_generations_success_rate']:.2%}")
-            print(f"  Attempts: {langgraph_result['attempts']}")
-            print(f"  Execution Time: {langgraph_result['execution_time']:.2f}s")
+
+            start_time = time.time()
+            try:
+                result = local_agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
+            except Exception as e:
+                result = {
+                    "task_id": task_id,
+                    "error": str(e),
+                    "workflow_completed": False,
+                    "attempts": 0,
+                    "testing_success_rate": 0.0,
+                }
+
+            result.setdefault("execution_time", time.time() - start_time)
+
+            # Merge any new helpers produced by this run into the shared helpers dict.
+            new_helpers = result.get("new_helpers") or {}
+            if new_helpers:
+                with shared_lock:
+                    # Simple merge: newer helpers override older ones by key.
+                    for hname, hdef in new_helpers.items():
+                        shared_helpers[hname] = hdef
+
+            return task_id, result
+
+        if args.workers and args.workers > 1:
+            # Parallel execution using threads
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+                future_to_task = {executor.submit(run_single_task, tid): tid for tid in selected_task_ids}
+                completed = 0
+                for future in concurrent.futures.as_completed(future_to_task):
+                    tid, langgraph_result = future.result()
+                    completed += 1
+
+                    all_results.append(langgraph_result)
+                    task_ids_processed.append(tid)
+
+                    # Save result
+                    save_task_result(output_dir, tid, langgraph_result)
+
+                    # Print concise result summary (thread-safe)
+                    with print_lock:
+                        print(f"\n{'='*60}")
+                        print(f"LANGGRAPH AGENT RESULTS ({completed}/{len(selected_task_ids)})")
+                        print(f"{'='*60}")
+                        print(f"  Task ID: {tid}")
+                        print(f"  Workflow Completed: {'✓' if langgraph_result.get('workflow_completed') else '✗'}")
+                        print(f"  Testing Success Rate: {langgraph_result.get('testing_success_rate', 0.0):.1f}%")
+                        print(f"  Attempts: {langgraph_result.get('attempts', 'N/A')}")
+                        print(f"  Execution Time: {langgraph_result.get('execution_time', 0.0):.2f}s")
+
+        else:
+            # Sequential execution (workers==1) — reuse the shared agent for efficiency
+            for i, task_id in enumerate(selected_task_ids, 1):
+                print(f"\n{'='*80}")
+                print(f"PROCESSING TASK {i}/{args.num_tasks}: {task_id}")
+                print(f"{'='*80}")
+
+                task_data = training_tasks[task_id]
+                task_solution = training_solutions.get(task_id)
+
+                # Run LangGraph agent with max attempts (reuse shared agent)
+                langgraph_result = agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
+                agent.update_available_helpers(langgraph_result.get('new_helpers', {}))
+                all_results.append(langgraph_result)
+                task_ids_processed.append(task_id)
+
+                # Save individual task result
+                save_task_result(output_dir, task_id, langgraph_result)
+
+                # Display results (same formatting as before)
+                print(f"\n{'='*60}")
+                print(f"LANGGRAPH AGENT RESULTS")
+                print(f"{'='*60}")
+                print(f"  Task ID: {task_id}")
+                print(f"  Workflow Completed: {'✓' if langgraph_result['workflow_completed'] else '✗'}")
+
+                if langgraph_result.get('training_results'):
+                    for i, train_example in enumerate(langgraph_result['training_results']):
+                        overlap_percentage = train_example.get('overlap_percentage', 0)
+                        matching_size = train_example.get('matching_size', False)
+                        correct = "✓" if train_example.get('correct', False) else "✗"
+                        print(f"    Train {i+1}: {correct} Overlap: {overlap_percentage:.1f}% Matching Size: {matching_size}")
+
+                if langgraph_result.get('new_helpers'):
+                    print(f"  New Helpers:")
+                    for helper_name, helper_info in langgraph_result['new_helpers'].items():
+                        print(f"    {helper_name}: {helper_info.get('description', '')}")
+
+                print(f"  Testing Success Rate: {langgraph_result['testing_success_rate'] * 100:.1f}%")
+
+                if langgraph_result.get('testing_results'):
+                    for i, test_example in enumerate(langgraph_result['testing_results']):
+                        overlap_percentage = test_example.get('overlap_percentage', 0)
+                        matching_size = test_example.get('matching_size', False)
+                        correct = "✓" if test_example.get('correct', False) else "✗"
+                        print(f"    Test {i+1}: {correct} Overlap: {overlap_percentage:.1f}% Matching Size: {matching_size}")
+
+                print(f"  Attempts: {langgraph_result['attempts']}")
+                print(f"  Execution Time: {langgraph_result['execution_time']:.2f}s")
     
     # Save summary
-    summary = save_summary(output_dir, all_results, task_ids_processed)
-    
-    # Display final summary
-    print(f"\n{'='*80}")  
-    print(f"FINAL SUMMARY")
-    print(f"{'='*80}")
-    print(f"Total tasks processed: {summary['total_tasks']}")
-    print(f"Successful generations: {summary['successful_json_generations']}")
-    print(f"JSON generation success rate: {summary['json_generations_success_rate']:.1f}%")
-    print(f"Training accuracy: {summary['train_accuracy']:.1f}%")
-    print(f"Test accuracy: {summary['test_accuracy']:.1f}%")
-    print(f"Average training overlap: {summary['avg_train_overlap']:.1f}%")
-    print(f"Average test overlap: {summary['avg_test_overlap']:.1f}%")
-    print(f"")
-    print(f"Note: 'Accuracy' requires perfect size + content match. 'Overlap' measures content similarity in intersection area.")
-    
-    # Display updated toolbox statistics
-    final_stats = toolbox.get_statistics()
-    print(f"\n📚 Final Run Toolbox Status:")
-    print(f"  Total functions: {final_stats['total_functions']}")
-    print(f"  Total usage records: {final_stats['total_usage_records']}")
-    print(f"  Categories: {list(final_stats['categories'].keys())}")
-    
-    # Export the run toolbox to the output directory
-    toolbox_export_path = toolbox.export_toolbox()
-    
-    print(f"\nResults saved to: {output_dir}")
-    print(f"Run toolbox database: {toolbox.storage_path}")
-    print(f"Run toolbox export: {toolbox_export_path}")
-    
+    print_summary(agent, all_results, task_ids_processed)
     return 0
 
 

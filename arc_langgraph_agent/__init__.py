@@ -7,7 +7,7 @@ A LangGraph-based agent for solving ARC (Abstraction and Reasoning Corpus) probl
 from .agent import ARCLangGraphAgent
 from .schema import AgentState, WorkflowOutput, ARCTask, CodeSolution, ExampleResult, HelperFunction
 from .nodes import generate_code_node, test_code_node, refinement_node, finalize_node
-from .tools import get_all_tool_definitions, FUNCTION_MAP
+from .tools import FUNCTION_MAP
 
 __version__ = "0.1.0"
 
@@ -26,6 +26,5 @@ __all__ = [
     "test_code_node",
     "refinement_node",
     "finalize_node",
-    "get_all_tool_definitions",
     "FUNCTION_MAP"
 ]

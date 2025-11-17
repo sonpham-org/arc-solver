@@ -68,7 +68,7 @@ def create_initial_state(task_id: str,
     return {
         "task_id": task_id,
         "task_data": task_data,
-        "attempt_number": 1,
+        "attempt_number": 0,
         "max_attempts": max_attempts,
         "current_solution": None,
         "previous_solutions": [],
@@ -117,6 +117,15 @@ class ARCLangGraphAgent:
         self._load_default_helpers()
         self.workflow = compile_workflow(llm)
 
+    def update_available_helpers(self, new_helpers: Dict[str, Dict]) -> None:
+        """
+        Update the available helper functions with new ones.
+        
+        Args:
+            new_helpers: Dictionary of new helper functions to add
+        """
+        self.available_helpers.update(new_helpers)
+
     def _load_default_helpers(self) -> None:
         """
         Load and normalize default helper functions from `.tools.FUNCTION_MAP`
@@ -160,13 +169,14 @@ class ARCLangGraphAgent:
         self.available_helpers = processed
         print(f"  📚 Loaded {len(self.available_helpers)} default helper functions into available_helpers")
         
-    def solve_task(self, task_id: str, task_data: Dict[str, Any], max_attempts: int = 5) -> WorkflowOutput:
+    def solve_task(self, task_id: str, task_data: Dict[str, Any], task_solution: Optional[List[List[List[int]]]] = None, max_attempts: int = 5) -> WorkflowOutput:
         """
         Solve a single ARC task using the LangGraph workflow.
         
         Args:
             task_id: The task identifier
             task_data: Task data containing train/test examples
+            task_solution: Contains the expected outputs for the test examples, if available
             max_attempts: Maximum number of attempts (overrides instance setting)
             
         Returns:
@@ -194,37 +204,70 @@ class ARCLangGraphAgent:
             "new_helpers": {}
         }
 
-        try:
-            # Run the workflow
-            final_state = self.workflow.invoke(initial_state)
-            
-        except Exception as e:
-            print(f"Error running workflow for task {task_id}: {e}")
-        
-        execution_time = time.time() - start_time
-        
-        # Create example_results for both training and testing examples
-        testing_examples = task_data.get("test", [])
-
-        training_results = final_state["training_results"]
-        training_success_rate = final_state["training_success_rate"]
-        testing_results, testing_success_rate = _build_example_results(best_solution, testing_examples, include_expected=False)
-
+        # Run the workflow
+        final_state = self.workflow.invoke(initial_state)
         execution_time = time.time() - start_time
 
         # Build WorkflowOutput-compatible dict (matches schema.WorkflowOutput)
         output: WorkflowOutput = {
             "task_id": task_id,
             "workflow_completed": True,
-            "attempts": attempts_made,
-            "solutions": all_solutions,
-            "training_results": training_results,
-            "training_success_rate": training_success_rate,
-            "testing_results": testing_results,
-            "testing_success_rate": testing_success_rate,
+            "attempts": final_state["attempt_number"],
+            "solutions": final_state["previous_solutions"] + ([final_state["current_solution"]] if final_state["current_solution"] else []),
+            "training_results": final_state["training_results"],
+            "training_success_rate": final_state["training_success_rate"],
             "execution_time": execution_time,
             "new_helpers": workflow_results.get("new_helpers", {})
         }
+
+        # At this point, final_predictions needed to be compared with task_solution to create
+        # testing_results and testing_success_rate and add to output.
+        if task_solution is not None:
+            from .nodes import calculate_grid_results, execute_transformation_code
+
+            testing_results = []
+            successful = 0
+            total = len(task_solution)
+
+            for i, expected_output in enumerate(task_solution):
+                input_grid = task_data["test"][i]["input"]
+
+                predicted_output, error = execute_transformation_code(
+                    final_state.get("current_solution", {}).get("main_code", ""),
+                    input_grid,
+                    final_state.get("current_solution", {}).get("helper_functions", {})
+                )
+
+                matching_size = False
+                overlap = 0.0
+                success_flag = False
+                error_message = None
+
+                if error is None and predicted_output is not None:
+                    matching_size, overlap = calculate_grid_results(predicted_output, expected_output)
+                    success_flag = matching_size and overlap >= 100.0
+                else:
+                    if error is not None:
+                        error_message = str(error)
+
+                if success_flag:
+                    successful += 1
+
+                testing_results.append({
+                    "example_index": i,
+                    "success": success_flag,
+                    "input": input_grid,
+                    "predicted_output": predicted_output,
+                    "expected_output": expected_output,
+                    "matching_size": matching_size,
+                    "overlap_percentage": float(overlap),
+                    "error_message": error_message
+                })
+
+            testing_success_rate = successful / total if total > 0 else 0.0
+
+            output["testing_results"] = testing_results
+            output["testing_success_rate"] = testing_success_rate
 
         return output
     
@@ -348,7 +391,7 @@ class ARCLangGraphAgent:
             Dictionary with detailed test results
         """
         # Return example_results (both train and test) matching schema.ExampleResult
-        from .nodes import execute_transformation_code, calculate_grid_overlap
+        from .nodes import execute_transformation_code, calculate_grid_results
 
         sols = result.get("solutions", [])
         final_solution = sols[-1] if sols else None
@@ -378,7 +421,7 @@ class ARCLangGraphAgent:
                     )
 
                     if error is None and predicted_output is not None and include_expected and expected_output:
-                        matching_size, overlap = calculate_grid_overlap(predicted_output, expected_output)
+                        matching_size, overlap = calculate_grid_results(predicted_output, expected_output)
                         success_flag = matching_size and overlap >= 100.0
                     else:
                         if error is not None:

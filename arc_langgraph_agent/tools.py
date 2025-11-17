@@ -9,71 +9,6 @@ and operations needed in ARC tasks.
 from typing import List, Dict, Any
 import numpy as np
 
-
-def create_grid_tool_definitions() -> List[Dict[str, Any]]:
-    """Create tool definitions for basic grid operations."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "copy_grid",
-                "description": "Create a deep copy of a grid",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "grid": {
-                            "type": "array",
-                            "description": "The grid to copy",
-                            "items": {
-                                "type": "array",
-                                "items": {"type": "integer"}
-                            }
-                        }
-                    },
-                    "required": ["grid"]
-                }
-            }
-        },
-        {
-            "type": "function", 
-            "function": {
-                "name": "get_grid_dimensions",
-                "description": "Get the height and width of a grid",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "grid": {
-                            "type": "array",
-                            "description": "The grid to measure",
-                            "items": {
-                                "type": "array",
-                                "items": {"type": "integer"}
-                            }
-                        }
-                    },
-                    "required": ["grid"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "create_empty_grid",
-                "description": "Create an empty grid filled with a specific value",
-                "parameters": {
-                    "type": "object", 
-                    "properties": {
-                        "height": {"type": "integer", "description": "Height of the grid"},
-                        "width": {"type": "integer", "description": "Width of the grid"},
-                        "fill_value": {"type": "integer", "description": "Value to fill the grid with", "default": 0}
-                    },
-                    "required": ["height", "width"]
-                }
-            }
-        }
-    ]
-
-
 # Helper function implementations
 def copy_grid(grid: List[List[int]]) -> List[List[int]]:
     """Create a deep copy of a grid."""
@@ -211,8 +146,3 @@ FUNCTION_MAP = {
     'find_rectangles': find_rectangles,
     'flood_fill': flood_fill,
 }
-
-
-def get_all_tool_definitions() -> List[Dict[str, Any]]:
-    """Get all available tool definitions for the ARC agent."""
-    return create_grid_tool_definitions()

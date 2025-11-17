@@ -73,7 +73,7 @@ class AgentState(TypedDict):
     # Task information (immutable)
     task_id: Annotated[str, take_first]
     task_data: Annotated[Dict[str, Any], immutable_dict]
-    
+
     # Current attempt information
     attempt_number: Annotated[int, take_latest]
     max_attempts: Annotated[int, take_latest]
@@ -82,12 +82,11 @@ class AgentState(TypedDict):
     current_solution: Annotated[Optional[CodeSolution], take_latest]
     previous_solutions: Annotated[List[CodeSolution], lambda x, y: x + y]  # Append new solutions
     
-    # Test results from training and testing examples
+    # Test results from training and testing examples 
     training_results: Annotated[List[ExampleResult], lambda x, y: x + y]  # Append new test results
     training_success_rate: Annotated[float, take_latest]
-    testing_results: Annotated[List[ExampleResult], lambda x, y: x + y]  # Append new test results
-    testing_success_rate: Annotated[float, take_latest]
     final_predictions: Annotated[List[List[List[int]]], take_latest]  # Prediction for the test cases
+    previous_run_training_results: Annotated[List[List[ExampleResult]], lambda x, y: x + y]  # Append new test results 
     
     # Available helper functions (accumulated across attempts)
     available_helpers: Annotated[Dict[str, HelperFunction], lambda x, y: {**x, **y}]  # Append new helpers

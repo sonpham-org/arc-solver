@@ -13,7 +13,6 @@ from .schema import AgentState, CodeSolution, ExampleResult, HelperFunction
 
 # Import actions (helpers, prompts, execution, refinement)
 from .actions import (
-    analyze_training_examples,
     extract_helper_functions,
     generate_python_transformation_code_with_reasoning,
     execute_transformation_code,
@@ -47,14 +46,12 @@ def extract_helpers_node(state: AgentState, llm) -> AgentState:
     new_state["extracted_helpers"] = extracted_helpers
 
     # Add to available helpers for this task
-    for helper in extracted_helpers:
-        if not any(h["name"] == helper["name"] for h in new_state.get("available_helpers", [])):
-            new_state.setdefault("available_helpers", []).append(helper)
-
-    # Add to global library (growing across tasks)
-    for helper in extracted_helpers:
-        if not any(h["name"] == helper["name"] for h in new_state.get("global_helper_library", [])):
-            new_state.setdefault("global_helper_library", []).append(helper)
+    for h in extracted_helpers:
+        func_name = h.get("name") if isinstance(h, dict) else str(h)
+        # Add to new helpers if not already in available_helpers
+        if func_name not in new_state.get("available_helpers", {}):
+            new_state.setdefault("available_helpers", {})[func_name] = h
+            new_state.setdefault("new_helpers", {})[func_name] = h
 
     # CRITICAL: Update current solution's helper_functions for execution
     if new_state.get("current_solution"):
@@ -71,12 +68,11 @@ def generate_code_node(state: AgentState, llm) -> AgentState:
     examples to generate a solution using the provided language model.
     """
     task_data = state["task_data"]
-    available_helpers = state.get("available_helpers", [])
+    available_helpers = state.get("available_helpers", {})
     previous_solutions = state.get("previous_solutions", [])
 
     # Analyze the training examples (kept for node-level logging/analysis)
     training_examples = task_data["train"]
-    analysis_text = analyze_training_examples(training_examples)
 
     # Generate code using the reasoning-first approach from actions
     main_code, reasoning_trace, transformation_steps = generate_python_transformation_code_with_reasoning(
@@ -98,6 +94,7 @@ def generate_code_node(state: AgentState, llm) -> AgentState:
     new_state = copy.deepcopy(state)
     new_state["current_solution"] = solution
     new_state["should_continue"] = True
+    new_state["attempt_number"] = state["attempt_number"] + 1
 
     return new_state
 
@@ -109,15 +106,22 @@ def test_code_node(state: AgentState) -> AgentState:
     This node executes the current solution on all training examples
     and calculates the success rate.
     """
-    current_solution = state.get("current_solution")
+    # Deep copy the new state, and shove in the training results to previous_training_results
+    # And then reset training results
+    new_state = copy.deepcopy(state)
+    if "training_results" in state:
+        previous_results = state["training_results"]
+        if "previous_run_training_results" not in new_state:
+            new_state["previous_run_training_results"] = []
+        new_state["previous_run_training_results"].append(previous_results)
+        new_state["training_results"] = []
+        new_state["training_success_rate"] = 0.0
+        new_state["should_continue"] = False
+
     task_data = state["task_data"]
+    current_solution = state.get("current_solution")
 
     if not current_solution:
-        # No solution to test
-        new_state = copy.deepcopy(state)
-        new_state["test_results"] = []
-        new_state["success_rate"] = 0.0
-        new_state["should_continue"] = False
         return new_state
 
     training_examples = task_data["train"]
@@ -137,16 +141,17 @@ def test_code_node(state: AgentState) -> AgentState:
 
         if error is None and predicted_output is not None:
             # Calculate overlap percentage
-            size_match, value_match_percentage = calculate_grid_results(predicted_output, expected_output)
-            success = size_match and value_match_percentage >= 100.0  # Perfect match required
+            matching_size, overlap_percentage = calculate_grid_results(predicted_output, expected_output)
+            success = matching_size and overlap_percentage >= 100.0  # Perfect match required
 
             training_result = {
                 "example_index": i,
                 "success": success,
+                "input": input_grid,
                 "predicted_output": predicted_output,
                 "expected_output": expected_output,
-                "size_match": size_match,
-                "value_match_percentage": value_match_percentage,
+                "matching_size": matching_size,
+                "overlap_percentage": overlap_percentage,
                 "error_message": None,
             }
 
@@ -157,13 +162,14 @@ def test_code_node(state: AgentState) -> AgentState:
             training_result = {
                 "example_index": i,
                 "success": False,
+                "input": input_grid,
                 "predicted_output": None,
                 "expected_output": expected_output,
+                "matching_size": False,
                 "overlap_percentage": 0.0,
                 "error_message": error or "Code execution returned None",
             }
-
-    training_results.append(training_result)
+        training_results.append(training_result)
     success_rate = successful_tests / len(training_examples) if training_examples else 0.0
 
     # Update state
@@ -179,25 +185,19 @@ def refinement_node(state: AgentState, llm) -> AgentState:
 
     This node analyzes failed test cases and attempts to improve the solution.
     """
-    test_results = state.get("test_results", [])
+    training_results = state.get("training_results", [])
     current_solution = state.get("current_solution")
     task_data = state["task_data"]
     attempt_number = state.get("attempt_number", 1)
     max_attempts = state.get("max_attempts", 5)
 
     # Analyze failures
-    failed_tests = [t for t in test_results if not t.get("success")]
-
-    if not failed_tests or attempt_number >= max_attempts:
-        # No failures or max attempts reached
-        new_state = copy.deepcopy(state)
-        new_state["should_continue"] = False
-        return new_state
+    failed_tests = [t for t in training_results if not t.get("success")]
 
     # Generate refinement based on failures using LLM with reflection (from actions)
     reflection_history = state.get("reflection_history", [])
     refined_solution, reflection_record = refine_solution_based_on_failures(
-        llm, current_solution, failed_tests, task_data["train"], reflection_history
+        llm, current_solution, training_results, task_data["train"], reflection_history
     )
 
     # Update state for next attempt
@@ -207,10 +207,6 @@ def refinement_node(state: AgentState, llm) -> AgentState:
     new_state["attempt_number"] = attempt_number + 1
     new_state["should_continue"] = True
 
-    # Update reflection history
-    new_reflection_history = reflection_history + [reflection_record]
-    new_state["reflection_history"] = new_reflection_history
-
     return new_state
 
 
@@ -219,7 +215,6 @@ def should_continue_predicate(state: AgentState) -> str:
     Determine if the workflow should continue or end.
 
     Returns:
-        "test" if we should test the current solution
         "refine" if we should refine based on failures
         "end" if we should end the workflow
     """
@@ -230,7 +225,7 @@ def should_continue_predicate(state: AgentState) -> str:
 
     # If no solution, end
     if not current_solution:
-        return "end"
+        return "refine"
 
     # If perfect success, end
     if success_rate >= 1.0:
@@ -240,12 +235,9 @@ def should_continue_predicate(state: AgentState) -> str:
     if attempt_number >= max_attempts:
         return "end"
 
-    # If we haven't tested yet, test
-    if "test_results" not in state:
-        return "test"
-
     # If we have failures and haven't reached max attempts, refine
-    if success_rate < 1.0 and attempt_number < max_attempts:
+    if success_rate < 1.0:
+        # Increment state attempt number
         return "refine"
 
     return "end"

@@ -17,13 +17,7 @@ import re
 # Import schema and tools
 from .schema import AgentState, CodeSolution, ExampleResult, HelperFunction
 from .tools import FUNCTION_MAP
-
-# ANSI color codes for terminal output (used for debugging LLM prompts/responses)
-BLUE = "\033[34m"
-RED = "\033[31m"
-GREEN = "\033[32m"
-RESET = "\033[0m"
-
+from .debug import print_prompt_and_response, print_python_code
 
 def analyze_training_examples(training_examples: List[Dict]) -> str:
     """Analyze training examples to understand the pattern."""
@@ -70,10 +64,7 @@ def extract_helper_functions(llm, main_code: str, training_examples: List[Dict],
     try:
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, 'content') else str(response)
-        print(f"{BLUE}--- Helper Extraction LLM Prompt ---{RESET}")
-        print(f"{BLUE}{prompt}{RESET}")
-        print(f"{GREEN}--- Helper Extraction LLM Response ---{RESET}")
-        print(f"{GREEN}{response_text}{RESET}")
+        print_prompt_and_response(prompt, response)
         
         # Parse extracted helpers from response
         extracted_helpers = parse_helper_functions_response(response_text)
@@ -168,49 +159,82 @@ def generate_python_transformation_code_with_reasoning(llm, training_examples: L
         Tuple of (python_code, reasoning_trace, transformation_steps)
     """
     
-    try:
-        # Step 1: Generate reasoning trace
-        reasoning_trace = generate_reasoning_trace(llm, training_examples, helper_functions, previous_solutions)
-        
-        # Step 2: Extract step-by-step transformation from reasoning
-        transformation_steps = extract_transformation_steps(llm, reasoning_trace, training_examples)
-        
-        # Step 3: Generate Python code based on reasoning and steps
-        python_code = generate_code_from_reasoning(llm, reasoning_trace, transformation_steps, 
-                                                  training_examples, helper_functions)
-        
-        return python_code, reasoning_trace, transformation_steps
-        
-    except Exception as e:
-        print(f"Error generating code with reasoning: {e}")
-        # Fallback to original approach
-        fallback_code = generate_main_transformation_code(training_examples, helper_functions, previous_solutions)
-        return fallback_code, "Error in reasoning generation", ["Fallback transformation"]
+    # Step 1: Generate reasoning trace
+    reasoning_trace = generate_reasoning_trace(llm, training_examples, helper_functions, previous_solutions)
+    
+    # Step 2: Extract step-by-step transformation from reasoning
+    transformation_steps = extract_transformation_steps(llm, reasoning_trace, training_examples)
+    
+    # Step 3: Generate Python code based on reasoning and steps
+    python_code = generate_code_from_reasoning(llm, reasoning_trace, transformation_steps, 
+                                                training_examples, helper_functions)
+    
+    return python_code, reasoning_trace, transformation_steps
 
 
 def generate_reasoning_trace(llm, training_examples: List[Dict], 
                            helper_functions: List[HelperFunction],
                            previous_solutions: List[CodeSolution]) -> str:
     """Generate detailed reasoning trace analyzing ARC patterns."""
+
+    def build_initial_reasoning_prompt(training_examples: List[Dict],
+                                   helper_functions: Dict[str, HelperFunction]) -> str:
+        """Build prompt for generating detailed reasoning about ARC patterns."""
+        
+        prompt_parts = [
+            "You are an expert mathematician, logistician and pattern recognizier who is solving the"
+            "Abstract Reasoning Corpus (ARC) problems.",
+            "Your task is to deeply analyze the input-output examples and understand the underlying pattern.",
+            "Focus on identifying the core transformation rule that maps inputs to outputs.",
+            "",
+            "TRAINING EXAMPLES:"
+        ]
+        
+        # Add training examples with detailed formatting
+        for i, example in enumerate(training_examples):
+            prompt_parts.append(f"\nExample {i+1}:")
+            prompt_parts.append(f"Input Grid ({len(example['input'])}x{len(example['input'][0]) if example['input'] else 0}):")
+            prompt_parts.append(format_grid_for_analysis(example['input']))
+            prompt_parts.append(f"Output Grid ({len(example['output'])}x{len(example['output'][0]) if example['output'] else 0}):")
+            prompt_parts.append(format_grid_for_analysis(example['output']))
+        
+        prompt_parts.extend([
+            "",
+            "ANALYSIS INSTRUCTIONS:",
+            "Provide a ```reasoning``` block that contains the following information.",
+            "",
+            "```reasoning",
+            "PATTERN OBSERVATION:",
+            "- What do you notice about the relationship between inputs and outputs?",
+            "- What patterns in movement, color changes, shape tranformations, layering, rotation, create, delete (etc.) that stand out?",
+            "- What changes between input and output grids?",
+            "- Are there consistent elements, colors, shapes, or spatial relationships?",
+            "",
+            "TRANSFORMATION HYPOTHESIS:",
+            "- What is the core rule that transforms input to output?",
+            "- How do objects move, transform shape, layer, rotate. How do colors change? How are patterns form and delete.",
+            "- Are there geometric transformations (rotation, reflection, scaling)? Are there visual transformations? Are there physical transformations?",
+            "",
+            "VERIFICATION:",
+            "- Does your hypothesis work for ALL training examples?",
+            "- What edge cases or special conditions exist?",
+            "",
+            "CORE INSIGHT:",
+            "- What is the single most important insight about this transformation?",
+            "- How would you explain this pattern in simple terms?",
+            "```",
+        ])
+        
+        return "\n".join(prompt_parts)
     
     try:
         prompt = build_initial_reasoning_prompt(training_examples, helper_functions)
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, 'content') else str(response)
+        print_prompt_and_response(prompt, response)
 
-        # Print prompt and response with ANSI colors for easier reading in terminals
-        try:
-            print(f"{BLUE}--- LLM Prompt ---{RESET}")
-            print(f"{BLUE}{prompt}{RESET}")
-            print(f"{GREEN}--- LLM Response ---{RESET}")
-            print(f"{GREEN}{response_text}{RESET}")
-        except Exception:
-            # If printing fails for any reason, silently continue
-            pass
-        
         # Extract reasoning from response
         reasoning = extract_reasoning_content(response_text)
-        
         return reasoning if reasoning else "Unable to generate reasoning trace"
         
     except Exception as e:
@@ -220,7 +244,7 @@ def generate_reasoning_trace(llm, training_examples: List[Dict],
 
 def generate_reflection_reasoning_trace(llm,
                                        current_solution: CodeSolution,
-                                       failed_tests: List[ExampleResult],
+                                       training_results: List[ExampleResult],
                                        training_examples: List[Dict],
                                        reflection_history: List[Dict] = None) -> str:
     """Generate a reflection-focused reasoning trace using the ARC-style reflection prompt.
@@ -228,77 +252,136 @@ def generate_reflection_reasoning_trace(llm,
     This is intended for refinement: it asks the model to analyze failures, explain
     what went wrong, and produce a reasoning trace focused on correcting the logic.
     """
+    def build_refinement_reasoning_prompt(current_solution: CodeSolution,
+                                        failed_tests: List[ExampleResult],
+                                        training_examples: List[Dict],
+                                        reflection_history: List[Dict]) -> str:
+        """Build reflection prompt based on ARC reflection prompt style for deep analysis."""
+        
+        # Format previous solution
+        previous_code = current_solution["main_code"]
+        
+        # Build detailed failure analysis
+        failure_analysis = []
+        for test in failed_tests:
+            example_idx = test.get("example_index", 0)
+            if example_idx < len(training_examples):
+                example = training_examples[example_idx]
+                
+                analysis = f"Training Example {example_idx + 1} - FAILED\\n"
+                analysis += "--\\n"
+                analysis += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
+                analysis += f"Expected Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
+                
+                predicted = test.get("predicted_output")
+                if predicted:
+                    analysis += f"Your Predicted Output:\\n{format_grid_for_prompt(predicted)}\\n\\n"
+                    # Calculate sizes
+                    pred_h, pred_w = len(predicted), len(predicted[0]) if predicted else 0
+                    exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
+                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: {pred_h}x{pred_w}\\n"
+                else:
+                    analysis += "Your Predicted Output: No output generated\\n\\n"
+                    exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
+                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: 0x0\\n"
+                
+                analysis += f"Overlap: {test.get('overlap_percentage', 0):.1f}%\\n"
+                analysis += f"IOU (Intersection over Union): {test.get('iou_percentage', 0):.1f}%\\n"
+                
+                error_msg = test.get("error_message")
+                if error_msg:
+                    analysis += f"Error: {error_msg}\\n"
+                
+                failure_analysis.append(analysis)
+        
+        failures_block = "\\n".join(failure_analysis)
+        
+        # Build training examples block
+        examples_block = ""
+        for i, example in enumerate(training_examples, 1):
+            examples_block += f"Training Example {i}\\n--\\n"
+            examples_block += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
+            examples_block += f"Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
+        
+        # Add reflection context
+        # TODO: Think about this reflection context for now. It is a little bit of an odd-ball at the moment.
+        reflection_context = ""
+        if reflection_history:
+            reflection_context = f"\\nPrevious reflection attempts: {len(reflection_history)}\\n"
+            reflection_context += "Key insights from previous attempts:\\n"
+            for i, refl in enumerate(reflection_history[-2:], 1):  # Show last 2
+                insight = refl.get("key_insight", "No insight recorded")
+                reflection_context += f"{i}. {insight}\\n"
+        
+        prompt_parts = [
+            "You are an expert mathematician, logistician and pattern recognizier who is solving the"
+            "Abstract Reasoning Corpus (ARC) problems.",
+            "Your task is to deeply analyze the input-output examples and understand the underlying pattern.",
+            "You previously attempted to solve this task but your solution was incorrect on some training examples."
+
+            "Your goal:",
+            "Analyze your previous attempt deeply, understand why it failed, and provide a CORRECTED reasoning rule that:",
+            "1. Correctly maps every training input to its output",
+            "2. Is general and intuitive (no memorization or hard-coded values)",
+            "3. Is logical, reproducible, and object-level",
+            "",
+            "ORIGINAL TRAINING EXAMPLES",
+            "",
+            f"{examples_block}",
+            "",
+            "YOUR PREVIOUS SOLUTION",
+            "```python",
+            f"{previous_code}",
+            "```",
+            "",
+            "DETAILED FAILURE ANALYSIS",
+            "",
+            f"{failures_block}",
+            "",
+            "",
+            "ANALYSIS INSTRUCTIONS:",
+            "",
+            "Provide a ```reasoning``` block that contains the following information.",
+            "",
+            "```reasoning"
+            "LOGIC ERRORS",
+            "- Where exactly did your transformation logic fail?",
+            "- Is your failure just due to missing edge cases or flawed steps? Or is there a fundamental misunderstanding of the pattern?",
+            ""
+            "CODE ERRORS",
+            "- Were there any coding mistakes, bugs, or mis-implementations that caused incorrect outputs or buggy error messages?",
+            "",
+            "PATTERN MISINTERPRETATION",
+            "- What pattern did you miss or misunderstand?",
+            "- What objects, shapes, colors, spatial or movement relationships did you fail to account for?",
+            "",
+            "CORE INSIGHT: "
+            "What is the insight you're missing?",
+            "```",
+            "",
+            "Return ONLY the ```reasoning``` block. DO NOT include executable Python code in your response."
+        ]
+
+        prompt = "\n".join(prompt_parts)
+
+        return prompt
     try:
-        prompt = build_refinement_reasoning_prompt(current_solution, failed_tests, training_examples, reflection_history or [])
+        prompt = build_refinement_reasoning_prompt(current_solution, training_results, training_examples, reflection_history or [])
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, 'content') else str(response)
+        print_prompt_and_response(prompt, response)
 
         # Prefer structured reflection extraction first
-        reasoning = extract_reasoning_from_reflection(response_text)
+        reasoning = extract_reasoning_content(response_text)
         if reasoning and reasoning != "No structured reasoning found in response":
             return reasoning
-
-        # Fallback to extracting a substantial analysis from the response
-        reasoning = extract_reasoning_content(response_text)
-        return reasoning if reasoning else "Unable to generate reflection reasoning trace"
 
     except Exception as e:
         print(f"Error generating reflection reasoning trace: {e}")
         return f"Error in reflection reasoning generation: {str(e)}"
 
 
-def build_initial_reasoning_prompt(training_examples: List[Dict],
-                                   helper_functions: Dict[str, HelperFunction]) -> str:
-    """Build prompt for generating detailed reasoning about ARC patterns."""
-    
-    prompt_parts = [
-        "You are an expert at analyzing Abstract Reasoning Corpus (ARC) problems.",
-        "Your task is to deeply analyze the input-output examples and understand the underlying pattern.",
-        "Focus on identifying the core transformation rule that maps inputs to outputs.",
-        "",
-        "TRAINING EXAMPLES:"
-    ]
-    
-    # Add training examples with detailed formatting
-    for i, example in enumerate(training_examples):
-        prompt_parts.append(f"\nExample {i+1}:")
-        prompt_parts.append(f"Input Grid ({len(example['input'])}x{len(example['input'][0]) if example['input'] else 0}):")
-        prompt_parts.append(format_grid_for_analysis(example['input']))
-        prompt_parts.append(f"Output Grid ({len(example['output'])}x{len(example['output'][0]) if example['output'] else 0}):")
-        prompt_parts.append(format_grid_for_analysis(example['output']))
-    
-    prompt_parts.extend([
-        "",
-        "ANALYSIS INSTRUCTIONS:",
-        "Provide a detailed reasoning trace in the following structure:",
-        "",
-        "```reasoning",
-        "PATTERN OBSERVATION:",
-        "- What do you notice about the relationship between inputs and outputs?",
-        "- What changes between input and output grids?",
-        "- Are there consistent elements, colors, shapes, or spatial relationships?",
-        "",
-        "TRANSFORMATION HYPOTHESIS:",
-        "- What is the core rule that transforms input to output?",
-        "- How do objects, colors, or patterns change?",
-        "- Are there geometric transformations (rotation, reflection, scaling)?",
-        "",
-        "VERIFICATION:",
-        "- Does your hypothesis work for ALL training examples?",
-        "- What edge cases or special conditions exist?",
-        "",
-        "CORE INSIGHT:",
-        "- What is the single most important insight about this transformation?",
-        "- How would you explain this pattern in simple terms?",
-        "```",
-        "",
-        "Generate your detailed reasoning trace now:"
-    ])
-    
-    return "\n".join(prompt_parts)
-
-
-def format_grid_for_analysis(grid: List[List[int]]) -> str:
+def format_grid_for_analysis(grid: List[List[int]]) -> str: 
     """Format grid for detailed analysis in reasoning prompts."""
     if not grid:
         return "(empty grid)"
@@ -353,16 +436,9 @@ def extract_transformation_steps(llm, reasoning_trace: str, training_examples: L
         response_text = response.content if hasattr(response, 'content') else str(response)
         
         # Print prompt and response with ANSI colors for easier reading in terminals
-        try:
-            print(f"{BLUE}--- Transformation Steps Prompt ---{RESET}")
-            print(f"{BLUE}{prompt}{RESET}")
-            print(f"{GREEN}--- Transformation Steps Response ---{RESET}")
-            print(f"{GREEN}{response_text}{RESET}")
-        except Exception:
-            pass
+        print_prompt_and_response(prompt, response)
 
         steps = parse_transformation_steps(response_text)
-        
         return steps if steps else ["Unable to extract transformation steps"]
         
     except Exception as e:
@@ -372,29 +448,33 @@ def extract_transformation_steps(llm, reasoning_trace: str, training_examples: L
 
 def build_transformation_steps_prompt(reasoning_trace: str, training_examples: List[Dict]) -> str:
     """Build prompt for extracting clear transformation steps."""
-    
-    prompt = f"""Based on the following reasoning analysis, extract clear step-by-step transformation instructions.
+    prompt_parts = [
+        "You are an expert mathematician, logistician and pattern recognizier who is solving the Abstract Reasoning Corpus (ARC) problems.",
+        "Based on the following reasoning analysis, extract clear step-by-step transformation instructions.",
+        "------------------",
+        "REASONING ANALYSIS",
+        "------------------",
+        f"{reasoning_trace}",
+        "",
+        "------------------",
+        "INSTRUCTIONS",
+        "------------------",
+        "Extract the transformation as a numbered list of clear, actionable steps.",
+        "Each step should be implementable in code and describe exactly what to do.",
+        "",
+        "Format your response as:",
+        "```steps",
+        "1. [First transformation step]",
+        "2. [Second transformation step]",
+        "3. [Third transformation step]",
+        "...",
+        "```",
+        "",
+        "Generate the step-by-step transformation:"
+    ]
 
-REASONING ANALYSIS:
-{reasoning_trace}
+    prompt = "\n".join(prompt_parts)
 
-TRAINING EXAMPLES SUMMARY:
-We have {len(training_examples)} examples of input-output transformations.
-
-INSTRUCTIONS:
-Extract the transformation as a numbered list of clear, actionable steps.
-Each step should be implementable in code and describe exactly what to do.
-
-Format your response as:
-```steps
-1. [First transformation step]
-2. [Second transformation step]
-3. [Third transformation step]
-...
-```
-
-Generate the step-by-step transformation:"""
-    
     return prompt
 
 
@@ -430,8 +510,68 @@ def parse_transformation_steps(response_text: str) -> List[str]:
 
 
 def generate_code_from_reasoning(llm, reasoning_trace: str, transformation_steps: List[str],
-                               training_examples: List[Dict], helper_functions: List[HelperFunction]) -> str:
+                               training_examples: List[Dict], helper_functions: Dict[str, HelperFunction]) -> str:
     """Generate Python code based on reasoning trace and transformation steps."""
+
+    def build_code_from_reasoning_prompt(reasoning_trace: str, transformation_steps: List[str],
+                                   training_examples: List[Dict], helper_functions: Dict[str, HelperFunction]) -> str:
+        """Build prompt for generating Python code from reasoning and steps."""
+        steps_text = '\n'.join(f"{i+1}. {step}" for i, step in enumerate(transformation_steps))
+
+        available_helpers = ""
+        if helper_functions:
+            available_helpers = "\nAVAILABLE HELPER FUNCTIONS:\n"
+            for func in list(helper_functions.values())[:10]:
+                available_helpers += f"- {func['name']}: {func['description']}\n"
+
+        prompt_parts = [
+            "You are a Python expert implementing ARC transformations.",
+            "",
+            "Given the following reasoning analysis and step-by-step transformation, implement a Python function.",
+            "",
+            "REASONING ANALYSIS:",
+            f"{reasoning_trace}",
+            "",
+            "TRANSFORMATION STEPS:",
+            f"{steps_text}",
+            "",
+            "AVAILABLE HELPERS:",
+            f"{available_helpers}",
+            "",
+            "TRAINING EXAMPLES:",
+            f"{len(training_examples)} input-output example pairs are provided for validation.",
+            "",
+            "IMPLEMENTATION REQUIREMENTS:",
+            "1. Write a function called 'transform(input_grid)' that takes a 2D list of integers as input and returns a transformed 2D list of integers",
+            "2. Implement each transformation step clearly and precisely",
+            "3. Import any necessary standard libraries at the top",
+            "4. Use available helper functions where appropriate. If needed, define new helper functions within the code.",
+            "5. DO NOT ADD ANY EXPLANATIONS OR COMMENTS IN THE CODE",
+            "6. Address any error cases or edge conditions mentioned in the reasoning to ensure correctness and robustness",
+            "7. Return ONLY executable Python code",
+            "",
+            "Example structure:",
+            "```python",
+            "",
+            "import ...",
+            "",
+            "def helper_function_1(...):",
+            "    # Add helper functions if neeeded",
+            "",
+            "def helper_function_2(...):",
+            "    # Add helper functions if needed",
+            "",
+            "def transform(input_grid: List[List[int]]) -> List[List[int]]:",
+            "    [implementations of transformation steps]",
+            "    return transformed_grid",
+            "```",
+            "",
+            "Generate the Python code implementing the transformation:"
+        ]
+
+        prompt = "\n".join(prompt_parts)
+
+        return prompt
     
     prompt = build_code_from_reasoning_prompt(reasoning_trace, transformation_steps, 
                                             training_examples, helper_functions)
@@ -439,15 +579,11 @@ def generate_code_from_reasoning(llm, reasoning_trace: str, transformation_steps
     try:
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, 'content') else str(response)
-        print(f"{BLUE}--- LLM Prompt ---{RESET}")
-        print(f"{BLUE}{prompt}{RESET}")
-        print(f"{GREEN}--- LLM Response ---{RESET}")
-        print(f"{GREEN}{response_text}{RESET}")
+        print_prompt_and_response(prompt, response)
         
         # Extract and validate Python code
         python_code = extract_and_validate_python_code(response_text)
-        print(f"{RED}--- Extracted Python Code ---{RESET}")
-        print(f"{RED}{python_code}{RESET}")
+        print_python_code(python_code)
         
         if python_code:
             return python_code
@@ -457,69 +593,6 @@ def generate_code_from_reasoning(llm, reasoning_trace: str, transformation_steps
     except Exception as e:
         print(f"Error generating code from reasoning: {e}")
         return generate_fallback_code_from_steps(transformation_steps)
-
-
-def build_code_from_reasoning_prompt(reasoning_trace: str, transformation_steps: List[str],
-                                   training_examples: List[Dict], helper_functions: List[HelperFunction]) -> str:
-    """Build prompt for generating Python code from reasoning and steps."""
-    
-    steps_text = '\n'.join(f"{i+1}. {step}" for i, step in enumerate(transformation_steps))
-    
-    available_helpers = ""
-    if helper_functions:
-        available_helpers = "\nAVAILABLE HELPER FUNCTIONS:\n"
-        for func in helper_functions[:10]:
-            available_helpers += f"- {func['name']}: {func['description']}\n"
-    
-    prompt = f"""You are a Python expert implementing ARC transformations.
-
-Given the following reasoning analysis and step-by-step transformation, implement a Python function.
-
-REASONING ANALYSIS:
-{reasoning_trace}
-
-TRANSFORMATION STEPS:
-{steps_text}
-
-AVAILABLE HELPERS:
-{available_helpers}
-
-TRAINING EXAMPLES:
-{len(training_examples)} input-output example pairs are provided for validation.
-
-IMPLEMENTATION REQUIREMENTS:
-1. Write a function called 'transform(input_grid)' that returns the output grid
-2. Implement each transformation step clearly and precisely
-3. Use available helper functions where appropriate
-4. Add clear comments mapping to the transformation steps
-5. Handle edge cases and ensure robustness
-6. Return ONLY executable Python code
-
-Example structure:
-```python
-
-import ...
-
-def helper_function_1(...):
-    # Add helper functions if neeeded
-
-def helper_function_2(...):
-    # Add helper functions if needed
-
-def transform(input_grid: List[List[int]]) -> List[List[int]]:
-    # Step 1: [Short comment comment describing first step]
-    [implementation of step 1]
-    
-    # Step 2: [Short comment comment describing second step]
-    [implementation of step 2]
-    
-    # Continue for all steps...
-    return transformed_grid
-```
-
-Generate the Python code implementing the transformation:"""
-    
-    return prompt
 
 
 def generate_fallback_code_from_steps(transformation_steps: List[str]) -> str:
@@ -539,53 +612,6 @@ def generate_fallback_code_from_steps(transformation_steps: List[str]) -> str:
     code_lines.append("    return result")
     
     return "\n".join(code_lines)
-
-
-def build_python_focused_prompt(training_examples: List[Dict],
-                               helper_functions: List[HelperFunction],
-                               previous_solutions: List[CodeSolution]) -> str:
-    """Build prompt focused on generating high-quality Python transformation code."""
-    
-    prompt_parts = [
-        "You are a Python expert specializing in ARC problem solving.",
-        "Your PRIMARY goal is to write clean, efficient Python code that transforms input grids to output grids.",
-        "",
-        "TRAINING EXAMPLES:"
-    ]
-    
-    # Add training examples with clear input/output format
-    for i, example in enumerate(training_examples):
-        prompt_parts.append(f"\nExample {i+1}:")
-        prompt_parts.append(f"Input:  {example['input']}")
-        prompt_parts.append(f"Output: {example['output']}")
-    
-    # Add available helper functions
-    if helper_functions:
-        prompt_parts.append("\nAVAILABLE HELPER FUNCTIONS:")
-        for func in helper_functions[:10]:  # Limit to avoid token overflow
-            prompt_parts.append(f"- {func['name']}: {func['description']}")
-    
-    # Add context from previous attempts
-    if previous_solutions:
-        prompt_parts.append("\nPREVIOUS ATTEMPTS (failed):")
-        for i, sol in enumerate(previous_solutions[-2:], 1):
-            prompt_parts.append(f"Attempt {i}: {sol['main_code'][:100]}...")
-    
-    prompt_parts.extend([
-        "",
-        "PYTHON CODE REQUIREMENTS:",
-        "1. Write a function called 'transform(input_grid)' that returns the output grid",
-        "2. Use clear, readable Python code with proper error handling", 
-        "3. Focus on the core transformation logic - be precise and efficient",
-        "4. Use available helper functions or create new helper functions when appropriate",
-        "5. Add comments explaining the transformation steps",
-        "6. Return ONLY executable Python code, no explanations",
-        "7. No TODO comments - implement the logic fully",
-        "",
-        "Generate the transform function:"
-    ])
-    
-    return "\n".join(prompt_parts)
 
 
 def extract_and_validate_python_code(response_text: str) -> str:
@@ -624,62 +650,6 @@ def extract_and_validate_python_code(response_text: str) -> str:
         return '\n'.join(code_lines)
     
     return ""
-
-
-def build_code_generation_prompt(training_examples: List[Dict],
-                                helper_functions: List[HelperFunction],
-                                previous_solutions: List[CodeSolution]) -> str:
-    """Build a prompt for LLM to generate transformation code."""
-    
-    prompt_parts = [
-        "You are an expert at solving ARC (Abstraction and Reasoning Corpus) problems.",
-        "Your task is to analyze the input-output examples and write a Python function called 'transform' that solves the pattern.",
-        "",
-        "TRAINING EXAMPLES:"
-    ]
-    
-    # Add training examples
-    for i, example in enumerate(training_examples):
-        prompt_parts.append(f"\nExample {i+1}:")
-        prompt_parts.append(f"Input: {example['input']}")
-        prompt_parts.append(f"Output: {example['output']}")
-    
-    # Add available helper functions
-    if helper_functions:
-        prompt_parts.append("\nAVAILABLE HELPER FUNCTIONS:")
-        helper_names = [func['name'] for func in helper_functions]
-        prompt_parts.append(f"You can use these functions: {', '.join(helper_names)}")
-        
-        # Add function descriptions
-        for func in helper_functions[:5]:  # Limit to avoid token overflow
-            prompt_parts.append(f"- {func['name']}: {func.get('description', 'Helper function')}")
-    
-    # Add information about previous attempts if any
-    if previous_solutions:
-        prompt_parts.append("\nPREVIOUS ATTEMPTS (that failed):")
-        for i, sol in enumerate(previous_solutions[-2:], 1):  # Show last 2 attempts
-            prompt_parts.append(f"Attempt {i}: {sol.get('main_code', '')[:200]}...")
-    
-    prompt_parts.extend([
-        "",
-        "REQUIREMENTS:",
-        "1. Write a function called 'transform(input_grid)' that takes a 2D list and returns a 2D list",
-        "2. The function should work for ALL the training examples shown above",
-        "3. Use the available helper functions when possible",
-        "4. Focus on finding the core pattern or rule that transforms input to output",
-        "5. Return ONLY the Python code, no explanations",
-        "",
-        "Example format:",
-        "```python",
-        "def transform(input_grid):",
-        "    # Your transformation logic here",
-        "    return result_grid",
-        "```",
-        "",
-        "Generate the transform function now:"
-    ])
-    
-    return "\n".join(prompt_parts)
 
 
 def extract_python_code(response_text: str) -> str:
@@ -731,75 +701,6 @@ def extract_python_code(response_text: str) -> str:
     return ""
 
 
-def generate_main_transformation_code(training_examples: List[Dict],
-                                    helper_functions: List[HelperFunction],
-                                    previous_solutions: List[CodeSolution]) -> str:
-    """Generate the main transformation code."""
-    
-    if not training_examples:
-        return "def transform(input_grid):\n    return input_grid"
-    
-    # Analyze the first example to get some insights
-    first_example = training_examples[0]
-    input_grid = first_example["input"]
-    output_grid = first_example["output"]
-    
-    # Basic template based on pattern analysis
-    if len(input_grid) == len(output_grid) and len(input_grid[0]) == len(output_grid[0]):
-        # Same size - might be color transformation or pattern replacement
-        code = """def transform(input_grid):
-    # Copy the input grid
-    result = copy_grid(input_grid)
-    height, width = get_grid_dimensions(input_grid)
-    
-    # Apply transformation logic
-    for i in range(height):
-        for j in range(width):
-            # TODO: Add specific transformation logic based on pattern analysis
-            # For now, just copy the input
-            pass
-    
-    return result"""
-    else:
-        # Different size - might be scaling or cropping
-        code = """def transform(input_grid):
-    height, width = get_grid_dimensions(input_grid)
-    
-    # TODO: Determine output dimensions and create result grid
-    # For now, return a copy of input
-    result = copy_grid(input_grid)
-    
-    return result"""
-    
-    return code
-
-
-def get_solution_reasoning(solution: CodeSolution) -> str:
-    """Get reasoning trace from solution, with fallback for compatibility."""
-    return solution.get("reasoning_trace", "No reasoning trace available")
-
-
-def get_solution_steps(solution: CodeSolution) -> List[str]:
-    """Get transformation steps from solution, with fallback for compatibility."""
-    # Try new field first, then fall back to legacy field
-    steps = solution.get("step_by_step_transformation", [])
-    if not steps:
-        steps = solution.get("step_by_step_description", [])
-    return steps if steps else ["No transformation steps available"]
-
-
-def generate_step_by_step_description(training_examples: List[Dict], main_code: str) -> List[str]:
-    """Generate a step-by-step description of the transformation."""
-    return []
-
-
-def calculate_confidence_score(training_examples: List[Dict], 
-                              main_code: str, 
-                              helper_functions: List[HelperFunction]) -> float:
-    """Calculate a confidence score for the generated solution."""
-    return 0.5  # Simplified - confidence score no longer used
-
-
 def execute_transformation_code(main_code: str,
                                input_grid: List[List[int]],
                                helper_functions: List[HelperFunction]) -> Tuple[Optional[List[List[int]]], Optional[str]]:
@@ -830,9 +731,7 @@ def execute_transformation_code(main_code: str,
         # Call the transform function
         if "transform" in namespace:
             try:
-                print("Code successfully executed. Running transform function...")
                 result = namespace["transform"](input_grid)
-                print("Transform function executed successfully.")
                 return result, None
             except Exception as inner_e:
                 tb = traceback.format_exc()
@@ -925,46 +824,9 @@ def analyze_failures(failed_tests: List[ExampleResult], training_examples: List[
     return analysis
 
 
-def refine_code_based_on_analysis(original_code: str, 
-                                 failure_analysis: Dict[str, Any],
-                                 helper_functions: List[HelperFunction]) -> str:
-    """Refine the code based on failure analysis using intelligent analysis."""
-    
-    # Try to intelligently refine the code based on failure patterns
-    if not original_code or "pass" in original_code:
-        # If original code is empty or has placeholders, return a basic template
-        return """def transform(input_grid):
-    result = copy_grid(input_grid)
-    height, width = get_grid_dimensions(result)
-    
-    # TODO: Implement actual transformation logic
-    # This is a basic template - the LLM should provide real logic
-    for i in range(height):
-        for j in range(width):
-            # Pattern matching and transformation logic needed here
-            if result[i][j] == 0:  # Example: transform zeros
-                # Add your transformation logic
-                pass
-    
-    return result"""
-    
-    # If we have actual code, try to preserve and enhance it
-    refined_lines = []
-    original_lines = original_code.split('\n')
-    
-    for line in original_lines:
-        # Remove placeholder comments and passes
-        if 'pass' in line and ('TODO' in line or 'Enhanced' in line or 'Refined' in line):
-            refined_lines.append(line.replace('pass', '# Add transformation logic here'))
-        else:
-            refined_lines.append(line)
-    
-    return '\n'.join(refined_lines)
-
-
 def refine_solution_based_on_failures(llm,
                                       current_solution: CodeSolution,
-                                      failed_tests: List[ExampleResult],
+                                      training_results: List[ExampleResult],
                                       training_examples: List[Dict],
                                       reflection_history: List[Dict] = None) -> Tuple[CodeSolution, Dict]:
     """Refine the solution based on test failures using LLM with ARC-style reflection."""
@@ -977,7 +839,7 @@ def refine_solution_based_on_failures(llm,
         helper_functions = current_solution.get("helper_functions", [])
 
         # 1) Get reflection reasoning trace (structured analysis only)
-        reasoning = generate_reflection_reasoning_trace(llm, current_solution, failed_tests, training_examples, reflection_history)
+        reasoning = generate_reflection_reasoning_trace(llm, current_solution, training_results, training_examples, reflection_history)
 
         # 2) Extract transformation steps from the reasoning
         transformation_steps = extract_transformation_steps(llm, reasoning, training_examples)
@@ -994,38 +856,38 @@ def refine_solution_based_on_failures(llm,
                 "step_by_step_transformation": transformation_steps or ["Refined based on failure analysis"],
             }
 
-            reflection_record = {
+            refinement_record = {
                 "attempt_number": len(reflection_history) + 1,
                 "reasoning": reasoning,
                 "key_insight": extract_key_insight_from_reasoning(reasoning),
-                "failed_examples": [t.get("example_index", 0) for t in failed_tests],
+                "failed_examples": [t.get("example_index", 0) for t in training_results],
                 "refinement_type": "arc_reflection"
             }
 
-            return refined_solution, reflection_record
+            return refined_solution, refinement_record
         else:
             # LLM produced no usable refined code. Do NOT fallback to rule-based refinement.
-            reflection_record = {
+            refinement_record = {
                 "attempt_number": len(reflection_history) + 1,
                 "reasoning": reasoning if reasoning else "LLM failed to produce valid refined code",
                 "key_insight": extract_key_insight_from_reasoning(reasoning) if reasoning else "LLM code-generation failed",
-                "failed_examples": [t.get("example_index", 0) for t in failed_tests],
+                "failed_examples": [t.get("example_index", 0) for t in training_results],
                 "refinement_type": "no_refinement"
             }
             # Return the original solution unchanged along with the reflection record
-            return current_solution, reflection_record
+            return current_solution, refinement_record
             
     except Exception as e:
         print(f"Error refining code with LLM: {e}")
         # Do not perform rule-based fallback here; return original solution and an error reflection record
-        reflection_record = {
+        refinement_record = {
             "attempt_number": len(reflection_history) + 1,
             "reasoning": f"Error during LLM refinement: {str(e)}",
             "key_insight": "Technical error prevented LLM refinement",
-            "failed_examples": [t.get("example_index", 0) for t in failed_tests],
+            "failed_examples": [t.get("example_index", 0) for t in training_results],
             "refinement_type": "llm_error"
         }
-        return current_solution, reflection_record
+        return current_solution, refinement_record
 
 
 def extract_reasoning_from_reflection(response_content: str) -> str:
@@ -1085,119 +947,6 @@ def extract_key_insight_from_reasoning(reasoning: str) -> str:
             return cleaned[:200] + '...' if len(cleaned) > 200 else cleaned
     
     return "Pattern recognition issue identified"
-
-
-def build_refinement_reasoning_prompt(current_solution: CodeSolution,
-                                     failed_tests: List[ExampleResult],
-                                     training_examples: List[Dict],
-                                     reflection_history: List[Dict]) -> str:
-    """Build reflection prompt based on ARC reflection prompt style for deep analysis."""
-    
-    # Format previous solution
-    previous_code = current_solution["main_code"]
-    
-    # Build detailed failure analysis
-    failure_analysis = []
-    for test in failed_tests:
-        example_idx = test.get("example_index", 0)
-        if example_idx < len(training_examples):
-            example = training_examples[example_idx]
-            
-            analysis = f"Training Example {example_idx + 1} - FAILED\\n"
-            analysis += "--\\n"
-            analysis += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
-            analysis += f"Expected Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
-            
-            predicted = test.get("predicted_output")
-            if predicted:
-                analysis += f"Your Predicted Output:\\n{format_grid_for_prompt(predicted)}\\n\\n"
-                # Calculate sizes
-                pred_h, pred_w = len(predicted), len(predicted[0]) if predicted else 0
-                exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
-                analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: {pred_h}x{pred_w}\\n"
-            else:
-                analysis += "Your Predicted Output: No output generated\\n\\n"
-                exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
-                analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: 0x0\\n"
-            
-            analysis += f"Overlap: {test.get('overlap_percentage', 0):.1f}%\\n"
-            analysis += f"IOU (Intersection over Union): {test.get('iou_percentage', 0):.1f}%\\n"
-            
-            error_msg = test.get("error_message")
-            if error_msg:
-                analysis += f"Error: {error_msg}\\n"
-            
-            failure_analysis.append(analysis)
-    
-    failures_block = "\\n".join(failure_analysis)
-    
-    # Build training examples block
-    examples_block = ""
-    for i, example in enumerate(training_examples, 1):
-        examples_block += f"Training Example {i}\\n--\\n"
-        examples_block += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
-        examples_block += f"Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
-    
-    # Add reflection context
-    # TODO: Think about this reflection context for now. It is a little bit of an odd-ball at the moment.
-    reflection_context = ""
-    if reflection_history:
-        reflection_context = f"\\nPrevious reflection attempts: {len(reflection_history)}\\n"
-        reflection_context += "Key insights from previous attempts:\\n"
-        for i, refl in enumerate(reflection_history[-2:], 1):  # Show last 2
-            insight = refl.get("key_insight", "No insight recorded")
-            reflection_context += f"{i}. {insight}\\n"
-    
-    prompt = f"""You are an expert in reasoning about Abstract Reasoning Corpus (ARC) puzzles.
-You previously attempted to solve this task but your solution was incorrect on some training examples.
-
-====================
-TASK REFLECTION AND DEEP ANALYSIS
-====================
-
-Your goal:
-Analyze your previous attempt deeply, understand why it failed, and provide a CORRECTED transformation that:
-1. Correctly maps every training input to its output
-2. Is general and intuitive (no memorization or hard-coded values)
-3. Is logical, reproducible, and object-level
-
-====================
-Original Training Examples
-====================
-{examples_block}
-
-====================
-Your Previous Solution
-====================
-```python
-{previous_code}
-```
-
-====================
-Detailed Failure Analysis
-====================
-{failures_block}
-
-====================
-Deep Reflection Instructions
-====================
-    First, analyze what went wrong inside a ```reasoning``` block:
-    1. PATTERN MISINTERPRETATION: What pattern did you miss or misunderstand?
-    2. LOGIC ERRORS: Where exactly did your transformation logic fail?
-    3. EDGE CASES: What cases did you not handle properly?
-    4. OBJECT-LEVEL THINKING: How should you think about this in terms of objects, shapes, movements?
-    5. CORE INSIGHT: What is the single most important insight you're missing?
-
-    After the analysis, produce a clear, numbered ACTION PLAN (no executable code):
-    - Provide a concise algorithmic description of the corrected transformation (1-3 paragraphs).
-    - List any helper functions that should be added or adjusted (name and brief signature only).
-    - Enumerate edge cases and how to handle them.
-    - Suggest specific, focused tests or checks that would validate the fix.
-
-    Return ONLY the requested analysis and action plan inside clearly ```reasoning``` block Do NOT include executable Python code in your response.
-"""
-    
-    return prompt
 
 
 def format_grid_for_prompt(grid: List[List[int]]) -> str:

@@ -54,9 +54,6 @@ PRINT_INPUT = True
 PRINT_OUTPUT = True
 PRINT_JSON = True
 
-
-
-
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Simple ARC LangChain Agent")
@@ -77,25 +74,6 @@ def parse_arguments():
                         help=f"Print extracted JSON (default: {PRINT_JSON})")
     
     return parser.parse_args()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 def run_arc_task(task_id, task_data, model_name, print_input=True, print_output=True, print_json=True):
     """Run a single ARC task using LangChain."""

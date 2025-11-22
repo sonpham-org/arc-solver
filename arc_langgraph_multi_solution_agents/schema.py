@@ -1,0 +1,107 @@
+"""
+Schema definitions for the ARC LangGraph Agent.
+
+This module defines the TypedDict structures used to maintain state 
+throughout the LangGraph workflow for ARC problem solving.
+"""
+
+from typing import TypedDict, List, Dict, Any, Optional, Union, Annotated
+from langchain_core.messages import BaseMessage
+
+# Define a reducer that takes the first value (for immutable fields)
+def take_first(left, right):
+    """Reducer that takes the first (left) value, ignoring updates."""
+    return left if left is not None else right
+
+
+def immutable_dict(left, right):
+    """Reducer for immutable dict fields - preserves first non-empty value."""
+    # If left is a non-empty dict, keep it
+    if left and isinstance(left, dict) and left != {}:
+        return left
+    # Otherwise, take right if it's a non-empty dict
+    if right and isinstance(right, dict) and right != {}:
+        return right
+    # Fallback: prefer left over right
+    return left if left is not None else right
+
+
+def take_latest(left, right):
+    """Reducer that takes the latest (right) value."""
+    return right if right is not None else left
+
+
+class ARCTask(TypedDict):
+    """Represents an ARC task with training and test examples."""
+    train: List[Dict[str, List[List[int]]]]  # List of {'input': grid, 'output': grid}
+    test: List[Dict[str, List[List[int]]]]   # List of {'input': grid}
+
+class ExampleResult(TypedDict):
+    """Result of testing code on a single training example."""
+    example_index: int
+    input: List[List[int]]
+    expected_output: List[List[int]]
+    predicted_output: Optional[List[List[int]]]
+    matching_size: bool
+    overlap_percentage: float
+    error_message: Optional[str]
+    code_success: bool
+    llm_predicted_output: Optional[List[List[int]]]
+    llm_matching_size: Optional[bool]
+    llm_overlap_percentage: Optional[float]
+    llm_error_message: Optional[str]
+    llm_success: bool
+
+
+class CodeSolution(TypedDict):
+    """Represents a complete code solution."""
+    main_code: str
+    reasoning_trace: str  # Full reasoning analysis of patterns. Maybe should just do some summary.
+    step_by_step_transformation: List[str]  # Clear transformation steps
+    
+    training_results: List[ExampleResult]
+    training_success_rate: float
+    llm_training_success_rate: float
+    testing_results: List[ExampleResult]
+    testing_success_rate: float
+    llm_testing_success_rate: float
+
+
+class AgentState(TypedDict):
+    """Main state for the ARC LangGraph Agent workflow."""
+    
+    # Task information (immutable)
+    task_id: Annotated[str, take_first]
+    task_data: Annotated[Dict[str, Any], immutable_dict]
+    
+    # Generated solutions
+    solutions_list: Annotated[Optional[List[CodeSolution]], take_latest]
+    
+    # Runtime flags propagated from agent instance
+    enable_code_predict: Annotated[bool, take_latest]
+    enable_llm_predict: Annotated[bool, take_latest]
+    enable_parallel_eval: Annotated[bool, take_latest]
+    
+    # Additional metadata
+    metadata: Annotated[Dict[str, Any], lambda x, y: {**x, **y}]  # Merge metadata dicts
+
+
+class WorkflowOutput(TypedDict):
+    """Final output from the ARC agent workflow."""
+    task_id: str
+    workflow_completed: bool
+    solutions_list: List[CodeSolution]
+    highest_solution_index: int
+    highest_training_solution_priority_score: float
+    highest_training_solution_overlap_score: float
+
+    highest_success_rate: float
+    highest_success_index: int
+    highest_llm_success_rate: float
+    highest_llm_success_index: int
+    execution_time: float
+
+
+# Type aliases for common data structures
+Grid = List[List[int]]
+GridPair = Dict[str, Grid]  # {'input': grid, 'output': grid}

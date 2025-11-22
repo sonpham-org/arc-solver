@@ -90,12 +90,14 @@ def compute_run_stats(run_path: str) -> Tuple[int, int, float, int, float, List[
     return success, total, success_rate, llm_success, llm_success_rate, rates
 
 
-def draw_menu(stdscr, items: List[tuple], selected_idx: int) -> None:
+def draw_menu(stdscr, items: List[tuple], selected_idx: int, sort_mode: str) -> None:
     stdscr.clear()
     h, w = stdscr.getmaxyx()
-    title = 'Select a run folder and press Enter (q to quit)'
+    title = f"Select a run folder and press Enter (q to quit) — sort: {sort_mode} (press 's' to toggle)"
     stdscr.addstr(0, 0, title)
-    for i, (it, count) in enumerate(items):
+    for i, item in enumerate(items):
+        # item is (path, count, mtime)
+        it, count, mtime = item
         # show just the basename for readability, append (num tasks)
         base = os.path.basename(it)
         display = f"{base} ({count} tasks)"
@@ -139,7 +141,7 @@ def curses_selector(output_dir: str) -> int:
         print(f'No runs found in `{output_dir}`')
         return 1
 
-    # Precompute task counts for each run to display in the menu
+    # Precompute task counts and modification time for each run to display in the menu
     runs_with_counts = []
     for r in raw_runs:
         try:
@@ -147,21 +149,37 @@ def curses_selector(output_dir: str) -> int:
             count = len(files)
         except Exception:
             count = 0
-        runs_with_counts.append((r, count))
+        try:
+            mtime = os.path.getmtime(r)
+        except Exception:
+            mtime = 0.0
+        runs_with_counts.append((r, count, mtime))
 
-    # Sort runs by number of task files (descending) for easier selection of large runs
+    # Default sort: by count descending
+    sort_mode = 'count'
     runs_with_counts.sort(key=lambda x: x[1], reverse=True)
 
     def _main(stdscr):
         curses.curs_set(0)
+        nonlocal sort_mode
         idx = 0
         while True:
-            draw_menu(stdscr, runs_with_counts, idx)
+            draw_menu(stdscr, runs_with_counts, idx, sort_mode)
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord('k')):
                 idx = max(0, idx - 1)
             elif key in (curses.KEY_DOWN, ord('j')):
                 idx = min(len(runs_with_counts) - 1, idx + 1)
+            elif key in (ord('s'), ord('S')):
+                # Toggle sort mode between 'count' and 'time'
+                if sort_mode == 'count':
+                    sort_mode = 'time'
+                    runs_with_counts.sort(key=lambda x: x[2], reverse=True)
+                else:
+                    sort_mode = 'count'
+                    runs_with_counts.sort(key=lambda x: x[1], reverse=True)
+                idx = 0
+                continue
             elif key in (ord('\n'), curses.KEY_ENTER, 10, 13):
                 # compute stats and show
                 run_path = runs_with_counts[idx][0]

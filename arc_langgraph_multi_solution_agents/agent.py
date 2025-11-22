@@ -43,7 +43,8 @@ def create_arc_workflow(llm, code_llm) -> StateGraph:
 
 def create_initial_state(task_id: str,
                         task_data: Dict[str, Any],
-                        max_attempts: int = 5) -> AgentState:
+                        max_attempts: int = 5,
+                        enable_visual_cue: bool = False) -> AgentState:
     """
     Create the initial state for the workflow.
     """
@@ -51,7 +52,8 @@ def create_initial_state(task_id: str,
         "task_id": task_id,
         "task_data": task_data,
         "solutions_list": [],
-        "metadata": {}
+        "metadata": {},
+        "enable_visual_cue": enable_visual_cue,
     }
 
 class MultiSolutionARCLangGraphAgent:
@@ -62,7 +64,7 @@ class MultiSolutionARCLangGraphAgent:
     storing all solutions in the workflow state.
     """
 
-    def __init__(self, llm, code_llm, enable_code_predict: bool = True, enable_llm_predict: bool = False, enable_parallel_eval: bool = False):
+    def __init__(self, llm, code_llm, enable_code_predict: bool = True, enable_llm_predict: bool = False, enable_parallel_eval: bool = False, enable_visual_cue: bool = False):
         """
         Initialize the ARC LangGraph Agent.
         
@@ -77,6 +79,7 @@ class MultiSolutionARCLangGraphAgent:
         self.enable_code_predict = enable_code_predict  # Whether to enable code-predicted outputs during testing
         self.enable_llm_predict = enable_llm_predict  # Whether to enable LLM-predicted outputs during testing
         self.enable_parallel_eval = enable_parallel_eval  # Whether to parallelize evaluation with threads and tqdm
+        self.enable_visual_cue = enable_visual_cue
 
         # Preload and normalize helper functions at initialization so
         # `solve_task` can simply copy them into the workflow initial state.
@@ -105,7 +108,7 @@ class MultiSolutionARCLangGraphAgent:
                 test_example['output'] = task_solution[i]
         
         # Create initial state with custom max_attempts and helper functions
-        initial_state = create_initial_state(task_id, task_data, max_attempts)
+        initial_state = create_initial_state(task_id, task_data, max_attempts, enable_visual_cue=self.enable_visual_cue)
         
         # Copy the preloaded helper definitions into the workflow initial state
         initial_state['available_helpers'] = dict(self.available_helpers)
@@ -114,6 +117,8 @@ class MultiSolutionARCLangGraphAgent:
         initial_state['enable_llm_predict'] = bool(self.enable_llm_predict)
         # New: allow nodes to enable parallelized evaluation
         initial_state['enable_parallel_eval'] = bool(self.enable_parallel_eval)
+        # Propagate visual cue flag
+        initial_state['enable_visual_cue'] = bool(self.enable_visual_cue)
         
         # Initialize final_state to avoid UnboundLocalError
         workflow_results = {

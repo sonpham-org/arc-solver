@@ -94,11 +94,6 @@ class WorkflowOutput(TypedDict):
     highest_solution_index: int
     highest_training_solution_priority_score: float
     highest_training_solution_overlap_score: float
-
-    highest_success_rate: float
-    highest_success_index: int
-    highest_llm_success_rate: float
-    highest_llm_success_index: int
     execution_time: float
 
 

@@ -63,7 +63,7 @@ TASK_ID = None  # Specific task ID to test (for single mode)
 TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
-NUM_TASKS = 100  # Number of tasks for batch mode
+NUM_TASKS = 10  # Number of tasks for batch mode
 
 # Processing configuration
 MAX_ATTEMPTS = 3  # Maximum attempts per task
@@ -71,6 +71,7 @@ RANDOM_SEED = 42  # Random seed for reproducibility
 
 ENABLE_CODE_PREDICT = True  # Whether to enable code-predicted outputs during testing
 ENABLE_LLM_PREDICT = False # Whether to enable LLM-predicted outputs during testing
+ENABLE_VISUAL_CUE = True  # When True, generate and pass input/output images to the LLM
 
 
 def load_arc_tasks(file_path: str) -> Dict[str, Dict]:
@@ -208,7 +209,7 @@ def save_task_result(output_dir: str, task_id: str, result: Dict[str, Any]) -> N
 
     # Normalize training_results and testing_results to include
     # `predicted_output` and `expected_output` as list-of-strings views
-    for solution in result.get("solutions_list", []):
+    for si, solution in enumerate(result.get("solutions_list", [])):
         for key in ("training_results", "testing_results"):
             entries = solution.get(key)
             if not entries:
@@ -219,8 +220,58 @@ def save_task_result(output_dir: str, task_id: str, result: Dict[str, Any]) -> N
                 entry["predicted_output"] = grid_to_string_lines(entry["predicted_output"])
                 entry["llm_predicted_output"] = grid_to_string_lines(entry.get("llm_predicted_output"))
                 entry["input"] = grid_to_string_lines(entry["input"])
+        # Also check for any visual cues attached to the solution's transformation
+        # (actions may attach `_visual_cues` to the step_by_step_transformation)
+        try:
+            trans = solution.get('step_by_step_transformation')
+            visual_files = []
+            if isinstance(trans, dict) and trans.get('_visual_cues'):
+                import base64
+                # Ensure per-task folder exists
+                task_folder = os.path.join(output_dir, task_id)
+                try:
+                    os.makedirs(task_folder, exist_ok=True)
+                except Exception:
+                    task_folder = output_dir
 
-    with open(os.path.join(output_dir, f"{task_id}.json"), 'w') as f:
+                for vc in trans.get('_visual_cues'):
+                    ex_idx = vc.get('example_index')
+                    in_b64 = vc.get('input_b64')
+                    out_b64 = vc.get('output_b64')
+                    if in_b64:
+                        try:
+                            img_bytes = base64.b64decode(in_b64)
+                            fname_in = f"{task_id}_sol{si}_ex{ex_idx}_input.png"
+                            fpath_in = os.path.join(task_folder, fname_in)
+                            with open(fpath_in, 'wb') as imgf:
+                                imgf.write(img_bytes)
+                            visual_files.append(os.path.join(task_id, fname_in) if task_folder != output_dir else fname_in)
+                        except Exception:
+                            pass
+                    if out_b64:
+                        try:
+                            img_bytes = base64.b64decode(out_b64)
+                            fname_out = f"{task_id}_sol{si}_ex{ex_idx}_expected.png"
+                            fpath_out = os.path.join(task_folder, fname_out)
+                            with open(fpath_out, 'wb') as imgf:
+                                imgf.write(img_bytes)
+                            visual_files.append(os.path.join(task_id, fname_out) if task_folder != output_dir else fname_out)
+                        except Exception:
+                            pass
+            if visual_files:
+                solution['_visual_cue_files'] = visual_files
+        except Exception:
+            pass
+
+    # Ensure the JSON is saved inside the per-task folder for easier inspection by the visualizer
+    task_folder = os.path.join(output_dir, task_id)
+    try:
+        os.makedirs(task_folder, exist_ok=True)
+        out_path = os.path.join(task_folder, f"{task_id}.json")
+    except Exception:
+        out_path = os.path.join(output_dir, f"{task_id}.json")
+
+    with open(out_path, 'w') as f:
         json.dump(result, f, indent=2)
 
 
@@ -372,8 +423,8 @@ def summarize_and_print_result(result: Dict[str, Any], task_id: Optional[str] = 
     # Print highest-scoring solution (Priority Score primary, Overlap Score tie-breaker)
     print(f"  Selected Solution (Highest training): ")
     print(f"    Index {highest_solution_index}")
-    print(f"    Training Priority Score: {highest_priority_score:.1f}%  Overlap Score: {highest_overlap_score:.1f}%")
-    print(f"    Testing Priority Score: {highest_testing_priority_score:.1f}%  Testing Overlap Score: {highest_testing_overlap_score:.1f}%")
+    print(f"    Training Priority Score: {(highest_priority_score or 0.0):.1f}%  Overlap Score: {(highest_overlap_score or 0.0):.1f}%")
+    print(f"    Testing Priority Score: {(highest_testing_priority_score or 0.0):.1f}%  Testing Overlap Score: {(highest_testing_overlap_score or 0.0):.1f}%")
 
 def print_summary(agent: MultiSolutionARCLangGraphAgent, all_results: List[Dict[str, Any]], task_ids: List[str]) -> Dict[str, Any]:
     """Save summary of all task results to summary.json."""
@@ -448,7 +499,12 @@ def main():
     print(f"Initialize the multi-solution LangGraph agent...")
 
     # Create a MultiSolution agent for this run
-    agent = MultiSolutionARCLangGraphAgent(llm=llm, code_llm=llm)
+    agent = MultiSolutionARCLangGraphAgent(
+        llm=llm,
+        code_llm=llm, 
+        enable_code_predict=ENABLE_CODE_PREDICT,
+        enable_visual_cue=ENABLE_VISUAL_CUE,
+        enable_llm_predict=ENABLE_LLM_PREDICT)
 
     # Initialize a thread-safe shared helpers store.
     # If the agent defines `available_helpers`, snapshot it; otherwise start empty.
@@ -523,7 +579,10 @@ def main():
             # Create a per-task multi-solution agent and attach helpers snapshot
             local_agent = MultiSolutionARCLangGraphAgent(
                 llm=llm,
-                code_llm=llm
+                code_llm=llm,
+                enable_visual_cue=ENABLE_VISUAL_CUE,
+                enable_code_predict=ENABLE_CODE_PREDICT,
+                enable_llm_predict=ENABLE_LLM_PREDICT
             )
             # Attach the helpers snapshot so the workflow can use them
             local_agent.available_helpers = helpers_snapshot

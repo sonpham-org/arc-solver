@@ -1,0 +1,105 @@
+{% from 'grid_macro.html' import render_grid, render_diff %}
+
+<style>
+  pre.code, pre.language-python { padding:8px; border-radius:4px; }
+  /* Highlight.js container style - applied after highlight runs */
+  .hljs { background: #f8f9fa; padding:8px; border-radius:4px; display:block; }
+</style>
+{# Expects variables: run_name, task_id, task (prepared via prepare_task_for_view) #}
+<div>
+  <h3>Task {{ task_id }}</h3>
+  {% set sols = task.solutions_list or [] %}
+  {% set hs_idx = task.highest_solution_index or 0 %}
+
+  <ul class="nav nav-tabs" id="solTabs" role="tablist">
+    {% for sol in sols %}
+      {% set i = loop.index0 %}
+      {% if i == hs_idx %}
+        <li class="nav-item"><a class="nav-link active" id="tab-{{ i }}" data-bs-toggle="tab" href="#sol-{{ i }}">Highest solution</a></li>
+      {% else %}
+        <li class="nav-item"><a class="nav-link" id="tab-{{ i }}" data-bs-toggle="tab" href="#sol-{{ i }}">Sol {{ i }} ({{ '%.1f'|format(sol._training_pct or 0.0) }}%)</a></li>
+      {% endif %}
+    {% endfor %}
+  </ul>
+
+  <div class="tab-content mt-3">
+    {% for sol in sols %}
+      {% set i = loop.index0 %}
+      <div class="tab-pane fade {% if i==hs_idx %}show active{% endif %}" id="sol-{{ i }}">
+        <h4>Solution {{ i }}</h4>
+        <p><strong>Training success:</strong> {{ '%.1f'|format(sol._training_pct or 0.0) }}% &nbsp; <strong>Testing success:</strong> {{ '%.1f'|format(sol._testing_pct or 0.0) }}%</p>
+
+        <h5>Transformation / Reasoning</h5>
+        <pre class="params transformation">{% if sol.step_by_step_transformation %}{{ sol.step_by_step_transformation | tojson(indent=2) }}{% else %}{{ sol.reasoning_trace or '' }}{% endif %}</pre>
+
+        <h5>Python code</h5>
+        {% set _pycode = sol.main_code or sol.code or sol.generated_code or '' %}
+        <pre class="code"><code class="language-python">{{ _pycode | e }}</code></pre>
+
+        <h5>Training examples</h5>
+        {% for ex in sol.training_results or [] %}
+          <div class="example-card">
+            <h6>Example {{ ex.example_index }}</h6>
+            <div class="d-flex gap-3">
+              <div>
+                <strong>Input</strong>
+                {{ render_grid(ex.input) }}
+              </div>
+              <div>
+                <strong>Expected</strong>
+                {% set expected = ex.expected_output or ex.output %}
+                {{ render_grid(expected) }}
+              </div>
+              <div>
+                <strong>Predicted</strong>
+                {% set predicted = ex.predicted_output or ex.predicted or ex.llm_predicted_output %}
+                {{ render_grid(predicted) }}
+              </div>
+            </div>
+            <div class="mt-2">
+              <strong>Difference map</strong>
+              {% set diff = ex._diff_status if ex._diff_status is defined else None %}
+              {{ render_diff(diff) }}
+            </div>
+            <div class="mt-2 text-muted">Code success: {{ ex.code_success }} &nbsp; Overlap: {{ '%.1f'|format(ex.overlap_percentage or 0.0) }}%</div>
+          </div>
+        {% endfor %}
+
+        <h5>Testing examples</h5>
+        {% for ex in sol.testing_results or [] %}
+          <div class="example-card">
+            <h6>Example {{ ex.example_index }}</h6>
+            <div class="d-flex gap-3">
+              <div>
+                <strong>Input</strong>
+                {{ render_grid(ex.input) }}
+              </div>
+              <div>
+                <strong>Expected</strong>
+                {% set expected = ex.expected_output or ex.output %}
+                {{ render_grid(expected) }}
+              </div>
+              <div>
+                <strong>Predicted</strong>
+                {% set predicted = ex.predicted_output or ex.predicted or ex.llm_predicted_output %}
+                {{ render_grid(predicted) }}
+              </div>
+            </div>
+            <div class="mt-2">
+              <strong>Difference map</strong>
+              {% set diff = ex._diff_status if ex._diff_status is defined else None %}
+              {{ render_diff(diff) }}
+            </div>
+            <div class="mt-2 text-muted">Code success: {{ ex.code_success }} &nbsp; Overlap: {{ '%.1f'|format(ex.overlap_percentage or 0.0) }}%</div>
+          </div>
+        {% endfor %}
+
+      </div>
+    {% endfor %}
+  </div>
+</div>
+
+<!-- Highlight.js for Python syntax highlighting -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+<script>document.addEventListener('DOMContentLoaded', () => { if(window.hljs) hljs.highlightAll(); });</script>

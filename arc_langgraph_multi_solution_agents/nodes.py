@@ -36,10 +36,17 @@ def generate_code_node(state: AgentState, llm, code_llm) -> AgentState:
     training_examples = task_data["train"]
 
     # Generate code using the reasoning-first approach from actions
+    # Read visual cue flag from node state and pass through to generation
+    enable_visual_cue = state.get('enable_visual_cue', False)
+    print(enable_visual_cue)
+    task_id = state.get('task_id')
+
     python_codes, reasoning_trace, transformation_solutions_list = generate_solutions_with_reasoning(
         llm,
         code_llm,
-        training_examples
+        training_examples,
+        enable_visual_cue=enable_visual_cue,
+        task_id=task_id,
     )
 
     solutions_list = []

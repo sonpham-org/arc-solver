@@ -155,30 +155,104 @@ def analyze_training_examples(training_examples: List[Dict]) -> str:
     return "\n".join(analysis)
 
 
-def generate_solutions_with_reasoning(llm, code_llm, training_examples: List[Dict]) -> Tuple[List[str], str, List[Dict]]:
-    """Generate Python transformation code using reasoning-first approach.
-    
-    Returns:
-        Tuple of (python_code, reasoning_trace, transformation_steps)
+def _grid_to_image_bytes(grid: List[List[int]], cell_size: int = 24, padding: int = 8) -> bytes:
+    """Render a grid (list of lists of ints) to a PNG bytes buffer.
+
+    Returns PNG bytes. If Pillow is not available, raises ImportError.
     """
-    
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        raise ImportError("Pillow is required to generate visual cues (pip install pillow)")
+
+    # Simple color map for values 0..9
+    DEFAULT_COLORS = {
+        0: (255, 255, 255),
+        1: (230, 25, 75),
+        2: (60, 180, 75),
+        3: (255, 225, 25),
+        4: (0, 130, 200),
+        5: (245, 130, 48),
+        6: (145, 30, 180),
+        7: (70, 240, 240),
+        8: (240, 50, 230),
+        9: (210, 245, 60),
+    }
+
+    h = len(grid)
+    w = len(grid[0]) if h > 0 else 0
+    img_w = w * cell_size + padding * 2
+    img_h = h * cell_size + padding * 2
+    img = Image.new('RGB', (img_w, img_h), (240, 240, 240))
+    draw = ImageDraw.Draw(img)
+
+    for r in range(h):
+        for c in range(w):
+            val = grid[r][c]
+            color = DEFAULT_COLORS.get(val, (200, 200, 200))
+            x0 = padding + c * cell_size
+            y0 = padding + r * cell_size
+            x1 = x0 + cell_size - 1
+            y1 = y0 + cell_size - 1
+            draw.rectangle([x0, y0, x1, y1], fill=color, outline=(100, 100, 100))
+
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+
+def generate_solutions_with_reasoning(llm, code_llm, training_examples: List[Dict], enable_visual_cue: bool = False, task_id: Optional[str] = None) -> Tuple[List[str], str, List[Dict]]:
+    """Generate Python transformation code using reasoning-first approach.
+
+    When `enable_visual_cue` is True, this function will render training
+    input/output pairs to PNG images, encode them as base64 and include them
+    in the LLM invocation (if the LLM driver supports image messages).
+
+    Returns:
+        Tuple of (python_code_list, reasoning_trace, transformation_steps)
+    """
+
+    visual_cues = []
+    if enable_visual_cue:
+        # Build visual cues: for each training example, create a small image
+        # that shows the input and expected output stacked vertically.
+        import base64
+        for i, ex in enumerate(training_examples):
+            inp = ex.get('input') or []
+            out = ex.get('output') or []
+            inp_bytes = _grid_to_image_bytes(inp)
+            out_bytes = _grid_to_image_bytes(out)
+            b64_in = base64.b64encode(inp_bytes).decode('utf-8')
+            b64_out = base64.b64encode(out_bytes).decode('utf-8')
+            visual_cues.append({
+                'example_index': i,
+                'input_b64': b64_in,
+                'output_b64': b64_out,
+            })
+    print(visual_cues)
+
     # Step 1: Generate reasoning trace
-    reasoning_trace = generate_reasoning_trace(llm, training_examples)
-    
+    reasoning_trace = generate_reasoning_trace(llm, training_examples) if not enable_visual_cue else generate_reasoning_trace(llm, training_examples, visual_cues=visual_cues)
+
     # Step 2: Extract step-by-step transformation from reasoning
     transoformation_solutions_list = generate_transformation_steps(llm, reasoning_trace, training_examples)
-    
+
     # Step 3: Generate Python code(s) based on reasoning and steps
     # Note: `generate_code_from_reasoning` may return multiple candidate code strings.
     python_codes_list = generate_code_from_reasoning(llm, code_llm, reasoning_trace, transoformation_solutions_list,
                                                      training_examples)
 
-    
+    # Attach visual cue data onto each transformation dict (best-effort)
+    if enable_visual_cue and visual_cues:
+        # Try to attach example-level cues to the first solution dict to be saved later
+        for sol in transoformation_solutions_list:
+            sol['_visual_cues'] = visual_cues
 
     # Return the list of candidate codes, plus reasoning and steps.
     return python_codes_list, reasoning_trace, transoformation_solutions_list
 
-def generate_reasoning_trace(llm, training_examples: List[Dict]) -> str:
+def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Optional[List[Dict]] = None) -> str:
     """Generate detailed reasoning trace analyzing ARC patterns."""
 
     def build_initial_reasoning_prompt(training_examples: List[Dict]) -> str:
@@ -224,14 +298,94 @@ def generate_reasoning_trace(llm, training_examples: List[Dict]) -> str:
     
     try:
         prompt = build_initial_reasoning_prompt(training_examples)
-        response = llm.invoke(prompt)
-        response_text = response.content if hasattr(response, 'content') else str(response)
+        # If visual cues are provided and the llm driver supports image messages,
+        # send a structured message containing the images (base64 data URLs).
+        if visual_cues:
+            # Build content array: text intro + image entries per example
+            content = []
+            content.append({"type": "text", "text": "Analyze the following training example images and produce a reasoning trace that explains the transformation."})
+            for vc in visual_cues:
+                idx = vc.get('example_index')
+                in_b64 = vc.get('input_b64')
+                out_b64 = vc.get('output_b64')
+                if not in_b64 and not out_b64:
+                    continue
+                # Add explicit Input then Expected tokens separately to help model parse
+                if in_b64:
+                    content.append({"type": "text", "text": f"Training example {idx}: Input (image)"})
+                    content.append({"type": "image", "image_url": {"url": f"data:image/png;base64,{in_b64}"}})
+                if out_b64:
+                    content.append({"type": "text", "text": f"Training example {idx}: Expected Output (image)"})
+                    content.append({"type": "image", "image_url": {"url": f"data:image/png;base64,{out_b64}"}})
+            # Append the textual prompt as the last text block so models that prefer text can still see it
+            content.append({"type": "text", "text": prompt})
+            # Call the LLM with structured content if supported
+            try:
+                response = llm.invoke([
+                    {
+                        "role": "user",
+                        "content": content
+                    }
+                ])
+            except Exception:
+                # Fallback: call with plain prompt
+                response = llm.invoke(prompt)
+        else:
+            response = llm.invoke(prompt)
+
+        # Normalize response content into a single string for regex extraction
+        resp_content = None
+        if hasattr(response, 'content'):
+            resp_content = response.content
+        else:
+            resp_content = response
+
+        def _flatten_content(c):
+            # Return a string representation of various response content shapes
+            try:
+                if isinstance(c, str):
+                    return c
+                if isinstance(c, dict):
+                    # common forms: {'content': '...'} or {'choices': [...]}
+                    if 'content' in c and isinstance(c['content'], (str, list)):
+                        return _flatten_content(c['content'])
+                    if 'choices' in c and isinstance(c['choices'], list):
+                        return '\n'.join(_flatten_content(ch) for ch in c['choices'])
+                    # fallback to string
+                    return str(c)
+                if isinstance(c, (list, tuple)):
+                    parts = []
+                    for item in c:
+                        if isinstance(item, dict):
+                            # message-like item with 'content' or 'type' fields
+                            if 'content' in item:
+                                parts.append(_flatten_content(item['content']))
+                                continue
+                            # structured content items: {'type':'text','text':...} or {'type':'image',...}
+                            if item.get('type') == 'text' and 'text' in item:
+                                parts.append(str(item['text']))
+                                continue
+                            if item.get('type') == 'image' and item.get('image_url'):
+                                parts.append('[IMAGE]')
+                                continue
+                            # generic dict
+                            parts.append(str(item))
+                        else:
+                            parts.append(str(item))
+                    return '\n'.join([p for p in parts if p])
+                # fallback
+                return str(c)
+            except Exception:
+                return str(c)
+
+        response_text = _flatten_content(resp_content)
+
         # print_prompt_and_response(prompt, response)
 
         # Extract reasoning from response
         reasoning = extract_reasoning_content(response_text)
         return reasoning if reasoning else "Unable to generate reasoning trace"
-        
+
     except Exception as e:
         print(f"Error generating reasoning trace: {e}")
         return f"Error in reasoning generation: {str(e)}"

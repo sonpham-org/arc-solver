@@ -1,0 +1,70 @@
+{# grid_macro provides a render_grid macro to render 2D grids and optional diff masks #}
+{% macro render_grid(grid, mask=None) -%}
+  {% if not grid %}
+    <div class="text-muted">(empty)</div>
+  {% else %}
+    <table class="grid">
+      {# Ensure we have a color map available in templates; fall back to a default if not provided by the app #}
+      {% if color_map is defined %}
+        {% set cmap = color_map %}
+      {% else %}
+        {% set cmap = {0:'#ffffff',1:'#e6194b',2:'#3cb44b',3:'#ffe119',4:'#0082c8',5:'#f58231',6:'#911eb4',7:'#46f0f0',8:'#f032e6',9:'#d2f53c'} %}
+      {% endif %}
+      {% for r in range(grid|length) %}
+        <tr>
+        {% for c in range(grid[0]|length) %}
+          {% set raw = grid[r][c] %}
+          {# Coerce string digits (e.g. '3') to integers so cmap keys match numeric colors #}
+          {% if raw is string %}
+            {% set key = raw|int %}
+          {% else %}
+            {% set key = raw %}
+          {% endif %}
+          {% set is_diff = false %}
+          {% if mask %}
+            {% if mask[r] is defined and mask[r]|length > c and mask[r][c] %}
+              {% set is_diff = true %}
+            {% endif %}
+          {% endif %}
+          {# Choose background: diff mask overrides to diff color, else map using color_map dict exposed by app context #}
+          {% set bg = '#ffffff' %}
+          {% if is_diff %}
+            {% set bg = '#ffcccc' %}
+          {% else %}
+            {% set bg = cmap.get(key, '#dddddd') %}
+          {% endif %}
+          <td style="background-color: {{ bg }}; width:28px; height:28px; border:1px solid #666;"></td>
+        {% endfor %}
+        </tr>
+      {% endfor %}
+    </table>
+  {% endif %}
+{%- endmacro %}
+
+{% macro render_diff(status_grid) -%}
+  {% if not status_grid %}
+    <div class="text-muted">(empty)</div>
+  {% else %}
+    <table class="grid">
+      {% for r in range(status_grid|length) %}
+        <tr>
+        {% for c in range(status_grid[0]|length) %}
+          {% set s = status_grid[r][c] %}
+          {% if s == 'none' %}
+            <td style="background-color: #ffffff !important; border: none !important; width:28px; height:28px; padding:0;">
+            </td>
+          {% elif s == 'same' %}
+            <td style="background-color: #ffffff; border:1px solid #666; width:28px; height:28px;"></td>
+          {% elif s == 'diff' %}
+            <td style="background-color: #ff4d4d; border:1px solid #800; width:28px; height:28px;"></td>
+          {% elif s == 'only_expected' or s == 'only_predicted' %}
+            <td style="background-color: #ffb84d; border:1px solid #a65a00; width:28px; height:28px;"></td>
+          {% else %}
+            <td style="background-color: #ffffff; border:1px solid #ccc; width:28px; height:28px;"></td>
+          {% endif %}
+        {% endfor %}
+        </tr>
+      {% endfor %}
+    </table>
+  {% endif %}
+{%- endmacro %}

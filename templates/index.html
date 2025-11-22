@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ARC Visualizer - Runs</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+      .task-success { color: green; }
+      .task-lucky { color: deeppink; }
+      pre.params { background: #f8f9fa; padding: 8px; border-radius: 4px; }
+    </style>
+  </head>
+  <body class="p-4">
+    <div class="container-fluid">
+      <h1>ARC Visualizer</h1>
+      <form method="get" class="row g-2 align-items-end">
+        <div class="col-auto">
+          <label for="run" class="form-label">Select run</label>
+          <select id="run" name="run" class="form-select">
+            <option value="">-- choose --</option>
+            {% for p in runs %}
+            <option value="{{ p.name }}" {% if p.name == selected_run %}selected{% endif %}>{{ p.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-auto">
+          <button class="btn btn-primary">Show run</button>
+        </div>
+      </form>
+
+      <div class="row mt-3">
+        <div class="col-3">
+          {% if run_info %}
+            <h3>Run Summary</h3>
+            <p><strong>Accuracy (avg highest testing priority):</strong> {{ '%.1f'|format(accuracy or 0.0) }}%</p>
+            <h5>Params</h5>
+            <pre class="params">{{ run_info.params | tojson(indent=2) }}</pre>
+            <h5>Tasks</h5>
+            <div class="mb-2">
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="taskFilter" id="filter-all" value="all" checked>
+                <label class="form-check-label" for="filter-all">All ({{ total_tasks }})</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="taskFilter" id="filter-success" value="success">
+                <label class="form-check-label" for="filter-success">Successes only ({{ success_count }})</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="taskFilter" id="filter-failure" value="failure">
+                <label class="form-check-label" for="filter-failure">Failures only ({{ failure_count }})</label>
+              </div>
+            </div>
+
+            <ul id="task-list" class="list-group">
+              {% for tid, data in run_info.tasks.items()|sort %}
+                {% set test_pct = (data.get('_testing_pct_max') or 0.0) | float %}
+                {% set train_pct = (data.get('_training_pct_max') or 0.0) | float %}
+                {% set avg_overlap = (data.get('_avg_overlap_pct') or 0.0) | float %}
+                {% set is_lucky = (test_pct >= 100.0 and train_pct < 100.0) %}
+                <li class="list-group-item d-flex justify-content-between align-items-center" data-test-pct="{{ test_pct }}" data-overlap-pct="{{ avg_overlap }}" data-train-pct="{{ train_pct }}">
+                  <a href="?run={{ run_info.path.name }}&task={{ tid }}" class="{% if is_lucky %}task-lucky{% elif test_pct >= 100.0 %}task-success{% endif %}">{{ tid }}</a>
+                  <span class="badge bg-secondary">{{ '%.1f'|format(avg_overlap) }}%</span>
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+        </div>
+
+        <div class="col-9">
+          {% if run_info and request.args.get('task') %}
+            {% set task = run_info.tasks.get(request.args.get('task')) %}
+            {% include 'task_panel.html' with context %}
+          {% else %}
+            <div class="alert alert-secondary">Select a task on the left to view details here.</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <script>
+    // Client-side filter for tasks (All / Successes / Failures)
+    document.addEventListener('DOMContentLoaded', function(){
+      const radios = document.querySelectorAll('input[name="taskFilter"]');
+      const items = Array.from(document.querySelectorAll('#task-list li')) || [];
+      function applyFilter(){
+        const sel = document.querySelector('input[name="taskFilter"]:checked');
+        const v = sel ? sel.value : 'all';
+          items.forEach(li => {
+          const testpct = parseFloat(li.dataset.testPct || 0) || 0.0;
+          if(v === 'all') { li.style.display = ''; }
+          else if(v === 'success') { li.style.display = (testpct >= 100.0) ? '' : 'none'; }
+          else if(v === 'failure') { li.style.display = (testpct < 100.0) ? '' : 'none'; }
+        });
+      }
+      radios.forEach(r => r.addEventListener('change', applyFilter));
+      // apply initial filter to ensure UI reflects selected radio
+      applyFilter();
+    });
+    </script>
+    <!-- Bootstrap JS for tabs and interactive components -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    </div>
+  </body>
+</html>

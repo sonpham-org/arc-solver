@@ -142,61 +142,94 @@ def interactive_directory_selection(directories: List[Path]) -> Path:
 
 def load_and_display_summary(directory: Path) -> None:
     """Load and display the summary.json file."""
-    summary_file = directory / "summary.json"
-    
-    if not summary_file.exists():
-        print(f"\nSummary file not found. Generating summary for {directory.name}...")
+    # Instead of relying on a precomputed summary.json, scan task files
+    # and count 'correct' fields inside the `test` (or similar) lists.
+    task_files = [f for f in directory.glob("*.json")
+                  if f.name not in ["summary.json", "params.json"]]
+
+    total_tasks = 0
+    summed_task_scores = 0.0  # sum of per-task averaged correctness in [0,1]
+    total_test_items = 0
+    raw_correct_items = 0
+    total_tokens = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for f in task_files:
         try:
-            calculate_results(str(directory))
-        except Exception as e:
-            print(f"Error generating summary: {e}")
-            return
-    
-    # Load and display the summary
-    try:
-        with open(summary_file, 'r') as f:
-            summary = json.load(f)
-        
-        print(f"\n📊 Results Summary for {directory.name}")
-        print("=" * 60)
-        
-        # Basic statistics
-        print(f"Total tasks processed: {summary['total_tasks']}")
-        print(f"Completely correct tasks: {summary['completely_correct_tasks']}")
-        print(f"Correctness percentage: {summary['correctness_percentage']:.2f}%")
-        print()
-        
-        # Token and cost statistics
-        print(f"Total tokens used: {summary['total_tokens']:,}")
-        print(f"  - Input tokens: {summary['total_input_tokens']:,}")
-        print(f"  - Output tokens: {summary['total_output_tokens']:,}")
-        print(f"Average tokens per task: {summary['average_tokens_per_task']:.1f}")
-        print()
-        
-        print(f"Total estimated cost: ${summary['total_estimated_cost']:.6f}")
-        print(f"Average cost per task: ${summary['average_cost_per_task']:.6f}")
-        print()
-        
-        # Performance breakdown
-        if 'task_details' in summary:
-            task_details = summary['task_details']
-            correct_tasks = [t for t in task_details if t['completely_correct']]
-            incorrect_tasks = [t for t in task_details if not t['completely_correct']]
-            
-            if correct_tasks:
-                avg_tokens_correct = sum(t['tokens'] for t in correct_tasks) / len(correct_tasks)
-                avg_cost_correct = sum(t['cost'] for t in correct_tasks) / len(correct_tasks)
-                print(f"Correct tasks - Avg tokens: {avg_tokens_correct:.1f}, Avg cost: ${avg_cost_correct:.6f}")
-            
-            if incorrect_tasks:
-                avg_tokens_incorrect = sum(t['tokens'] for t in incorrect_tasks) / len(incorrect_tasks)
-                avg_cost_incorrect = sum(t['cost'] for t in incorrect_tasks) / len(incorrect_tasks)
-                print(f"Incorrect tasks - Avg tokens: {avg_tokens_incorrect:.1f}, Avg cost: ${avg_cost_incorrect:.6f}")
-        
-        print("=" * 60)
-        
-    except Exception as e:
-        print(f"Error reading summary file: {e}")
+            with open(f, 'r') as fh:
+                data = json.load(fh)
+
+            # Prefer explicit 'test' or 'tests' lists for scoring
+            tests_list = None
+            if isinstance(data, dict):
+                for preferred in ('test', 'tests'):
+                    candidate = data.get(preferred)
+                    if isinstance(candidate, list) and candidate and all(isinstance(x, dict) for x in candidate):
+                        tests_list = candidate
+                        break
+
+                # Fallback: find any list-of-dicts that contains 'correct' keys
+                if tests_list is None:
+                    for key, val in data.items():
+                        if isinstance(val, list) and val and all(isinstance(x, dict) for x in val) and any('correct' in x for x in val):
+                            tests_list = val
+                            break
+
+            elif isinstance(data, list):
+                if data and all(isinstance(x, dict) for x in data) and any('correct' in x for x in data):
+                    tests_list = data
+
+            if not tests_list:
+                # nothing to score in this file
+                continue
+
+            # Compute per-task score: average correctness across test cases for this task
+            num_cases = len(tests_list)
+            num_correct_cases = sum(1 for item in tests_list if bool(item.get('correct')))
+            task_score = (num_correct_cases / num_cases) if num_cases else 0.0
+
+            total_tasks += 1
+            summed_task_scores += task_score
+
+            # keep raw counts as well
+            total_test_items += num_cases
+            raw_correct_items += num_correct_cases
+
+            # Aggregate token info if available per-file
+            if isinstance(data, dict):
+                total_tokens += int(data.get('total_tokens', 0) or 0)
+                total_input_tokens += int(data.get('input_tokens', 0) or 0)
+                total_output_tokens += int(data.get('output_tokens', 0) or 0)
+
+        except Exception:
+            # Ignore malformed files and continue
+            continue
+
+    # Display computed summary where each file contributes at most 1.0 (averaged over its test cases)
+    print(f"\n📊 Results Summary for {directory.name}")
+    print("=" * 60)
+    print(f"Total tasks processed (files with test lists): {total_tasks}")
+    print(f"Raw test cases processed: {total_test_items}")
+    print(f"Raw correct test cases: {raw_correct_items}")
+    print()
+
+    # summed_task_scores is in [0, total_tasks]
+    average_score_per_task = (summed_task_scores / total_tasks) if total_tasks else 0.0
+    correctness_percentage = average_score_per_task * 100.0
+    print(f"Summed task scores (sum of per-task averages): {summed_task_scores:.3f}")
+    print(f"Average score per task: {average_score_per_task:.3f} ({correctness_percentage:.2f}%)")
+    print()
+
+    # Token statistics (best-effort)
+    if total_tokens or total_input_tokens or total_output_tokens:
+        print(f"Total tokens (sum from files): {total_tokens:,}")
+        print(f"  - Input tokens: {total_input_tokens:,}")
+        print(f"  - Output tokens: {total_output_tokens:,}")
+        avg_tokens_per_task = (total_tokens / total_tasks) if total_tasks else 0.0
+        print(f"Average tokens per task (best-effort): {avg_tokens_per_task:.1f}")
+
+    print("=" * 60)
 
 
 def main():

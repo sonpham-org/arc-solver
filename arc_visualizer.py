@@ -19,9 +19,36 @@ OUTPUT_ROOT = APP_ROOT / "output"
 
 
 def find_runs(output_root: Path) -> List[Path]:
+    """Return a list of runs sorted in descending order (most recent first).
+
+    Each entry is a dict with keys:
+      - name: directory name
+      - path: Path object
+      - count: number of tasks discovered in the run
+    """
     if not output_root.exists():
         return []
-    return sorted([p for p in output_root.iterdir() if p.is_dir()])
+
+    runs = []
+    for p in output_root.iterdir():
+        if not p.is_dir():
+            continue
+        # Load run to count tasks (robust to per-task subfolders or flat JSON files)
+        try:
+            data = load_run(p)
+            task_count = len(data.get('tasks', {}))
+        except Exception:
+            task_count = 0
+        runs.append({'name': p.name, 'path': p, 'count': task_count})
+
+    # Prefer descending order (newest runs first). Try to sort by name (timestamped folders),
+    # fall back to filesystem mtime if names are not comparable.
+    try:
+        runs = sorted(runs, key=lambda r: r['name'], reverse=True)
+    except Exception:
+        runs = sorted(runs, key=lambda r: r['path'].stat().st_mtime, reverse=True)
+
+    return runs
 
 
 def load_run(run_path: Path) -> Dict[str, Any]:
@@ -175,6 +202,7 @@ def normalize_grid(grid: Optional[List[Any]]) -> Optional[List[List[int]]]:
 def prepare_task_for_view(task: Dict[str, Any]) -> Dict[str, Any]:
     # For each solution, compute diff masks for its examples and attach them
     sols = task.get('solutions_list') or []
+    # Ensure templates can directly read `sol['reasoning_trace']` without errors
     for sol in sols:
         for key in ('training_results', 'testing_results'):
             arr = sol.get(key) or []

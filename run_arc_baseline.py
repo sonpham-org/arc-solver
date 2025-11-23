@@ -23,14 +23,17 @@ from dotenv import load_dotenv
 from model_configs import MODEL_CONFIGS, is_known_model, estimate_cost
 from prompts import build_arc_prompt, build_arc_baseline_prompt
 from utils import calculate_results
+# Reuse the LLM initializer used by the LangGraph runner so providers
+# (google/learnlm, ollama, openai, etc.) are handled consistently.
+from run_multi_solution_langgraph_agent import initialize_llm_from_config
 
 # Configuration variables - edit these directly or use command line args
 TASK_INDEX = None
-NUMBER_OF_TASKS = -1  # Set to -1 to run ALL tasks
-MODEL = "gemini-2.5-flash-lite-preview-06-17"  # The other is "qwen2.5:32b"
+NUMBER_OF_TASKS = 100  # Set to -1 to run ALL tasks
+MODEL = "gemini-2.5-flash"  # The other is "qwen2.5:32b"
 # Path to the ARC challenges and solutions JSON files
 YEAR = 2024
-if YEAR == 2024:
+if YEAR == 2025:
     TRAINING_CHALLENGES_PATH = "data/arc-2024/arc-agi_training_challenges.json"
     TRAINING_SOLUTIONS_PATH = "data/arc-2024/arc-agi_training_solutions.json"
     EVALUATION_CHALLENGES_PATH = "data/arc-2024/arc-agi_evaluation_challenges.json"
@@ -345,30 +348,15 @@ def main():
         # Count input tokens
         input_tokens = count_tokens_simple(prompt)
 
-        # Call model
-        if provider == 'google' or provider == 'learnlm':
-            response_text = None
-            api_key = os.getenv('GEMINI_API_KEY')
-            if not api_key:
-                print("GEMINI_API_KEY not set; cannot use Gemini")
-                sys.exit(1)
-            else:
-                try:
-                    import google.generativeai as genai
-                    genai.configure(api_key=api_key)
-                    model_instance = genai.GenerativeModel(model_name=model, generation_config={"temperature": temperature})
-                    response = model_instance.generate_content(prompt)
-                    response_text = response.text
-                except Exception as e:
-                    print(f"Gemini call failed: {e}")
-                    sys.exit(1)
-        else:
-            response_text = run_with_ollama(prompt, model=model, temperature=temperature, num_predict=num_predict)
+        # Call model via the repo's LangChain initializer for consistency.
+        # We always initialize the LLM from config and invoke it on `prompt`.
+        llm = initialize_llm_from_config(model)
+        if llm is None:
+            print(f"Failed to initialize LLM for model '{model}'")
+            sys.exit(1)
 
-        if not response_text:
-            print(f"No response from model for task {task_id}.")
-            overall_scores.append(0.0)
-            continue
+        # Simple unified call: use `invoke` on the LLM wrapper (as in LangGraph runner)
+        response_text = llm.invoke(prompt).content
 
         # Count output tokens
         output_tokens = count_tokens_simple(response_text)

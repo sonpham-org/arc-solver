@@ -15,11 +15,45 @@ from langgraph.graph import StateGraph, START, END
 from .nodes import (
     generate_code_node,
     test_code_node,
-    finalize_node
+    finalize_node,
+    evolve_code_node
 )
 
 from .schema import AgentState, WorkflowOutput
 
+
+def _all_examples_success(results):
+    if not results:
+        return False
+    return all(bool(r.get('code_success', False)) for r in results)
+
+
+def finalize_pred(state):
+    """Predicate: True when we should finalize.
+
+    Finalize when either:
+    - Any `CodeSolution` in `solutions_list` has ALL training examples
+      with `code_success == True` (we only check training examples), OR
+    - We've reached or exceeded `max_generations`.
+    """
+    sols = state.get('solutions_list') or []
+
+    # Check for a perfect training-only solution
+    perfect_training = any(
+        _all_examples_success(sol.get('training_results', []))
+        for sol in sols
+    )
+
+    cur = int(state.get('current_generation', 0))
+    mx = int(state.get('max_generations', 0))
+
+    return perfect_training or (cur >= mx)
+
+def out_of_loops(state):
+    """Predicate: True when we've exhausted all loops."""
+    cur_loop = int(state.get('current_loop', 0))
+    max_loops = int(state.get('num_loops', 0))
+    return cur_loop >= max_loops
 
 def create_arc_workflow(llm, code_llm) -> StateGraph:
     """
@@ -29,13 +63,33 @@ def create_arc_workflow(llm, code_llm) -> StateGraph:
 
     # Add nodes with LLM access
     workflow.add_node("generate_code", lambda state: generate_code_node(state, llm, code_llm))
+
+    # Add test and refine nodes. Keep `test_code_node` as the node body
+    # and use conditional edges (predicates) to decide the next step.
     workflow.add_node("test_code", lambda state: test_code_node(state, llm, code_llm))
+    workflow.add_node("evolve_code", lambda state: evolve_code_node(state, llm, code_llm))
     workflow.add_node("finalize", finalize_node)
 
-    # Add edges
+    # Add edges. Use conditional edges out of `test_code` so the graph can
+    # choose the next node based on the current `state`.
     workflow.add_edge(START, "generate_code")
     workflow.add_edge("generate_code", "test_code")
-    workflow.add_edge("test_code", "finalize")
+
+    # Decision node approach: route from `test_code` to a dedicated
+    # `decide` node which returns the next node name. This mirrors the
+    # `builder.add_conditional_edges` pattern in your example.
+    workflow.add_edge("test_code", "decide")
+    workflow.add_node("decide", lambda state: state)
+
+    # decide_next returns the literal name of the next node; mapping
+    # instructs the graph how to map those strings to nodes.
+    def decide_next(state):
+        return "finalize" if finalize_pred(state) or out_of_loops(state) else "refine_code"
+
+    workflow.add_conditional_edges("decide", decide_next, {
+        "finalize": "finalize", 
+        "evolve_code": "evolve_code"})
+    workflow.add_edge("evolve_code", "test_code")
     workflow.add_edge("finalize", END)
 
     return workflow
@@ -43,8 +97,7 @@ def create_arc_workflow(llm, code_llm) -> StateGraph:
 
 def create_initial_state(task_id: str,
                         task_data: Dict[str, Any],
-                        max_attempts: int = 5,
-                        enable_visual_cue: bool = False) -> AgentState:
+                        agent) -> AgentState:
     """
     Create the initial state for the workflow.
     """
@@ -53,7 +106,15 @@ def create_initial_state(task_id: str,
         "task_data": task_data,
         "solutions_list": [],
         "metadata": {},
-        "enable_visual_cue": enable_visual_cue,
+        "current_loop": 0,
+        "num_initial_solutions": agent.num_initial_solutions,
+        "num_loops": agent.num_loops,
+        "num_seed_solutions": agent.num_seed_solutions,
+        "num_refinements": agent.num_refinements,
+        "num_solutions_per_refinement": agent.num_solutions_per_refinement,
+        "num_fusions": agent.num_fusions,
+        "num_solutions_per_fusion": agent.num_solutions_per_fusion,
+        "enable_visual_cue": agent.enable_visual_cue,
     }
 
 class MultiSolutionARCLangGraphAgent:
@@ -64,7 +125,19 @@ class MultiSolutionARCLangGraphAgent:
     storing all solutions in the workflow state.
     """
 
-    def __init__(self, llm, code_llm, enable_code_predict: bool = True, enable_llm_predict: bool = False, enable_parallel_eval: bool = False, enable_visual_cue: bool = False):
+    def __init__(self, llm, code_llm,
+                 num_initial_solutions: int = 10,
+                 num_loops: int = 3,
+                 num_seed_solutions: int = 10,
+                 num_refinements: int = 5,
+                 num_solutions_per_refinement: int = 3,
+                 num_fusions: int = 5,
+                 num_solutions_per_fusion: int = 3,
+                 enable_code_predict: bool = True,
+                 enable_llm_predict: bool = False,
+                 enable_parallel_eval: bool = False,
+                 enable_visual_cue: bool = False,
+                 max_generations: int = 3):
         """
         Initialize the ARC LangGraph Agent.
         
@@ -74,17 +147,27 @@ class MultiSolutionARCLangGraphAgent:
             enable_code_predict: Whether to enable code-predicted outputs during testing
             enable_llm_predict: Whether to enable LLM-predicted outputs during testing
         """
+        # LLM instances
         self.llm = llm
         self.code_llm = code_llm
+
+        # Evolutionary parameters
+        self.num_initial_solutions = num_initial_solutions
+        self.num_loops = num_loops
+        self.num_seed_solutions = num_seed_solutions
+        self.num_refinements = num_refinements
+        self.num_solutions_per_refinement = num_solutions_per_refinement
+        self.num_fusions = num_fusions
+        self.num_solutions_per_fusion = num_solutions_per_fusion
+
+        # Code enabling flags
         self.enable_code_predict = enable_code_predict  # Whether to enable code-predicted outputs during testing
         self.enable_llm_predict = enable_llm_predict  # Whether to enable LLM-predicted outputs during testing
         self.enable_parallel_eval = enable_parallel_eval  # Whether to parallelize evaluation with threads and tqdm
         self.enable_visual_cue = enable_visual_cue
+        self.max_generations = int(max_generations)
 
-        # Preload and normalize helper functions at initialization so
-        # `solve_task` can simply copy them into the workflow initial state.
-        # self._load_default_helpers()
-        # Decide to not load default helpers here to allow custom helpers only.
+        # Create arc workflow
         self.workflow = create_arc_workflow(llm, code_llm).compile()
 
     def solve_task(self, task_id: str, task_data: Dict[str, Any], task_solution: Optional[List[List[List[int]]]] = None, max_attempts: int = 5) -> WorkflowOutput:
@@ -108,31 +191,19 @@ class MultiSolutionARCLangGraphAgent:
                 test_example['output'] = task_solution[i]
         
         # Create initial state with custom max_attempts and helper functions
-        initial_state = create_initial_state(task_id, task_data, max_attempts, enable_visual_cue=self.enable_visual_cue)
+
+        initial_state = create_initial_state(task_id, task_data, self)
         
-        # Copy the preloaded helper definitions into the workflow initial state
-        initial_state['available_helpers'] = dict(self.available_helpers)
         # Propagate runtime flags into the workflow state so nodes can read them
         initial_state['enable_code_predict'] = bool(self.enable_code_predict)
         initial_state['enable_llm_predict'] = bool(self.enable_llm_predict)
+
         # New: allow nodes to enable parallelized evaluation
         initial_state['enable_parallel_eval'] = bool(self.enable_parallel_eval)
-        # Propagate visual cue flag
-        initial_state['enable_visual_cue'] = bool(self.enable_visual_cue)
-        
-        # Initialize final_state to avoid UnboundLocalError
-        workflow_results = {
-            "task_id": task_id,
-            "workflow_completed": False,
-            "attempts": 0,
-            "solutions": [],
-            "training_results": [],
-            "training_success_rate": 0.0,
-            "testing_results": [],
-            "testing_success_rate": 0.0,
-            "execution_time": 0.0,
-            "new_helpers": {}
-        }
+
+        # Generation counters for refinement loop
+        initial_state['current_generation'] = int(initial_state.get('current_generation', 0))
+        initial_state['max_generations'] = int(getattr(self, 'max_generations', 0))
 
         # Run the workflow
         final_state = self.workflow.invoke(initial_state)
@@ -140,8 +211,6 @@ class MultiSolutionARCLangGraphAgent:
 
         # Build WorkflowOutput-compatible dict (matches schema.WorkflowOutput)
         solutions_list = final_state.get("solutions_list", [])
-        highest_success_rate = -1.0
-        highest_llm_success_rate = -1.0
         best_idx = None
         best_priority = -1.0
         best_overlap = -1.0

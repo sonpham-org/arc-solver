@@ -58,14 +58,26 @@ class CodeSolution(TypedDict):
     main_code: str
     reasoning_trace: str  # Full reasoning analysis of patterns. Maybe should just do some summary.
     step_by_step_transformation: List[str]  # Clear transformation steps
-    
+
+    evaluated: bool
     training_results: List[ExampleResult]
     training_success_rate: float
+    training_overlap_average: float
+    training_error_rate: float
     llm_training_success_rate: float
+    llm_training_overlap_average: float
     testing_results: List[ExampleResult]
     testing_success_rate: float
+    testing_overlap_average: float
+    testing_error_rate: float
     llm_testing_success_rate: float
+    llm_testing_overlap_average: float
 
+
+class SolutionGeneration(TypedDict):
+    """Represents a generation of solutions refined"""    
+    generation: int
+    solutions_list: List[CodeSolution]
 
 class AgentState(TypedDict):
     """Main state for the ARC LangGraph Agent workflow."""
@@ -73,9 +85,30 @@ class AgentState(TypedDict):
     # Task information (immutable)
     task_id: Annotated[str, take_first]
     task_data: Annotated[Dict[str, Any], immutable_dict]
+
+    # Runtime visual flag: prefer the latest provided value (allow agent to set)
+    enable_visual_cue: Annotated[bool, take_latest]
     
     # Generated solutions
+    seed_solutions_list: Annotated[Optional[List[CodeSolution]], take_latest]
+    fused_solutions_list: Annotated[Optional[List[List[CodeSolution]]], take_latest]
+    mutated_solutions_list: Annotated[Optional[List[List[CodeSolution]]], take_latest]
     solutions_list: Annotated[Optional[List[CodeSolution]], take_latest]
+
+    # Evolulionary test time compute metrics
+    current_loop: Annotated[Optional[int], take_latest]
+    num_initial_solutions: Annotated[Optional[int], take_latest]
+    num_loops: Annotated[Optional[int], take_latest]
+    num_seed_solutions: Annotated[Optional[int], take_latest]
+    num_refinements: Annotated[Optional[int], take_latest]
+    num_solutions_per_refinement: Annotated[Optional[int], take_latest]
+    num_fusions: Annotated[Optional[int], take_latest]
+    num_solutions_per_fusion: Annotated[Optional[int], take_latest]
+
+    # Generations of mutated solutions
+    current_generation: Annotated[Optional[int], take_latest]
+    max_generations: Annotated[Optional[int], take_latest]
+    generations: Annotated[Optional[List[SolutionGeneration]], take_latest]
     
     # Runtime flags propagated from agent instance
     enable_code_predict: Annotated[bool, take_latest]

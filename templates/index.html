@@ -20,7 +20,7 @@
           <select id="run" name="run" class="form-select">
             <option value="">-- choose --</option>
             {% for p in runs %}
-            <option value="{{ p.name }}" {% if p.name == selected_run %}selected{% endif %}>{{ p.name }}</option>
+            <option value="{{ p.name }}" {% if p.name == selected_run %}selected{% endif %}>{{ p.name }} ({{ p.count }})</option>
             {% endfor %}
           </select>
         </div>

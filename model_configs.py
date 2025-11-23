@@ -8,7 +8,8 @@ runner imports DEFAULT_MODEL to set the model unless overridden via CLI.
 from typing import Dict, Optional
 
 # Default model to use when none is supplied via CLI
-DEFAULT_MODEL = "gemini-2.5-flash-lite-preview-06-17"
+# Prefer the stable flash-lite model as the default (preview aliases remain available)
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
 
 # Pricing is expressed as USD per 1,000,000 tokens (per 1M). The cost
 # calculator below assumes tokens are raw token counts (not words) and
@@ -35,6 +36,12 @@ MODEL_CONFIGS: Dict[str, Dict[str, object]] = {
         "description": "Gemini 2.5 Flash-Lite",
         "pricing": {"input_per_m": 0.10, "output_per_m": 0.40},
     },
+    # Gemini 3 Pro (newer generation)
+    "gemini-3-pro": {
+        "provider": "google",
+        "description": "Gemini 3 Pro (powerful multimodal)",
+        "pricing": {"input_per_m": 2.00, "output_per_m": 12.00},
+    },
     # Gemini 2.0 Flash
     "gemini-2.0-flash": {
         "provider": "google",
@@ -57,6 +64,17 @@ MODEL_CONFIGS: Dict[str, Dict[str, object]] = {
     "gemini-2.5-flash-lite-preview-06-17": {
         "provider": "google",
         "description": "Gemini 2.5 flash lite preview",
+        "alias_of": "gemini-2.5-flash-lite",
+    },
+    # Additional preview aliases observed on the Gemini pricing page
+    "gemini-2.5-flash-preview-09-2025": {
+        "provider": "google",
+        "description": "Gemini 2.5 Flash preview (Sept 2025)",
+        "alias_of": "gemini-2.5-flash",
+    },
+    "gemini-2.5-flash-lite-preview-09-2025": {
+        "provider": "google",
+        "description": "Gemini 2.5 Flash-Lite preview (Sept 2025)",
         "alias_of": "gemini-2.5-flash-lite",
     },
     # Llama 3.1 via Ollama

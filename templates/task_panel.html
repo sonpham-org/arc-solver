@@ -29,8 +29,15 @@
         <h4>Solution {{ i }}</h4>
         <p><strong>Training success:</strong> {{ '%.1f'|format(sol._training_pct or 0.0) }}% &nbsp; <strong>Testing success:</strong> {{ '%.1f'|format(sol._testing_pct or 0.0) }}%</p>
 
-        <h5>Transformation / Reasoning</h5>
-        <pre class="params transformation">{% if sol.step_by_step_transformation %}{{ sol.step_by_step_transformation | tojson(indent=2) }}{% else %}{{ sol.reasoning_trace or '' }}{% endif %}</pre>
+        <h5>Transformation Rules</h5>
+        {% if sol.step_by_step_transformation %}
+          <pre class="params transformation">{{ sol.step_by_step_transformation | tojson(indent=2) }}</pre>
+        {% else %}
+          <div class="params transformation">
+            <script type="text/plain" class="reasoning-markdown">{% if sol.reasoning_trace is string %}{{ sol.reasoning_trace | e }}{% elif sol.reasoning_trace is sequence and not sol.reasoning_trace is string %}{{ sol.reasoning_trace | join('\n') | e }}{% else %}{{ sol.reasoning_trace | e }}{% endif %}</script>
+            <div class="reasoning-markdown-rendered"></div>
+          </div>
+        {% endif %}
 
         <h5>Python code</h5>
         {% set _pycode = sol.main_code or sol.code or sol.generated_code or '' %}
@@ -94,6 +101,12 @@
           </div>
         {% endfor %}
 
+        <h5>Reasoning Trace</h5>
+        <div class="code">
+          <script type="text/plain" class="reasoning-markdown">{% if sol.reasoning_trace is string %}{{ sol.reasoning_trace | e }}{% elif sol.reasoning_trace is sequence and not sol.reasoning_trace is string %}{{ sol.reasoning_trace | join('\n') | e }}{% else %}{{ sol.reasoning_trace | e }}{% endif %}</script>
+          <div class="reasoning-markdown-rendered"></div>
+        </div>
+
       </div>
     {% endfor %}
   </div>
@@ -103,3 +116,23 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
 <script>document.addEventListener('DOMContentLoaded', () => { if(window.hljs) hljs.highlightAll(); });</script>
+<!-- Marked (Markdown) + DOMPurify to safely render reasoning traces as HTML -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@2.4.0/dist/purify.min.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  // Render all reasoning-markdown script blocks into their following container
+  document.querySelectorAll('script.reasoning-markdown').forEach(s => {
+    try {
+      const text = s.textContent || '';
+      const raw = marked.parse(text || '');
+      const clean = DOMPurify.sanitize(raw);
+      const out = s.nextElementSibling;
+      if(out) out.innerHTML = clean;
+    } catch (e) {
+      const out = s.nextElementSibling;
+      if(out) out.textContent = s.textContent || '';
+    }
+  });
+});
+</script>

@@ -202,7 +202,7 @@ def _grid_to_image_bytes(grid: List[List[int]], cell_size: int = 24, padding: in
     return buf.getvalue()
 
 
-def generate_solutions_with_reasoning(llm, code_llm, training_examples: List[Dict], enable_visual_cue: bool = False, task_id: Optional[str] = None) -> Tuple[List[str], str, List[Dict]]:
+def generate_solutions_with_reasoning(llm, code_llm, training_examples: List[Dict], num_solutions: int, enable_visual_cue: bool = False) -> Tuple[List[str], str, List[Dict]]:
     """Generate Python transformation code using reasoning-first approach.
 
     When `enable_visual_cue` is True, this function will render training
@@ -230,13 +230,12 @@ def generate_solutions_with_reasoning(llm, code_llm, training_examples: List[Dic
                 'input_b64': b64_in,
                 'output_b64': b64_out,
             })
-    print(visual_cues)
 
     # Step 1: Generate reasoning trace
     reasoning_trace = generate_reasoning_trace(llm, training_examples) if not enable_visual_cue else generate_reasoning_trace(llm, training_examples, visual_cues=visual_cues)
 
     # Step 2: Extract step-by-step transformation from reasoning
-    transoformation_solutions_list = generate_transformation_steps(llm, reasoning_trace, training_examples)
+    transoformation_solutions_list = generate_transformation_steps(llm, reasoning_trace, training_examples, num_solutions)
 
     # Step 3: Generate Python code(s) based on reasoning and steps
     # Note: `generate_code_from_reasoning` may return multiple candidate code strings.
@@ -389,6 +388,13 @@ def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Op
     except Exception as e:
         print(f"Error generating reasoning trace: {e}")
         return f"Error in reasoning generation: {str(e)}"
+    
+
+def build_steps_text_from_transformation_steps(transformation_steps: List[str]) -> str:
+    """Build a numbered steps text block from a list of transformation steps."""
+    if not transformation_steps:
+        return "(no transformation steps provided)"
+    return "\n".join(f"{i+1}. {s}" for i, s in enumerate(transformation_steps))
 
 
 def generate_reflection_reasoning_trace(llm,
@@ -401,16 +407,21 @@ def generate_reflection_reasoning_trace(llm,
     what went wrong, and produce a reasoning trace focused on correcting the logic.
     """
     def build_refinement_reasoning_prompt(current_solution: CodeSolution,
-                                        failed_tests: List[ExampleResult],
+                                        training_results: List[ExampleResult],
                                         training_examples: List[Dict]) -> str:
         """Build reflection prompt based on ARC reflection prompt style for deep analysis."""
         
         # Format previous solution
         previous_code = current_solution["main_code"]
+        transformation_steps = current_solution["step_by_step_transformation"]
+        reasoning_trace = current_solution["reasoning_trace"]
+
+        # Format transformation steps
+        steps_text = build_steps_text_from_transformation_steps(transformation_steps)
         
         # Build detailed failure analysis
         failure_analysis = []
-        for test in failed_tests:
+        for test in training_results:
             example_idx = test.get("example_index", 0)
             if example_idx < len(training_examples):
                 example = training_examples[example_idx]
@@ -426,11 +437,23 @@ def generate_reflection_reasoning_trace(llm,
                     # Calculate sizes
                     pred_h, pred_w = len(predicted), len(predicted[0]) if predicted else 0
                     exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
-                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: {pred_h}x{pred_w}\\n"
+                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: {pred_h}x{pred_w}\n"
+                    # Add a visual difference map ('.' match, 'X' mismatch; non-overlap = X)
+                    try:
+                        diff_map = format_difference_map(predicted, example['output'])
+                        analysis += f"Difference:\n{diff_map}\n\n"
+                    except Exception:
+                        analysis += "Difference: (could not compute difference map)\n\n"
                 else:
                     analysis += "Your Predicted Output: No output generated\\n\\n"
                     exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
                     analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: 0x0\\n"
+                    # When there's no predicted output, mark the entire expected area as mismatches
+                    try:
+                        diff_map = format_difference_map(None, example['output'])
+                        analysis += f"Difference:\n{diff_map}\n\n"
+                    except Exception:
+                        analysis += "Difference: (could not compute difference map)\n\n"
                 
                 analysis += f"Overlap: {test.get('overlap_percentage', 0):.1f}%\\n"
                 analysis += f"IOU (Intersection over Union): {test.get('iou_percentage', 0):.1f}%\\n"
@@ -453,22 +476,23 @@ def generate_reflection_reasoning_trace(llm,
         prompt_parts = [
             "You are an expert mathematician, logistician and pattern recognizier who is solving the"
             "Abstract Reasoning Corpus (ARC) problems.",
-            "Your task is to deeply analyze the input-output examples and understand the underlying pattern.",
             "You previously attempted to solve this task but your solution was incorrect on some training examples."
 
             "YOUR GOAL:",
-            "Analyze your previous attempt deeply, understand why it failed, and provide a CORRECTED reasoning rule that:",
-            "1. Correctly maps every training input to its output",
-            "2. Is general and intuitive (no memorization or hard-coded values)",
-            "3. Is logical, reproducible, and object-level",
+            "Analyze your previous attempt deeply, understand why it failed"
+            "- Was there an issue with the logic of the code that led to the failure?",
+            "- If the code succeeds but the output doesn't match up, what are the difference between the intended output and your predicted output?",
+            "- What is missing from your reasoning and solution that leads to these differences?",
+            "- How to modify your reasoning and code to correct for these errors and ensure it solves the task fully?",
             "",
-            "ORIGINAL TRAINING EXAMPLES",
-            f"{examples_block}",
-            "",
-            "YOUR PREVIOUS SOLUTION",
-            "```python",
+            "YOUR PREVIOUS CODE:",
             f"{previous_code}",
-            "```",
+            ""
+            "YOUR PREVIOUS REASONING:",
+            f"{reasoning_trace}",
+            "",
+            "YOUR PREVIOUS TRANSFORMATION RULES:",
+            f"{steps_text}",
             "",
             "DETAILED FAILURE ANALYSIS",
             f"{failures_block}",
@@ -478,8 +502,8 @@ def generate_reflection_reasoning_trace(llm,
         ]
 
         prompt = "\n".join(prompt_parts)
-
         return prompt
+
     try:
         prompt = build_refinement_reasoning_prompt(current_solution, training_results, training_examples)
         response = llm.invoke(prompt)
@@ -506,6 +530,44 @@ def format_grid_for_analysis(grid: List[List[int]]) -> str:
         formatted_rows.append("".join(str(cell) for cell in row))
     
     return "\n".join(formatted_rows)
+
+
+def format_difference_map(predicted: Optional[List[List[int]]], expected: Optional[List[List[int]]], indent: int = 0) -> str:
+    """Return a visual difference map where '.' indicates a matching cell and 'X' a mismatch.
+
+    If the predicted and expected grids have different sizes, the non-overlapping
+    area is marked with 'X'. The returned string contains one line per row.
+    """
+    if not expected:
+        return "(no expected output)"
+
+    pred_h = len(predicted) if predicted else 0
+    pred_w = len(predicted[0]) if pred_h > 0 and predicted[0] else 0
+    exp_h = len(expected) if expected else 0
+    exp_w = len(expected[0]) if exp_h > 0 and expected[0] else 0
+
+    h = max(exp_h, pred_h)
+    w = max(exp_w, pred_w)
+
+    rows = []
+    for i in range(h):
+        cols = []
+        for j in range(w):
+            if i < pred_h and j < pred_w and i < exp_h and j < exp_w:
+                try:
+                    cols.append('.' if predicted[i][j] == expected[i][j] else 'X')
+                except Exception:
+                    cols.append('X')
+            else:
+                # Out-of-range or missing cell => mismatch
+                cols.append('X')
+        rows.append(''.join(cols))
+
+    # Apply indentation to each row
+    indentation = " " * indent
+    rows = [indentation + row for row in rows]
+
+    return "\n".join(rows)
 
 
 def extract_reasoning_content(response_text: str) -> str:
@@ -541,13 +603,61 @@ def extract_reasoning_content(response_text: str) -> str:
     return '\n'.join(substantial_lines[:10]) if substantial_lines else response_text[:500]
 
 
-def generate_transformation_steps(llm, reasoning_trace: str, training_examples: List[Dict]) -> List[Dict]:
+def generate_transformation_steps(llm, reasoning_trace: str, training_examples: List[Dict], num_solutions: int) -> List[Dict]:
     """Extract clear step-by-step transformation from reasoning trace.
 
     Returns a list of solution objects: [{"solution_number": int, "transformation_steps": [str, ...]}, ...]
     """
-    
-    prompt = build_transformation_steps_prompt(reasoning_trace, training_examples)
+
+    def build_transformation_steps_prompt() -> str:
+        """Build prompt for extracting clear transformation steps."""
+        # Build training examples block
+        examples_block = ""
+        for i, example in enumerate(training_examples, 1):
+            examples_block += f"Training Example {i}\\n--\\n"
+            examples_block += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
+            examples_block += f"Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
+        prompt_parts = [
+            "You are an expert mathematician, logistician and pattern recognizier who is solving the Abstract Reasoning Corpus (ARC) problems.",
+            "Based on the following reasoning analysis, extract clear step-by-step transformation instructions.",
+            "",
+            "TRAINING EXAMPLES",
+            f"{examples_block}",
+            "",
+            "REASONING ANALYSIS",
+            f"{reasoning_trace}",
+            "",
+            "INSTRUCTIONS",
+            f"Produce {num_solutions} different candidate solutions. Each solution should be a numbered sequence of clear, actionable transformation steps.",
+            "Be creative: try different, plausible interpretations of the reasoning so the set of solutions explores diverse approaches (use different object-level operations, orders, or heuristics).",
+            "Each solution should be concise and concrete so it can be executed programmatically.",
+            "",
+            "RESPONSE FORMAT (JSON):",
+            f"Return a JSON array in a json block containing {num_solutions} solution objects. Each object should have two keys:",
+            f"- \"solution_number\": an integer (1..{num_solutions})",
+            "- \"transformation_steps\": a JSON array of strings, each string being a single transformation step (in order)",
+            "",
+            "Example response structure:",
+            "```json",
+            "[",
+            "  {",
+            "    \"solution_number\": 1,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  {",
+            "    \"solution_number\": 2,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  ...",
+            "]",
+            "```",
+            f"Do NOT output any additional text outside the ```json``` block. Generate the {num_solutions} solutions now."
+        ]
+
+        prompt = "\n".join(prompt_parts)
+        return prompt
+        
+    prompt = build_transformation_steps_prompt()
     
     try:
         response = llm.invoke(prompt, temperature=0.7)
@@ -566,61 +676,119 @@ def generate_transformation_steps(llm, reasoning_trace: str, training_examples: 
         return [{"solution_number": 1, "transformation_steps": [f"Error in step extraction: {str(e)}"]}]
 
 
-def build_transformation_steps_prompt(reasoning_trace: str, training_examples: List[Dict]) -> str:
-    """Build prompt for extracting clear transformation steps."""
-    # Build training examples block
-    examples_block = ""
-    for i, example in enumerate(training_examples, 1):
-        examples_block += f"Training Example {i}\\n--\\n"
-        examples_block += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
-        examples_block += f"Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
-    prompt_parts = [
-        "You are an expert mathematician, logistician and pattern recognizier who is solving the Abstract Reasoning Corpus (ARC) problems.",
-        "Based on the following reasoning analysis, extract clear step-by-step transformation instructions.",
+def generate_refined_transformation_steps(llm, reasoning_trace: str, sol: Dict, training_examples: List[Dict], num_solutions: int) -> List[Dict]:
+    """Extract refined step-by-step transformation from reasoning trace and previous solution failures.
 
-        "------------------",
-        "TRAINING EXAMPLES",
-        "------------------",
-        f"{examples_block}",
-        "",
-        "------------------",
-        "REASONING ANALYSIS",
-        "------------------",
-        f"{reasoning_trace}",
-        "",
-        "------------------",
-        "INSTRUCTIONS",
-        "------------------",
-        "Produce 10 different candidate solutions. Each solution should be a numbered sequence of clear, actionable transformation steps.",
-        "Be creative: try different, plausible interpretations of the reasoning so the set of solutions explores diverse approaches (use different object-level operations, orders, or heuristics).",
-        "Each solution should be concise and concrete so it can be executed programmatically.",
-        "",
-        "RESPONSE FORMAT (JSON):",
-        "Return a JSON array in a json block containing 10 solution objects. Each object should have two keys:",
-        "- \"solution_number\": an integer (1..10)",
-        "- \"transformation_steps\": a JSON array of strings, each string being a single transformation step (in order)",
-        "",
-        "Example response structure:",
-        "```json",
-        "[",
-        "  {",
-        "    \"solution_number\": 1,",
-        "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
-        "  },",
-        "  {",
-        "    \"solution_number\": 2,",
-        "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
-        "  },",
-        "  ...",
-        "]",
-        "```",
-        "Do NOT output any additional text outside the ```json``` block. Generate the 10 solutions now."
-    ]
+    Returns a list of solution objects: [{"solution_number": int, "transformation_steps": [str, ...]}, ...]
+    """
 
-    prompt = "\n".join(prompt_parts)
+    def build_refined_transformation_steps_prompt() -> str:
+        """Build a prompt that includes reasoning, the previous solution (and its failures), and training examples.
 
-    return prompt
+        The `sol` argument is expected to be a solution dict that may contain keys like
+        'solution_number', 'transformation_steps', 'training_results', 'main_code', and any
+        failure analysis produced during evaluation. The prompt encourages the LLM to
+        produce refined candidate transformation-step sequences that take the failures
+        into account.
+        """
+        # Get relevant information out
+        training_results = sol["training_results"]
 
+        # Build detailed failure analysis
+        failure_analysis = []
+        for test in training_results:
+            example_idx = test.get("example_index", 0)
+            if example_idx < len(training_examples):
+                example = training_examples[example_idx]
+                
+                analysis = f"Training Example {example_idx + 1} - FAILED\\n"
+                analysis += "--\\n"
+                analysis += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
+                analysis += f"Expected Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
+                
+                predicted = test.get("predicted_output")
+                if predicted:
+                    analysis += f"Your Predicted Output:\\n{format_grid_for_prompt(predicted)}\\n\\n"
+                    # Calculate sizes
+                    pred_h, pred_w = len(predicted), len(predicted[0]) if predicted else 0
+                    exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
+                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: {pred_h}x{pred_w}\n"
+                    # Add a visual difference map ('.' match, 'X' mismatch; non-overlap = X)
+                    try:
+                        diff_map = format_difference_map(predicted, example['output'])
+                        analysis += f"Difference:\n{diff_map}\n\n"
+                    except Exception:
+                        analysis += "Difference: (could not compute difference map)\n\n"
+                else:
+                    analysis += "Your Predicted Output: No output generated\\n\\n"
+                    exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
+                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: 0x0\\n"
+                    # When there's no predicted output, mark the entire expected area as mismatches
+                    try:
+                        diff_map = format_difference_map(None, example['output'])
+                        analysis += f"Difference:\n{diff_map}\n\n"
+                    except Exception:
+                        analysis += "Difference: (could not compute difference map)\n\n"
+                
+                analysis += f"Overlap: {test.get('overlap_percentage', 0):.1f}%\\n"
+                analysis += f"IOU (Intersection over Union): {test.get('iou_percentage', 0):.1f}%\\n"
+                
+                error_msg = test.get("error_message")
+                if error_msg:
+                    analysis += f"Error: {error_msg}\\n"
+                
+                failure_analysis.append(analysis)
+            
+        failures_block = "\\n".join(failure_analysis) 
+
+        prompt_parts = [
+            "You are an expert mathematician, logistician and pattern recognizier who is solving the Abstract Reasoning Corpus (ARC) problems.",
+            "You previously attempted a solution which failed to solve the task. You are asked to use the failure information to generate refined candidate transformation steps.",
+            "",
+            "PREVIOUS SOLUTION & FAILURES:",
+            f"{failures_block}",
+            ""
+            "REFLECTION ON PAST FAILURE:",
+            f"{reasoning_trace}",
+            "",
+            "INSTRUCTIONS:",
+            f"Produce {num_solutions} different candidate solutions. Each solution should be a numbered sequence of clear, actionable transformation steps.",
+            "Give special attention to correcting the failure modes shown in the previous solution summary.",
+            "Each solution should be concise and concrete so it can be executed programmatically.",
+            "",
+            "RESPONSE FORMAT (JSON):",
+            f"Return a JSON array in a json block containing {num_solutions} solution objects. Each object should have two keys:",
+            f"- \"solution_number\": an integer (1..{num_solutions})",
+            "- \"transformation_steps\": a JSON array of strings, each string being a single transformation step (in order)",
+            "",
+            "Example response structure:",
+            "```json",
+            "[",
+            "  {",
+            "    \"solution_number\": 1,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  {",
+            "    \"solution_number\": 2,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  ...",
+            "]",
+            "```",
+            f"Do NOT output any additional text outside the ```json``` block. Generate the {num_solutions} solutions now."
+        ]
+
+        prompt = "\n".join(prompt_parts)
+        return prompt
+
+    prompt = build_refined_transformation_steps_prompt(reasoning_trace, sol, training_examples)
+    response = llm.invoke(prompt, temperature=0.7)
+    response_text = response.content if hasattr(response, 'content') else str(response)
+
+    # print_prompt_and_response(prompt, response)
+
+    solutions = parse_transformation_steps(response_text)
+    return solutions
 
 def parse_transformation_steps(response_text: str) -> List[str]:
     """Parse transformation steps from LLM response."""
@@ -1147,48 +1315,66 @@ def analyze_failures(failed_tests: List[ExampleResult], training_examples: List[
     return analysis
 
 
-# def refine_solution_based_on_failures(llm, code_llm, 
-#                                       current_solution: CodeSolution,
-#                                       training_results: List[ExampleResult],
-#                                       training_examples: List[Dict], helper_functions: Dict[str, HelperFunction]) -> CodeSolution:
-#     """Refine the solution based on test failures using LLM with ARC-style reflection."""
+def refine_solutions_with_reasoning(llm,
+                                    code_llm,
+                                    current_solution: CodeSolution,
+                                    training_examples: List[Dict],
+                                    num_refined_solutions: int,
+                                    enable_visual_cue: bool = False) -> Tuple[List[str], str, List[Dict]]:
+    """Refine a CodeSolution using LLM reflection, transformation extraction, and code regeneration.
 
-#     # 1) Get reflection reasoning trace (structured analysis only)
-#     reasoning = generate_reflection_reasoning_trace(llm, current_solution, training_results, training_examples)
+    Steps:
+    1. Identify failed/partial training examples from `current_solution['training_results']`.
+    2. Ask the LLM to reflect on differences between expected vs predicted and produce a
+       corrected `reasoning_trace` (via `generate_reflection_reasoning_trace`).
+    3. Extract concrete `transformation_steps` from the reasoning.
+    4. Generate candidate Python implementations from the reasoning + steps.
+    5. Pick a candidate, evaluate on training examples, and return an updated CodeSolution
+       with updated `main_code`, `reasoning_trace`, `step_by_step_transformation`, and metrics.
 
-#     # 2) Extract transformation steps from the reasoning
-#     transformation_steps = generate_transformation_steps(llm, reasoning, training_examples)
+    Returns an updated CodeSolution dict (may be same as input if refinement fails).
+    """
+    # Defensive copy of solution to avoid mutating the caller's object
+    sol = copy.deepcopy(current_solution)
 
-#     # 3) Generate refined code from reasoning + steps
-#     refined_codes = generate_code_from_reasoning(llm, code_llm, reasoning, transformation_steps, training_examples, helper_functions)
+    # Create visual cuesif needed
+    visual_cues = []
+    if enable_visual_cue:
+        # Build visual cues: for each training example, create a small image
+        # that shows the input and expected output stacked vertically.
+        import base64
+        for i, ex in enumerate(training_examples):
+            inp = ex.get('input') or []
+            out = ex.get('output') or []
+            inp_bytes = _grid_to_image_bytes(inp)
+            out_bytes = _grid_to_image_bytes(out)
+            b64_in = base64.b64encode(inp_bytes).decode('utf-8')
+            b64_out = base64.b64encode(out_bytes).decode('utf-8')
+            visual_cues.append({
+                'example_index': i,
+                'input_b64': b64_in,
+                'output_b64': b64_out,
+            })
 
-#     # refined_codes may be a list of candidates; pick the first candidate that
-#     # looks like a valid transform function, otherwise fall back to the first.
-#     chosen_code = None
-#     if isinstance(refined_codes, list):
-#         for c in refined_codes:
-#             if isinstance(c, str) and 'def transform(' in c:
-#                 chosen_code = c
-#                 break
-#         if chosen_code is None and refined_codes:
-#             chosen_code = refined_codes[0]
-#     else:
-#         chosen_code = refined_codes
+    training_results: List[ExampleResult] = sol.get('training_results', []) or []
 
-#     # If code generation succeeded, return the refined solution
-#     if chosen_code and isinstance(chosen_code, str) and 'def transform(' in chosen_code:
-#         refined_solution = {
-#             "main_code": chosen_code,
-#             "helper_functions": helper_functions,
-#             "reasoning_trace": reasoning,
-#             "step_by_step_transformation": transformation_steps or ["Refined based on failure analysis"],
-#         }
+    # 1) Generate reflection reasoning that focuses on what went wrong
+    reasoning_trace = generate_reflection_reasoning_trace(llm, sol, training_results, training_examples)
+    sol['reasoning_trace'] = reasoning_trace
 
-#         return refined_solution
-#     else:
-#         # Return the original solution unchanged
-#         return current_solution
+    # 2) Extract transformation steps from the reflection reasoning
+    transformation_solutions_list = generate_refined_transformation_steps(llm, reasoning_trace, sol, training_examples, num_refined_solutions)
 
+    # 3) Generate candidate code implementations
+    python_codes_list = generate_code_from_reasoning(llm, code_llm, reasoning_trace, transformation_solutions_list, training_examples)
+
+    # Attach visual cue data onto each transformation dict (best-effort)
+    if enable_visual_cue:
+        # TODO: Think about a way to add the visual cues here
+        pass
+
+    # Return the list of candidate codes, plus reasoning and steps.
+    return python_codes_list, reasoning_trace, transformation_solutions_list
 
 def extract_reasoning_from_reflection(response_content: str) -> str:
     """Extract reasoning section from ARC-style reflection response."""
@@ -1249,6 +1435,253 @@ def extract_key_insight_from_reasoning(reasoning: str) -> str:
     return "Pattern recognition issue identified"
 
 
-def format_grid_for_prompt(grid: List[List[int]]) -> str:
+def format_grid_for_prompt(grid: List[List[int]], indent: int = 0) -> str:
     """Format grid for display in prompts."""
-    return "\\n".join(" ".join(map(str, row)) for row in grid)
+    indentation = " " * indent
+    return "\n".join(indentation + " ".join(map(str, row)) for row in grid)
+
+def result_comparison_text(training_results1: List[ExampleResult],
+                           training_results2: List[ExampleResult]) -> str:
+    """Generate a comparison text of training results between two solutions."""
+
+    training_results_comparison = []
+    for i, (tr1, tr2) in enumerate(zip(training_results1, training_results2)):
+        size_match_a = tr1.get('matching_size', False)
+        overlap_a = tr1.get('overlap_percentage', 0.0)
+        size_match_b = tr2.get('matching_size', False)
+        overlap_b = tr2.get('overlap_percentage', 0.0)
+        training_results_comparison.extend([
+            f"Example {i+1}:",
+            f"  Input:\n{format_grid_for_prompt(tr1.get('input', []), indent=4)}",
+            f"  Expected Output:\n{format_grid_for_prompt(tr1.get('expected_output', []), indent=4)}",
+            f"  Solution A - size match: {size_match_a}, overlap: {overlap_a:.1f}%",
+            f"  Solution A - predicted Output:\n{format_grid_for_prompt(tr1.get('predicted_output', []), indent=4)}",
+            f"  Solution A - difference:\n{format_difference_map(tr1.get('predicted_output', []), tr1.get('expected_output', []), indent=4)}",
+            f"  Solution B - size match: {size_match_b}, overlap: {overlap_b:.1f}%",
+            f"  Solution B - predicted Output:\n{format_grid_for_prompt(tr2.get('predicted_output', []), indent=4)}",
+            f"  Solution B - difference:\n{format_difference_map(tr2.get('predicted_output', []), tr2.get('expected_output', []), indent=4)}",
+            ""
+        ])
+    training_results_text = "\n".join(training_results_comparison).strip()
+    return training_results_text
+
+
+def generate_fused_reasoning_trace(llm,
+                                   sola: Dict,
+                                   solb: Dict,
+                                   training_results1: List[ExampleResult],
+                                   training_results2: List[ExampleResult],
+                                   training_examples: List[Dict]) -> str:
+    """Generate a fused reasoning trace that reconciles two candidate solutions.
+
+    The prompt includes both solutions' reasoning, transformation steps, code (if available),
+    and the training results. The LLM is asked to produce a single, coherent reasoning
+    trace that explains how to combine their strengths and address their failure modes.
+    """
+    def build_fused_reasoning_trace_prompt():
+        reasoning_a = sola.get('reasoning_trace') or "(no reasoning)"
+        steps_text_a = build_steps_text_from_transformation_steps(sola.get('step_by_step_transformation') or [])
+        code_a = sola.get('main_code') or "(no code)"
+
+        reasoning_b = solb.get('reasoning_trace') or "(no reasoning)"
+        steps_text_b = build_steps_text_from_transformation_steps(solb.get('step_by_step_transformation') or [])
+        code_b = solb.get('main_code') or "(no code)"
+
+        training_results_text = result_comparison_text(training_results1, training_results2)
+
+        parts = [
+            "You are an expert ARC solver. Two candidate solutions were produced for the same task.",
+            "Your job is to reconcile them into a single solution that combines their strengths and remedies their weaknesses.",
+            "",
+            "----------",
+            "SOLUTION A",
+            "----------",
+            "",
+            "REASONING TRACE A:",
+            f"{reasoning_a}",
+            "",
+            "TRANSFORMATION STEPS A:",
+            f"{steps_text_a}",
+            "",
+            "CODE A:",
+            f"{code_a}",
+            "",
+            "----------",
+            "SOLUTION B",
+            "----------",
+            "",
+            "REASONING TRACE B:",
+            f"{reasoning_b}",
+            "",
+            "TRANSFORMATION STEPS B:",
+            f"{steps_text_b}",
+            "",
+            "CODE B:",
+            f"{code_b}",
+            "",
+            "---------------------------",
+            "TRAINING RESULTS COMPARISON",
+            "---------------------------",
+            "For each training example, show the performance of each solution in terms of size match and overlap percentage.",
+            "",
+            f"{training_results_text}",
+            "",
+            "---------------------",
+            "ANALYSIS INSTRUCTIONS",
+            "---------------------",
+            "Produce a single ```reasoning``` block that: "
+            "- Explains how the two solutions related to the final solution",
+            "- The strengths and weaknesses of each solution, and how they complement each other",
+            "- Proposes a fused general rule that combines the two"
+        ]
+        return "\n".join(parts)
+    
+    prompt = build_fused_reasoning_trace_prompt(training_examples)
+    # If visual cues are provided and the llm driver supports image messages,
+    # send a structured message containing the images (base64 data URLs).
+    response = llm.invoke(prompt)
+
+    # Extract reasoning from response
+    reasoning = extract_reasoning_content(response)
+    return reasoning if reasoning else "Unable to generate reasoning trace"
+
+
+def generate_fused_transformation_steps(llm,
+                                        reasoning_trace: str,
+                                        sola: Dict,
+                                        solb: Dict,
+                                        training_results_a: List[ExampleResult],
+                                        training_results_b: List[ExampleResult],
+                                        training_examples: List[Dict],
+                                        num_solutions: int) -> List[Dict]:
+    """Generate candidate fused transformation step sequences from a fused reasoning prompt.
+
+    Returns a list of solution dicts in the same shape as `generate_transformation_steps`.
+    """
+    def build_fused_transformation_steps_prompt() -> str:
+        steps_text_a = build_steps_text_from_transformation_steps(sola.get('step_by_step_transformation') or [])
+        code_a = sola.get('main_code') or "(no code)"
+
+        steps_text_b = build_steps_text_from_transformation_steps(solb.get('step_by_step_transformation') or [])
+        code_b = solb.get('main_code') or "(no code)"
+
+        training_results_text = result_comparison_text(training_results_a, training_results_b)
+
+        parts = [
+            "You are an expert ARC solver. Based on the reasoning that represents fusion of two solutions below, produce multiple candidate fused transformation rules.",
+            "Each candidate should be a clear ordered list of transformation steps that can be implemented programmatically.",
+            "",
+            "",
+            "----------",
+            "SOLUTION A",
+            "----------",
+            "",
+            "TRANSFORMATION STEPS A:",
+            f"{steps_text_a}",
+            "",
+            "CODE A:",
+            f"{code_a}",
+            "",
+            "----------",
+            "SOLUTION B",
+            "----------",
+            "",
+            "TRANSFORMATION STEPS B:",
+            f"{steps_text_b}",
+            "",
+            "CODE B:",
+            f"{code_b}",
+            "",
+            "---------------------",
+            "RESULTS COMPARISON",
+            "---------------------",
+            "",
+            f"{training_results_text}",
+            "",
+            "---------------------",
+            "FUSED REASONING TRACE",
+            "---------------------",
+            "",
+            f"{reasoning_trace}",
+            "",
+            "------------",
+            "INSTRUCTIONS",
+            "------------",
+            f"Produce {num_solutions} different candidate solutions based on the above fused reasoning which attempts to combine the strengths of both solutions.",
+            "Try to pick different aspects from each solution to create diverse candidates while still addressing the failures of individual solutions.",
+            "Each solution should be concise and concrete so it can be executed programmatically.",
+            "",
+            "RESPONSE FORMAT (JSON):",
+            f"Return a JSON array in a json block containing {num_solutions} solution objects. Each object should have two keys:",
+            f"- \"solution_number\": an integer (1..{num_solutions})",
+            "- \"transformation_steps\": a JSON array of strings, each string being a single transformation step (in order)",
+            "",
+            "Example response structure:",
+            "```json",
+            "[",
+            "  {",
+            "    \"solution_number\": 1,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  {",
+            "    \"solution_number\": 2,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  ...",
+            "]",
+            "```",
+            f"Do NOT output any additional text outside the ```json``` block. Generate the {num_solutions} solutions now."
+        ]
+
+        for i, ex in enumerate(training_examples, 1):
+            parts.append(f"Example {i} Input:\n{format_grid_for_prompt(ex.get('input', []))}")
+            parts.append(f"Example {i} Output:\n{format_grid_for_prompt(ex.get('output', []))}")
+            parts.append("")
+
+        parts.extend([
+            "",
+            "INSTRUCTIONS:",
+            f"Produce {num_solutions} candidate fused solutions. Return them as a single JSON array inside a ```json``` fenced block. Each object should have keys: 'solution_number' (int) and 'transformation_steps' (array of strings).",
+            "Do NOT include extra commentary. Generate the JSON array now."
+        ])
+
+        return "\n".join(parts)
+
+    prompt = build_fused_transformation_steps_prompt()
+    response = llm.invoke(prompt, temperature=0.7)
+    response_text = response.content if hasattr(response, 'content') else str(response)
+    solutions = parse_transformation_steps(response_text)
+    return solutions
+
+
+def fuse_solutions_with_reasoning(llm,
+                                  code_llm,
+                                  sola: CodeSolution,
+                                  solb: CodeSolution,
+                                  training_examples: List[Dict],
+                                  num_fused_solutions: int,
+                                  enable_visual_cue: bool = False) -> Tuple[List[str], str, List[Dict]]:
+    """Attempt to fuse two CodeSolution candidates into a stronger combined solution.
+
+    Returns a tuple: (python_codes_list, fused_reasoning_trace, fused_transformation_solutions_list)
+    """
+    # Build visual cues if requested
+    if enable_visual_cue:
+        # TODO: Implement visual cue generation for fused solutions if needed
+        pass
+
+    # Merge training_results from both solutions (concatenate, allowing duplicates)
+    tra = sola.get('training_results') or []
+    trb = solb.get('training_results') or []
+
+    # 1) Generate fused reasoning trace
+    fused_reasoning = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples, enable_visual_cue)
+
+    # 2) Generate fused transformation steps
+    fused_transformation_solutions = generate_fused_transformation_steps(llm, sola, solb, tra, trb, training_examples, num_fused_solutions)
+
+    # 3) Generate candidate Python implementations from fused reasoning and steps
+    python_codes_list = generate_code_from_reasoning(llm, code_llm, fused_reasoning, fused_transformation_solutions, training_examples)
+
+
+    return python_codes_list, fused_reasoning, fused_transformation_solutions

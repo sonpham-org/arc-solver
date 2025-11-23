@@ -63,7 +63,7 @@ TASK_ID = None  # Specific task ID to test (for single mode)
 TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
-NUM_TASKS = 10  # Number of tasks for batch mode
+NUM_TASKS = 100  # Number of tasks for batch mode
 
 # Processing configuration
 MAX_ATTEMPTS = 3  # Maximum attempts per task
@@ -71,7 +71,24 @@ RANDOM_SEED = 42  # Random seed for reproducibility
 
 ENABLE_CODE_PREDICT = True  # Whether to enable code-predicted outputs during testing
 ENABLE_LLM_PREDICT = False # Whether to enable LLM-predicted outputs during testing
-ENABLE_VISUAL_CUE = True  # When True, generate and pass input/output images to the LLM
+ENABLE_VISUAL_CUE = False  # When True, generate and pass input/output images to the LLM
+
+NUM_INITIAL_SOLUTIONS = 10
+NUM_LOOPS = 3
+NUM_SEED_SOLUTIONS = 10
+NUM_REFINEMENTS = 5
+NUM_SOLUTIONS_PER_REFINEMENT = 3
+NUM_FUSIONS = 5
+NUM_SOLUTIONS_PER_FUSION = 3
+
+# Year selection for ARC dataset directory (change to 2025 if using 2025 data)
+YEAR = 2025
+
+# Default ARC JSON paths (will be exposed as argparse defaults)
+TRAINING_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_training_challenges.json"
+TRAINING_SOLUTIONS_JSON = f"data/arc-{YEAR}/arc-agi_training_solutions.json"
+EVALUATION_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_evaluation_challenges.json"
+EVALUATION_SOLUTIONS_JSON = f"data/arc-{YEAR}/arc-agi_evaluation_solutions.json"
 
 
 def load_arc_tasks(file_path: str) -> Dict[str, Dict]:
@@ -126,6 +143,12 @@ def save_params(output_dir: str, args: argparse.Namespace, model: str) -> None:
         "random_seed": args.random_seed,
         "timestamp": datetime.datetime.now().isoformat()
     }
+    # Include year and file paths when available
+    if hasattr(args, 'YEAR') and args.YEAR is not None:
+        params['year'] = args.YEAR
+    for key in ('TRAINING_TASKS_JSON', 'TRAINING_SOLUTIONS_JSON', 'EVALUATION_TASKS_JSON', 'EVALUATION_SOLUTIONS_JSON'):
+        if hasattr(args, key) and getattr(args, key):
+            params[key.lower()] = getattr(args, key)
     if args.mode == "single":
         if args.task_id:
             params["task_id"] = args.task_id
@@ -147,52 +170,6 @@ def save_task_ids(output_dir: str, training_tasks: Dict, evaluation_tasks: Dict)
     with open(os.path.join(output_dir, "evaluation_task_ids.txt"), 'w') as f:
         for task_id in sorted(evaluation_tasks.keys()):
             f.write(f"{task_id}\n")
-
-
-def get_prediction_from_solution(solution: Dict[str, Any], task_data: Dict[str, Any]) -> Optional[List[List[int]]]:
-    """Extract prediction from solution for a test case."""
-    # Handle different solution formats
-    # If solution is a WorkflowOutput, extract the code
-    if 'code' in solution:
-        code = solution['code']
-    elif 'generated_code' in solution:
-        code = solution['generated_code']
-    else:
-        return None
-    
-    if not code:
-        return None
-    
-    try:
-        # Import helper functions
-        from arc_langgraph_agent.tools import FUNCTION_MAP
-        
-        # Create execution environment with test input
-        exec_globals = {}
-        
-        # Add built-in helper functions to execution environment
-        for name, func in FUNCTION_MAP.items():
-            exec_globals[name] = func
-        
-        # If code is a list of lines, join them
-        if isinstance(code, list):
-            code = '\n'.join(code)
-            
-        exec(code, exec_globals)
-        
-        # Look for transform function
-        if 'transform' in exec_globals:
-            transform_func = exec_globals['transform']
-            test_input = task_data['test'][0]['input']
-            result = transform_func(test_input)
-            
-            # Ensure result is a valid grid format
-            if isinstance(result, list) and all(isinstance(row, list) for row in result):
-                return result
-    except Exception as e:
-        print(f"Warning: Could not execute solution code: {e}")
-    
-    return None
 
 
 def save_task_result(output_dir: str, task_id: str, result: Dict[str, Any]) -> None:
@@ -463,6 +440,17 @@ def parse_arguments():
                        help=f"Random seed for reproducibility (default: {RANDOM_SEED})")
     parser.add_argument("--workers", type=int, default=NUM_WORKERS,
                        help="Number of parallel workers for batch mode (default: 1 = sequential)")
+    # Year and file path overrides for ARC data
+    parser.add_argument("--year", type=int, default=YEAR, dest="YEAR",
+                       help=f"Year for ARC dataset directory (default: {YEAR})")
+    parser.add_argument("--training-tasks-json", type=str, default=TRAINING_TASKS_JSON, dest="TRAINING_TASKS_JSON",
+                       help=f"Path to training tasks JSON (default: {TRAINING_TASKS_JSON})")
+    parser.add_argument("--training-solutions-json", type=str, default=TRAINING_SOLUTIONS_JSON, dest="TRAINING_SOLUTIONS_JSON",
+                       help=f"Path to training solutions JSON (default: {TRAINING_SOLUTIONS_JSON})")
+    parser.add_argument("--evaluation-tasks-json", type=str, default=EVALUATION_TASKS_JSON, dest="EVALUATION_TASKS_JSON",
+                       help=f"Path to evaluation tasks JSON (default: {EVALUATION_TASKS_JSON})")
+    parser.add_argument("--evaluation-solutions-json", type=str, default=EVALUATION_SOLUTIONS_JSON, dest="EVALUATION_SOLUTIONS_JSON",
+                       help=f"Path to evaluation solutions JSON (default: {EVALUATION_SOLUTIONS_JSON})")
     
     return parser.parse_args()
 
@@ -479,13 +467,12 @@ def main():
     output_dir = create_output_directory()
     print(f"Output directory: {output_dir}")
     
-    print("Initializing run-specific toolbox with default helper functions...")
     # Load tasks and solutions
     try:
-        training_tasks = load_arc_tasks("data/arc-2024/arc-agi_training_challenges.json")
-        training_solutions = load_arc_solutions("data/arc-2024/arc-agi_training_solutions.json")
-        evaluation_tasks = load_arc_tasks("data/arc-2024/arc-agi_evaluation_challenges.json")
-        evaluation_solutions = load_arc_solutions("data/arc-2024/arc-agi_evaluation_solutions.json")
+        training_tasks = load_arc_tasks(args.TRAINING_TASKS_JSON)
+        training_solutions = load_arc_solutions(args.TRAINING_SOLUTIONS_JSON)
+        evaluation_tasks = load_arc_tasks(args.EVALUATION_TASKS_JSON)
+        evaluation_solutions = load_arc_solutions(args.EVALUATION_SOLUTIONS_JSON)
     except FileNotFoundError as e:
         print(f"Error: Could not load ARC data: {e}")
         return 1
@@ -496,21 +483,24 @@ def main():
     # Save task IDs
     save_task_ids(output_dir, training_tasks, evaluation_tasks)
 
-    print(f"Initialize the multi-solution LangGraph agent...")
-
     # Create a MultiSolution agent for this run
+    print(f"Initialize the multi-solution LangGraph agent...")
     agent = MultiSolutionARCLangGraphAgent(
         llm=llm,
-        code_llm=llm, 
-        enable_code_predict=ENABLE_CODE_PREDICT,
+        code_llm=llm,
+        num_initial_solutions=NUM_INITIAL_SOLUTIONS,
+        num_loops=NUM_LOOPS,
+        num_seed_solutions=NUM_SEED_SOLUTIONS,
+        num_refinements=NUM_REFINEMENTS,
+        num_solutions_per_refinement=NUM_SOLUTIONS_PER_REFINEMENT,
+        num_fusions=NUM_FUSIONS,
+        num_solutions_per_fusion=NUM_SOLUTIONS_PER_FUSION,
         enable_visual_cue=ENABLE_VISUAL_CUE,
+        enable_code_predict=ENABLE_CODE_PREDICT,
         enable_llm_predict=ENABLE_LLM_PREDICT)
 
-    # Initialize a thread-safe shared helpers store.
-    # If the agent defines `available_helpers`, snapshot it; otherwise start empty.
-    shared_helpers = dict(getattr(agent, 'available_helpers', {}))
-    shared_lock = threading.Lock()
-    
+    # Initialize a thread-safe shared lock for consecutive printing
+    shared_lock = threading.Lock()  
     all_results = []
     task_ids_processed = []
     
@@ -534,10 +524,6 @@ def main():
         
         print(f"Testing single task: {task_id}")
         
-        # Ensure the agent has a snapshot of available helpers for this run
-        if not hasattr(agent, 'available_helpers'):
-            agent.available_helpers = dict(shared_helpers)
-
         # Run LangGraph agent with max attempts (reuse shared agent)
         langgraph_result = agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
 
@@ -571,11 +557,6 @@ def main():
             task_data = training_tasks[task_id]
             task_solution = training_solutions.get(task_id)
 
-            # Snapshot the shared helpers under lock so each worker starts with
-            # a consistent copy of the available helper toolbox.
-            with shared_lock:
-                helpers_snapshot = dict(shared_helpers)
-
             # Create a per-task multi-solution agent and attach helpers snapshot
             local_agent = MultiSolutionARCLangGraphAgent(
                 llm=llm,
@@ -584,13 +565,12 @@ def main():
                 enable_code_predict=ENABLE_CODE_PREDICT,
                 enable_llm_predict=ENABLE_LLM_PREDICT
             )
-            # Attach the helpers snapshot so the workflow can use them
-            local_agent.available_helpers = helpers_snapshot
 
             start_time = time.time()
             try:
                 result = local_agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
             except Exception as e:
+                print(f"Error processing task {task_id}: {e}")
                 result = {
                     "task_id": task_id,
                     "error": str(e),
@@ -606,14 +586,6 @@ def main():
                 calculate_average_score(result)
             except Exception as e:
                 print(f"Warning: could not calculate scores for task {task_id}: {e}")
-
-            # Merge any new helpers produced by this run into the shared helpers dict.
-            new_helpers = result.get("new_helpers") or {}
-            if new_helpers:
-                with shared_lock:
-                    # Simple merge: newer helpers override older ones by key.
-                    for hname, hdef in new_helpers.items():
-                        shared_helpers[hname] = hdef
 
             return task_id, result
 
@@ -647,9 +619,6 @@ def main():
                 task_data = training_tasks[task_id]
                 task_solution = training_solutions.get(task_id)
 
-                # Ensure agent has current snapshot of helpers
-                agent.available_helpers = dict(shared_helpers)
-
                 # Run LangGraph agent with max attempts (reuse shared agent)
                 langgraph_result = agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
 
@@ -658,14 +627,6 @@ def main():
                     calculate_average_score(langgraph_result)
                 except Exception as e:
                     print(f"Warning: could not calculate scores for task {task_id}: {e}")
-                # Merge new helpers into the shared store
-                new_helpers = langgraph_result.get('new_helpers', {}) or {}
-                if new_helpers:
-                    with shared_lock:
-                        for hname, hdef in new_helpers.items():
-                            shared_helpers[hname] = hdef
-                    # Also update the main agent's available_helpers attribute
-                    agent.available_helpers = dict(shared_helpers)
 
                 all_results.append(langgraph_result)
                 task_ids_processed.append(task_id)

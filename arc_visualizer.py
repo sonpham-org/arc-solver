@@ -39,6 +39,9 @@ def find_runs(output_root: Path) -> List[Path]:
             task_count = len(data.get('tasks', {}))
         except Exception:
             task_count = 0
+        # Skip runs that contain no tasks so the dropdown doesn't show empty runs
+        if task_count == 0:
+            continue
         runs.append({'name': p.name, 'path': p, 'count': task_count})
 
     # Prefer descending order (newest runs first). Try to sort by name (timestamped folders),

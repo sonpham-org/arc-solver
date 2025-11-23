@@ -84,7 +84,7 @@ def create_arc_workflow(llm, code_llm) -> StateGraph:
     # decide_next returns the literal name of the next node; mapping
     # instructs the graph how to map those strings to nodes.
     def decide_next(state):
-        return "finalize" if finalize_pred(state) or out_of_loops(state) else "refine_code"
+        return "finalize" if finalize_pred(state) or out_of_loops(state) else "evolve_code"
 
     workflow.add_conditional_edges("decide", decide_next, {
         "finalize": "finalize", 
@@ -254,6 +254,7 @@ class MultiSolutionARCLangGraphAgent:
             "highest_training_solution_overlap_score": best_overlap,
             "highest_testing_solution_priority_score": best_testing_priority,
             "highest_testing_solution_overlap_score": best_testing_overlap,
+            "num_loops": final_state.get("current_loop", 0),
             "execution_time": execution_time,
         }
         return output

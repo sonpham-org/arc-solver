@@ -504,21 +504,56 @@ def generate_reflection_reasoning_trace(llm,
         prompt = "\n".join(prompt_parts)
         return prompt
 
-    try:
-        prompt = build_refinement_reasoning_prompt(current_solution, training_results, training_examples)
-        response = llm.invoke(prompt)
-        response_text = response.content if hasattr(response, 'content') else str(response)
-        # print_prompt_and_response(prompt, response)
+    prompt = build_refinement_reasoning_prompt(current_solution, training_results, training_examples)
+    response = llm.invoke(prompt)
+    if hasattr(response, 'content'):
+        resp_content = response.content
+    else:
+        resp_content = response
+    def _flatten_content(c):
+        # Return a string representation of various response content shapes
+        try:
+            if isinstance(c, str):
+                return c
+            if isinstance(c, dict):
+                # common forms: {'content': '...'} or {'choices': [...]}
+                if 'content' in c and isinstance(c['content'], (str, list)):
+                    return _flatten_content(c['content'])
+                if 'choices' in c and isinstance(c['choices'], list):
+                    return '\n'.join(_flatten_content(ch) for ch in c['choices'])
+                # fallback to string
+                return str(c)
+            if isinstance(c, (list, tuple)):
+                parts = []
+                for item in c:
+                    if isinstance(item, dict):
+                        # message-like item with 'content' or 'type' fields
+                        if 'content' in item:
+                            parts.append(_flatten_content(item['content']))
+                            continue
+                        # structured content items: {'type':'text','text':...} or {'type':'image',...}
+                        if item.get('type') == 'text' and 'text' in item:
+                            parts.append(str(item['text']))
+                            continue
+                        if item.get('type') == 'image' and item.get('image_url'):
+                            parts.append('[IMAGE]')
+                            continue
+                        # generic dict
+                        parts.append(str(item))
+                    else:
+                        parts.append(str(item))
+                return '\n'.join([p for p in parts if p])
+            # fallback
+            return str(c)
+        except Exception:
+            return str(c)
 
-        # Prefer structured reflection extraction first
-        reasoning = extract_reasoning_content(response_text)
-        if reasoning and reasoning != "No structured reasoning found in response":
-            return reasoning
+    response_text = _flatten_content(resp_content)
+    print_prompt_and_response(prompt, response_text)
 
-    except Exception as e:
-        print(f"Error generating reflection reasoning trace: {e}")
-        return f"Error in reflection reasoning generation: {str(e)}"
-
+    # Prefer structured reflection extraction first
+    reasoning = extract_reasoning_content(response_text)
+    return reasoning if reasoning else "Unable to generate reasoning trace"
 
 def format_grid_for_analysis(grid: List[List[int]]) -> str: 
     """Format grid for detailed analysis in reasoning prompts."""
@@ -781,7 +816,7 @@ def generate_refined_transformation_steps(llm, reasoning_trace: str, sol: Dict, 
         prompt = "\n".join(prompt_parts)
         return prompt
 
-    prompt = build_refined_transformation_steps_prompt(reasoning_trace, sol, training_examples)
+    prompt = build_refined_transformation_steps_prompt()
     response = llm.invoke(prompt, temperature=0.7)
     response_text = response.content if hasattr(response, 'content') else str(response)
 
@@ -1536,13 +1571,14 @@ def generate_fused_reasoning_trace(llm,
         ]
         return "\n".join(parts)
     
-    prompt = build_fused_reasoning_trace_prompt(training_examples)
+    prompt = build_fused_reasoning_trace_prompt()
     # If visual cues are provided and the llm driver supports image messages,
     # send a structured message containing the images (base64 data URLs).
     response = llm.invoke(prompt)
 
     # Extract reasoning from response
-    reasoning = extract_reasoning_content(response)
+    response_text = response.content if hasattr(response, 'content') else str(response)
+    reasoning = extract_reasoning_content(response_text)
     return reasoning if reasoning else "Unable to generate reasoning trace"
 
 
@@ -1675,10 +1711,10 @@ def fuse_solutions_with_reasoning(llm,
     trb = solb.get('training_results') or []
 
     # 1) Generate fused reasoning trace
-    fused_reasoning = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples, enable_visual_cue)
+    fused_reasoning = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples)
 
     # 2) Generate fused transformation steps
-    fused_transformation_solutions = generate_fused_transformation_steps(llm, sola, solb, tra, trb, training_examples, num_fused_solutions)
+    fused_transformation_solutions = generate_fused_transformation_steps(llm, fused_reasoning, sola, solb, tra, trb, training_examples, num_fused_solutions)
 
     # 3) Generate candidate Python implementations from fused reasoning and steps
     python_codes_list = generate_code_from_reasoning(llm, code_llm, fused_reasoning, fused_transformation_solutions, training_examples)

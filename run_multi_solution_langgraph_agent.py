@@ -52,18 +52,21 @@ from model_configs import MODEL_CONFIGS, find_model_key
 # ==========================================================================
 
 # Model selection: Choose from available models in model_configs.py
-MODEL = "gemini-2.5-flash-lite"
+# For fast local debugging prefer an Ollama-hosted local model (free/local).
+# Available local options in `model_configs.py` include: "llama3.1", "qwen2.5:32b".
+# Set default to `llama3.1` for quick local iteration/debugging.
+MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
 
 # Test mode configuration
-MODE = "batch"  # "single" or "batch"
+MODE = "single"  # "single" or "batch"
 NUM_WORKERS = 8  # Number of parallel workers for batch mode
 
 # Task selection for single mode
-TASK_ID = None  # Specific task ID to test (for single mode)
+TASK_ID = "0a938d79"  # Specific task ID to test (for single mode)
 TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
-NUM_TASKS = 100  # Number of tasks for batch mode
+NUM_TASKS = 10  # Number of tasks for batch mode
 
 # Processing configuration
 MAX_ATTEMPTS = 3  # Maximum attempts per task
@@ -82,7 +85,7 @@ NUM_FUSIONS = 5
 NUM_SOLUTIONS_PER_FUSION = 3
 
 # Year selection for ARC dataset directory (change to 2025 if using 2025 data)
-YEAR = 2025
+YEAR = 2024
 
 # Default ARC JSON paths (will be exposed as argparse defaults)
 TRAINING_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_training_challenges.json"
@@ -510,9 +513,11 @@ def main():
             if args.task_id in training_tasks:
                 task_id = args.task_id
                 task_data = training_tasks[task_id]
+                task_solution = training_solutions.get(task_id)
             elif args.task_id in evaluation_tasks:
                 task_id = args.task_id
                 task_data = evaluation_tasks[task_id]
+                task_solution = evaluation_solutions.get(task_id)
             else:
                 print(f"Error: Task ID '{args.task_id}' not found")
                 return 1

@@ -133,9 +133,9 @@ class MultiSolutionARCLangGraphAgent:
                  num_solutions_per_refinement: int = 3,
                  num_fusions: int = 5,
                  num_solutions_per_fusion: int = 3,
+                 enable_parallel_eval: bool = False,
                  enable_code_predict: bool = True,
                  enable_llm_predict: bool = False,
-                 enable_parallel_eval: bool = False,
                  enable_visual_cue: bool = False,
                  max_generations: int = 3):
         """

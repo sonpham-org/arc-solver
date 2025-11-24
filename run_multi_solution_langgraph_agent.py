@@ -58,7 +58,7 @@ from model_configs import MODEL_CONFIGS, find_model_key
 MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
 
 # Test mode configuration
-MODE = "single"  # "single" or "batch"
+MODE = "batch"  # "single" or "batch"
 NUM_WORKERS = 8  # Number of parallel workers for batch mode
 
 # Task selection for single mode
@@ -72,6 +72,7 @@ NUM_TASKS = 10  # Number of tasks for batch mode
 MAX_ATTEMPTS = 3  # Maximum attempts per task
 RANDOM_SEED = 42  # Random seed for reproducibility
 
+ENABLE_PARALLEL_EVAL = True  # Whether to enable parallel evaluation of examples
 ENABLE_CODE_PREDICT = True  # Whether to enable code-predicted outputs during testing
 ENABLE_LLM_PREDICT = False # Whether to enable LLM-predicted outputs during testing
 ENABLE_VISUAL_CUE = False  # When True, generate and pass input/output images to the LLM
@@ -498,6 +499,7 @@ def main():
         num_solutions_per_refinement=NUM_SOLUTIONS_PER_REFINEMENT,
         num_fusions=NUM_FUSIONS,
         num_solutions_per_fusion=NUM_SOLUTIONS_PER_FUSION,
+        enable_parallel_eval=ENABLE_PARALLEL_EVAL,
         enable_visual_cue=ENABLE_VISUAL_CUE,
         enable_code_predict=ENABLE_CODE_PREDICT,
         enable_llm_predict=ENABLE_LLM_PREDICT)

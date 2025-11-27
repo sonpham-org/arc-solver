@@ -41,10 +41,10 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
 # Import the MultiSolution LangGraph agent
-from arc_langgraph_multi_solution_agents.agent import MultiSolutionARCLangGraphAgent
+from agent.agent import MultiSolutionARCLangGraphAgent
 
 # Import model configurations and utilities
-from model_configs import MODEL_CONFIGS, find_model_key
+from model_configs import MODEL_CONFIGS, find_model_key, get_pricing_for, estimate_cost
 
 
 # ==========================================================================
@@ -62,11 +62,11 @@ MODE = "batch"  # "single" or "batch"
 NUM_WORKERS = 8  # Number of parallel workers for batch mode
 
 # Task selection for single mode
-TASK_ID = "0a938d79"  # Specific task ID to test (for single mode)
+TASK_ID = None  # Specific task ID to test (for single mode)
 TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
-NUM_TASKS = 10  # Number of tasks for batch mode
+NUM_TASKS = 120  # Number of tasks for batch mode
 
 # Processing configuration
 MAX_ATTEMPTS = 3  # Maximum attempts per task
@@ -78,21 +78,23 @@ ENABLE_LLM_PREDICT = False # Whether to enable LLM-predicted outputs during test
 ENABLE_VISUAL_CUE = False  # When True, generate and pass input/output images to the LLM
 
 NUM_INITIAL_SOLUTIONS = 10
-NUM_LOOPS = 3
+NUM_LOOPS = 6
 NUM_SEED_SOLUTIONS = 10
-NUM_REFINEMENTS = 5
-NUM_SOLUTIONS_PER_REFINEMENT = 3
-NUM_FUSIONS = 5
-NUM_SOLUTIONS_PER_FUSION = 3
+NUM_REFINEMENTS = 3
+NUM_SOLUTIONS_PER_REFINEMENT = 10
+NUM_FUSIONS = 3
+NUM_SOLUTIONS_PER_FUSION = 10
 
 # Year selection for ARC dataset directory (change to 2025 if using 2025 data)
-YEAR = 2024
+YEAR = 2025
 
 # Default ARC JSON paths (will be exposed as argparse defaults)
 TRAINING_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_training_challenges.json"
 TRAINING_SOLUTIONS_JSON = f"data/arc-{YEAR}/arc-agi_training_solutions.json"
 EVALUATION_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_evaluation_challenges.json"
 EVALUATION_SOLUTIONS_JSON = f"data/arc-{YEAR}/arc-agi_evaluation_solutions.json"
+TEST_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_test_challenges.json"
+TEST_SOLUTIONS_JSON = f"data/arc-{YEAR}/arc-agi_test_solutions.json"
 
 
 def load_arc_tasks(file_path: str) -> Dict[str, Dict]:
@@ -160,6 +162,10 @@ def save_params(output_dir: str, args: argparse.Namespace, model: str) -> None:
             params["task_index"] = args.task_index
     elif args.mode == "batch":
         params["num_tasks"] = args.num_tasks
+
+    # Record evaluate-only flag when present
+    if hasattr(args, 'evaluate_only') and args.evaluate_only:
+        params['evaluate_only'] = True
 
     with open(os.path.join(output_dir, "params.json"), 'w') as f:
         json.dump(params, f, indent=2)
@@ -407,7 +413,7 @@ def summarize_and_print_result(result: Dict[str, Any], task_id: Optional[str] = 
     print(f"    Training Priority Score: {(highest_priority_score or 0.0):.1f}%  Overlap Score: {(highest_overlap_score or 0.0):.1f}%")
     print(f"    Testing Priority Score: {(highest_testing_priority_score or 0.0):.1f}%  Testing Overlap Score: {(highest_testing_overlap_score or 0.0):.1f}%")
 
-def print_summary(agent: MultiSolutionARCLangGraphAgent, all_results: List[Dict[str, Any]], task_ids: List[str]) -> Dict[str, Any]:
+def print_summary(agent: MultiSolutionARCLangGraphAgent, all_results: List[Dict[str, Any]], task_ids: List[str], model_name: Optional[str] = None) -> Dict[str, Any]:
     """Save summary of all task results to summary.json."""
     total_tasks = len(all_results)
     workflow_completions = sum(1 for r in all_results if r.get('workflow_completed'))
@@ -422,7 +428,53 @@ def print_summary(agent: MultiSolutionARCLangGraphAgent, all_results: List[Dict[
     print(f"Number of tests fully successful: {num_tests_successful}")
     print(f"Test success rate: {num_tests_successful / total_tasks * 100:.1f}%")
     print(f"{'='*80}\n")
+    # Token usage & cost summary (if the agent exposes a TokenTrackingLLM)
+    try:
+        token_counts = None
+        if hasattr(agent, 'llm') and hasattr(agent.llm, 'get_token_counts'):
+            token_counts = agent.llm.get_token_counts()
+        elif hasattr(agent, 'get_token_counts'):
+            token_counts = agent.get_token_counts()
 
+        if token_counts:
+            in_t = int(token_counts.get('input_tokens', 0))
+            out_t = int(token_counts.get('output_tokens', 0))
+            tot_t = int(token_counts.get('total_tokens', in_t + out_t))
+
+            print(f"Token usage summary:")
+            print(f"  Input tokens : {in_t}")
+            print(f"  Output tokens: {out_t}")
+            print(f"  Total tokens : {tot_t}")
+
+            # Pricing & cost estimate (if model_name provided)
+            if model_name:
+                pricing = get_pricing_for(model_name)
+                try:
+                    total_cost = estimate_cost(model_name, input_tokens=in_t, output_tokens=out_t)
+                except Exception:
+                    total_cost = None
+
+                if pricing:
+                    in_rate = float(pricing.get('input_per_m', 0.0))
+                    out_rate = float(pricing.get('output_per_m', 0.0))
+                    in_cost = (in_t / 1_000_000.0) * in_rate
+                    out_cost = (out_t / 1_000_000.0) * out_rate
+                    print(f"Pricing (USD per 1M tokens): input={in_rate:.6f} output={out_rate:.6f}")
+                    print(f"  Estimated input cost : ${in_cost:.6f}")
+                    print(f"  Estimated output cost: ${out_cost:.6f}")
+                    if total_cost is not None:
+                        print(f"  Estimated total cost : ${total_cost:.6f}")
+                else:
+                    if total_cost is not None:
+                        print(f"  Estimated total cost : ${total_cost:.6f} (model pricing unknown)" )
+                    else:
+                        print("  Pricing information not available for model")
+            else:
+                print("  Model name not provided — cannot estimate cost.")
+
+    except Exception:
+        # Fail silently on token/cost reporting so summary still prints
+        pass
 
 
 def parse_arguments():
@@ -432,6 +484,8 @@ def parse_arguments():
                        help=f"Model to use (e.g., gpt-4o-mini, gemini-2.0-flash) (default: {MODEL})")
     parser.add_argument("--mode", type=str, choices=["single", "batch"], default=MODE,
                        help=f"Test mode: single task or batch (default: {MODE})")
+    parser.add_argument("--evaluate-only", action="store_true", dest="evaluate_only",
+                       help="When set, run ONLY on the evaluation dataset (applies to single or batch mode)")
     parser.add_argument("--task-id", type=str, default=TASK_ID,
                        help=f"Specific task ID to test (for single mode) (default: {TASK_ID})")
     parser.add_argument("--task-index", type=int, default=TASK_INDEX,
@@ -455,15 +509,18 @@ def parse_arguments():
                        help=f"Path to evaluation tasks JSON (default: {EVALUATION_TASKS_JSON})")
     parser.add_argument("--evaluation-solutions-json", type=str, default=EVALUATION_SOLUTIONS_JSON, dest="EVALUATION_SOLUTIONS_JSON",
                        help=f"Path to evaluation solutions JSON (default: {EVALUATION_SOLUTIONS_JSON})")
+    parser.add_argument("--use-print-lock", action="store_true", dest="use_print_lock",
+                       help="Enable a thread-printing lock to serialize prints (default: disabled)")
     
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
+    use_print_lock = getattr(args, 'use_print_lock', False)
     
     # Initialize LLM
-    llm = initialize_llm_from_config(args.model)
+    llm = TokenTrackingLLM(initialize_llm_from_config(args.model))
     if llm is None:
         return 1
     
@@ -480,6 +537,15 @@ def main():
     except FileNotFoundError as e:
         print(f"Error: Could not load ARC data: {e}")
         return 1
+
+    # Determine which dataset to use based on evaluate-only flag
+    if getattr(args, 'evaluate_only', False):
+        active_tasks = evaluation_tasks
+        active_solutions = evaluation_solutions
+        print("EVALUATE-ONLY mode: using evaluation dataset for all runs")
+    else:
+        active_tasks = training_tasks
+        active_solutions = training_solutions
     
     # Save parameters
     save_params(output_dir, args, args.model)
@@ -504,30 +570,39 @@ def main():
         enable_code_predict=ENABLE_CODE_PREDICT,
         enable_llm_predict=ENABLE_LLM_PREDICT)
 
-    # Initialize a thread-safe shared lock for consecutive printing
-    shared_lock = threading.Lock()  
     all_results = []
     task_ids_processed = []
     
     if args.mode == "single":
         # Single task test
         if args.task_id:
-            if args.task_id in training_tasks:
-                task_id = args.task_id
-                task_data = training_tasks[task_id]
-                task_solution = training_solutions.get(task_id)
-            elif args.task_id in evaluation_tasks:
-                task_id = args.task_id
-                task_data = evaluation_tasks[task_id]
-                task_solution = evaluation_solutions.get(task_id)
+            # When evaluate-only is set, only search evaluation tasks
+            if getattr(args, 'evaluate_only', False):
+                if args.task_id in evaluation_tasks:
+                    task_id = args.task_id
+                    task_data = evaluation_tasks[task_id]
+                    task_solution = evaluation_solutions.get(task_id)
+                else:
+                    print(f"Error: Task ID '{args.task_id}' not found in evaluation tasks (evaluate-only mode)")
+                    return 1
             else:
-                print(f"Error: Task ID '{args.task_id}' not found")
-                return 1
+                # Default behavior: prefer training tasks, fall back to evaluation tasks
+                if args.task_id in training_tasks:
+                    task_id = args.task_id
+                    task_data = training_tasks[task_id]
+                    task_solution = training_solutions.get(task_id)
+                elif args.task_id in evaluation_tasks:
+                    task_id = args.task_id
+                    task_data = evaluation_tasks[task_id]
+                    task_solution = evaluation_solutions.get(task_id)
+                else:
+                    print(f"Error: Task ID '{args.task_id}' not found")
+                    return 1
         elif args.task_index is not None:
-            task_id, task_data, task_solution = get_task_by_index(training_tasks, training_solutions, args.task_index)
+            task_id, task_data, task_solution = get_task_by_index(active_tasks, active_solutions, args.task_index)
         else:
-            # Random task
-            task_id, task_data, task_solution = get_task_by_index(training_tasks, training_solutions, None)
+            # Random task from the active dataset
+            task_id, task_data, task_solution = get_task_by_index(active_tasks, active_solutions, None)
         
         print(f"Testing single task: {task_id}")
         
@@ -554,38 +629,36 @@ def main():
         print(f"Running batch test with {args.num_tasks} tasks (workers={args.workers})")
 
         random.seed(args.random_seed)
-        selected_task_ids = random.sample(list(training_tasks.keys()),
-                                        min(args.num_tasks, len(training_tasks)))
+        selected_task_ids = random.sample(list(active_tasks.keys()),
+                        min(args.num_tasks, len(active_tasks)))
+
+        # Create optional print lock if requested (used only for parallel workers)
+        print_lock = threading.Lock() if use_print_lock else None
 
         # Helper to run a single task (creates a fresh agent to avoid shared-state issues)
-        print_lock = threading.Lock()
 
         def run_single_task(task_id: str):
-            task_data = training_tasks[task_id]
-            task_solution = training_solutions.get(task_id)
+            task_data = active_tasks[task_id]
+            task_solution = active_solutions.get(task_id)
 
             # Create a per-task multi-solution agent and attach helpers snapshot
             local_agent = MultiSolutionARCLangGraphAgent(
                 llm=llm,
                 code_llm=llm,
+                num_initial_solutions=NUM_INITIAL_SOLUTIONS,
+                num_loops=NUM_LOOPS,
+                num_seed_solutions=NUM_SEED_SOLUTIONS,
+                num_refinements=NUM_REFINEMENTS,
+                num_solutions_per_refinement=NUM_SOLUTIONS_PER_REFINEMENT,
+                num_fusions=NUM_FUSIONS,
+                num_solutions_per_fusion=NUM_SOLUTIONS_PER_FUSION,
+                enable_parallel_eval=ENABLE_PARALLEL_EVAL,
                 enable_visual_cue=ENABLE_VISUAL_CUE,
                 enable_code_predict=ENABLE_CODE_PREDICT,
-                enable_llm_predict=ENABLE_LLM_PREDICT
-            )
+                enable_llm_predict=ENABLE_LLM_PREDICT)
 
             start_time = time.time()
-            try:
-                result = local_agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
-            except Exception as e:
-                print(f"Error processing task {task_id}: {e}")
-                result = {
-                    "task_id": task_id,
-                    "error": str(e),
-                    "workflow_completed": False,
-                    "attempts": 0,
-                    "testing_success_rate": 0.0,
-                }
-
+            result = local_agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
             result.setdefault("execution_time", time.time() - start_time)
 
             # Compute training/testing priority & average scores for this result
@@ -611,9 +684,12 @@ def main():
                     # Save result
                     save_task_result(output_dir, tid, langgraph_result)
 
-                    # Print concise result summary (thread-safe)
-                    with print_lock:
-                        # Use helper to print full concise summary (with progress)
+                    # Print concise result summary
+                    # Use helper to print full concise summary (with progress)
+                    if print_lock:
+                        with print_lock:
+                            summarize_and_print_result(langgraph_result, task_id=tid, progress=f"({completed}/{len(selected_task_ids)})")
+                    else:
                         summarize_and_print_result(langgraph_result, task_id=tid, progress=f"({completed}/{len(selected_task_ids)})")
 
         else:
@@ -623,8 +699,8 @@ def main():
                 print(f"PROCESSING TASK {i}/{args.num_tasks}: {task_id}")
                 print(f"{'='*80}")
 
-                task_data = training_tasks[task_id]
-                task_solution = training_solutions.get(task_id)
+                task_data = active_tasks[task_id]
+                task_solution = active_solutions.get(task_id)
 
                 # Run LangGraph agent with max attempts (reuse shared agent)
                 langgraph_result = agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
@@ -644,9 +720,104 @@ def main():
                 # Display concise summary via helper
                 summarize_and_print_result(langgraph_result, task_id=task_id)
     
-    # Save summary
-    print_summary(agent, all_results, task_ids_processed)
+    # Save summary (include model name so we can estimate cost)
+    print_summary(agent, all_results, task_ids_processed, model_name=args.model)
     return 0
+
+
+class TokenTrackingLLM:
+    def __init__(self, llm):
+        self.llm = llm
+        # Initialize cumulative token counters
+        self.input_tokens = 0    # tokens sent as input/prompts
+        self.output_tokens = 0   # tokens in model completions/responses
+        self.total_tokens = 0    # cumulative total tokens (input + output when available)
+
+    def invoke(self, *args, **kwargs):
+        response = self.llm.invoke(*args, **kwargs)
+        # Count tokens directly from the prompt/messages passed and the response
+        # content. This uses a simple whitespace-based token approximation.
+
+        # Build prompt text from common call patterns: `prompt`, `messages`,
+        # or first positional string arg.
+        prompt_text = ""
+        try:
+            if 'prompt' in kwargs and kwargs.get('prompt') is not None:
+                prompt_obj = kwargs.get('prompt')
+                prompt_text = prompt_obj if isinstance(prompt_obj, str) else str(prompt_obj)
+            elif 'messages' in kwargs and kwargs.get('messages'):
+                msgs = kwargs.get('messages')
+                # messages expected as list[dict] with 'content'
+                if isinstance(msgs, (list, tuple)):
+                    parts = []
+                    for m in msgs:
+                        if isinstance(m, dict):
+                            parts.append(m.get('content', ''))
+                        else:
+                            parts.append(str(m))
+                    prompt_text = ' '.join(parts)
+            elif len(args) > 0 and isinstance(args[0], str):
+                prompt_text = args[0]
+        except Exception:
+            prompt_text = ''
+
+        def _count_tokens_whitespace(s):
+            if not s:
+                return 0
+            try:
+                return len(str(s).split())
+            except Exception:
+                return 0
+
+        prompt_i = _count_tokens_whitespace(prompt_text)
+
+        # Get response text/content
+        response_text = None
+        try:
+            response_text = getattr(response, 'content', None)
+        except Exception:
+            response_text = None
+        if response_text is None:
+            # try common dict shapes
+            if isinstance(response, dict):
+                response_text = response.get('content') or response.get('text') or str(response)
+            else:
+                response_text = str(response)
+
+        completion_i = _count_tokens_whitespace(response_text)
+        total_i = prompt_i + completion_i
+
+        # Update internal cumulative counters
+        self.input_tokens += int(prompt_i or 0)
+        self.output_tokens += int(completion_i or 0)
+        self.total_tokens += int(total_i or 0)
+
+        # Prepare per-call usage report
+        return response
+
+    # Accessors for cumulative token counts
+    def get_input_token_count(self) -> int:
+        """Return cumulative input (prompt) tokens seen so far."""
+        return int(self.input_tokens)
+
+    def get_output_token_count(self) -> int:
+        """Return cumulative output (completion) tokens seen so far."""
+        return int(self.output_tokens)
+
+    def get_total_token_count(self) -> int:
+        """Return cumulative total tokens seen so far."""
+        return int(self.total_tokens)
+
+    def get_token_counts(self) -> Dict[str, int]:
+        """Return all cumulative token counts as a dict with separate keys.
+
+        Keys: `input_tokens`, `output_tokens`, `total_tokens`.
+        """
+        return {
+            "input_tokens": self.get_input_token_count(),
+            "output_tokens": self.get_output_token_count(),
+            "total_tokens": self.get_total_token_count()
+        }
 
 
 def initialize_llm_from_config(model_name: str):
@@ -676,7 +847,7 @@ def initialize_llm_from_config(model_name: str):
             return ChatGoogleGenerativeAI(
                 model=model_key,
                 temperature=0.6,
-                max_output_tokens=50000
+                max_output_tokens=100000
             )
         
         elif provider == "anthropic":

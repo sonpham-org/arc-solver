@@ -1,0 +1,1668 @@
+"""
+Action helpers for the ARC LangGraph Agent workflow.
+
+This module contains helper functions, prompt builders, LLM-driven
+generation utilities, execution helpers, and refinement logic.
+"""
+
+import json
+import copy
+from typing import List, Dict, Optional, Any, TypedDict, Tuple, Union
+import traceback
+import ast
+import sys
+from io import StringIO
+from contextlib import redirect_stdout, redirect_stderr
+import traceback
+import re
+
+# Import schema and tools
+from .schema import AgentState, CodeSolution, ExampleResult
+from .tools import FUNCTION_MAP
+from .debug import print_prompt_and_response, print_python_code
+
+
+def generate_llm_predicted_output(llm,
+                                  transformation_steps: Dict[str, Any],
+                                  input_grid: List[List[int]]) -> Tuple[Optional[List[List[int]]], Optional[str]]:
+    """Use the LLM to apply the step-by-step transformation to a single input grid.
+
+    The LLM is instructed to return the transformed grid as a JSON array
+    (list of lists of integers). Returns (grid, None) on success, or
+    (None, error_message) on failure.
+    """
+    try:
+        steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(transformation_steps)) if transformation_steps else "(no steps provided)"
+
+        prompt_parts = [
+            "You are an expert that can execute step-by-step grid transformations by following instructions",
+            "Given the following input grid and transformation steps, you are tasked with applying the steps and return the resulting grid.",
+            
+            "Do NOT return any other text after that block.",
+            "",
+            "INPUT GRID:",
+            format_grid_for_prompt(input_grid),
+            "",
+            "TRANSFORMATION STEPS:",
+            steps_text,
+            "",
+            "Follow the transformation steps carefully, show your detailed step-by-step transformation"
+            "After finishing all the steps, show the 2D grid inside a fenced block labeled ```llm_predicted_output``` containing only the grid rows as lines of numbers (space-separated or contiguous digits)."
+        ]
+
+        prompt = "\n".join(prompt_parts)
+
+        response = llm.invoke(prompt)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+
+        # Prefer a fenced block labelled ```llm_predicted_output``` containing
+        # the grid as lines of numbers (space-separated or run-together digits).
+        import re, json
+        block_match = re.search(r'```llm_predicted_output\s*(.*?)\s*```', response_text, re.DOTALL | re.IGNORECASE)
+        if block_match:
+            block = block_match.group(1).strip()
+            lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+            parsed_grid = []
+            for line in lines:
+                # Split on whitespace; if no whitespace, split into single chars
+                if re.search(r'\s+', line):
+                    parts = re.split(r'\s+', line.strip())
+                else:
+                    parts = list(line.strip())
+                row = []
+                for p in parts:
+                    try:
+                        row.append(int(p))
+                    except Exception:
+                        # If conversion fails, try to strip non-digits then int
+                        digits = re.findall(r'-?\d+', p)
+                        if digits:
+                            row.append(int(digits[0]))
+                        else:
+                            # Give up and return error with raw block
+                            return None, f"Non-numeric token in llm_predicted_output block: '{p}'"
+                parsed_grid.append(row)
+            return parsed_grid, None
+
+        # Fallback: try to find a JSON array in the response
+        json_match = re.search(r'(\[\s*\[.*?\]\s*\])', response_text, re.DOTALL)
+        if json_match:
+            candidate = json_match.group(1)
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list) and all(isinstance(row, list) for row in parsed):
+                    norm = []
+                    for row in parsed:
+                        new_row = []
+                        for cell in row:
+                            try:
+                                new_row.append(int(cell))
+                            except Exception:
+                                new_row.append(cell)
+                        norm.append(new_row)
+                    return norm, None
+            except Exception:
+                pass
+
+        # Fallback: try to parse any Python-style list literal
+        try:
+            parsed2 = eval(response_text, {"__builtins__": {}}, {})
+            if isinstance(parsed2, list) and all(isinstance(r, list) for r in parsed2):
+                return parsed2, None
+        except Exception:
+            pass
+
+        # If response contains an explicit error line, return it as error
+        if isinstance(response_text, str) and ("error" in response_text.lower() or "cannot" in response_text.lower() or "failed" in response_text.lower()):
+            return None, response_text.strip()
+
+        return None, f"Could not parse LLM response as grid. Raw response: {response_text[:1000]}"
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        return None, f"Exception calling LLM for predicted output: {e}\n{tb}"
+
+
+def analyze_training_examples(training_examples: List[Dict]) -> str:
+    """Analyze training examples to understand the pattern."""
+    if not training_examples:
+        return "No training examples provided."
+    
+    analysis = []
+    analysis.append(f"Found {len(training_examples)} training examples.")
+    
+    # Analyze input/output dimensions
+    input_sizes = [(len(ex["input"]), len(ex["input"][0]) if ex["input"] else 0) 
+                   for ex in training_examples]
+    output_sizes = [(len(ex["output"]), len(ex["output"][0]) if ex["output"] else 0) 
+                    for ex in training_examples]
+    
+    analysis.append(f"Input sizes: {input_sizes}")
+    analysis.append(f"Output sizes: {output_sizes}")
+    
+    # Check if sizes are consistent
+    if len(set(input_sizes)) == 1:
+        analysis.append("All inputs have the same size.")
+    else:
+        analysis.append("Input sizes vary.")
+    
+    if len(set(output_sizes)) == 1:
+        analysis.append("All outputs have the same size.")
+    else:
+        analysis.append("Output sizes vary.")
+    
+    return "\n".join(analysis)
+
+
+def _grid_to_image_bytes(grid: List[List[int]], cell_size: int = 24, padding: int = 8) -> bytes:
+    """Render a grid (list of lists of ints) to a PNG bytes buffer.
+
+    Returns PNG bytes. If Pillow is not available, raises ImportError.
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        raise ImportError("Pillow is required to generate visual cues (pip install pillow)")
+
+    # Simple color map for values 0..9
+    DEFAULT_COLORS = {
+        0: (255, 255, 255),
+        1: (230, 25, 75),
+        2: (60, 180, 75),
+        3: (255, 225, 25),
+        4: (0, 130, 200),
+        5: (245, 130, 48),
+        6: (145, 30, 180),
+        7: (70, 240, 240),
+        8: (240, 50, 230),
+        9: (210, 245, 60),
+    }
+
+    h = len(grid)
+    w = len(grid[0]) if h > 0 else 0
+    img_w = w * cell_size + padding * 2
+    img_h = h * cell_size + padding * 2
+    img = Image.new('RGB', (img_w, img_h), (240, 240, 240))
+    draw = ImageDraw.Draw(img)
+
+    for r in range(h):
+        for c in range(w):
+            val = grid[r][c]
+            color = DEFAULT_COLORS.get(val, (200, 200, 200))
+            x0 = padding + c * cell_size
+            y0 = padding + r * cell_size
+            x1 = x0 + cell_size - 1
+            y1 = y0 + cell_size - 1
+            draw.rectangle([x0, y0, x1, y1], fill=color, outline=(100, 100, 100))
+
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+
+def generate_solutions_with_reasoning(llm, code_llm, training_examples: List[Dict], num_solutions: int, enable_visual_cue: bool = False) -> Tuple[List[str], str, List[Dict]]:
+    """Generate Python transformation code using reasoning-first approach.
+
+    When `enable_visual_cue` is True, this function will render training
+    input/output pairs to PNG images, encode them as base64 and include them
+    in the LLM invocation (if the LLM driver supports image messages).
+
+    Returns:
+        Tuple of (python_code_list, reasoning_trace, transformation_steps)
+    """
+
+    visual_cues = []
+    if enable_visual_cue:
+        # Build visual cues: for each training example, create a small image
+        # that shows the input and expected output stacked vertically.
+        import base64
+        for i, ex in enumerate(training_examples):
+            inp = ex.get('input') or []
+            out = ex.get('output') or []
+            inp_bytes = _grid_to_image_bytes(inp)
+            out_bytes = _grid_to_image_bytes(out)
+            b64_in = base64.b64encode(inp_bytes).decode('utf-8')
+            b64_out = base64.b64encode(out_bytes).decode('utf-8')
+            visual_cues.append({
+                'example_index': i,
+                'input_b64': b64_in,
+                'output_b64': b64_out,
+            })
+
+    # Step 1: Generate reasoning trace
+    reasoning_trace = generate_reasoning_trace(llm, training_examples) if not enable_visual_cue else generate_reasoning_trace(llm, training_examples, visual_cues=visual_cues)
+
+    # Step 2: Extract step-by-step transformation from reasoning
+    transoformation_solutions_list = generate_transformation_steps(llm, reasoning_trace, training_examples, num_solutions)
+
+    # Step 3: Generate Python code(s) based on reasoning and steps
+    # Note: `generate_code_from_reasoning` may return multiple candidate code strings.
+    python_codes_list = generate_code_from_reasoning(llm, code_llm, reasoning_trace, transoformation_solutions_list,
+                                                     training_examples)
+
+    # Attach visual cue data onto each transformation dict (best-effort)
+    if enable_visual_cue and visual_cues:
+        # Try to attach example-level cues to the first solution dict to be saved later
+        for sol in transoformation_solutions_list:
+            sol['_visual_cues'] = visual_cues
+
+    # Return the list of candidate codes, plus reasoning and steps.
+    return python_codes_list, reasoning_trace, transoformation_solutions_list
+
+def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Optional[List[Dict]] = None) -> str:
+    """Generate detailed reasoning trace analyzing ARC patterns."""
+
+    def build_initial_reasoning_prompt(training_examples: List[Dict]) -> str:
+        """Build prompt for generating detailed reasoning about ARC patterns."""
+        
+        prompt_parts = [
+            "You are an expert mathematician, logistician and pattern recognizier who is solving the"
+            "Abstract Reasoning Corpus (ARC) problems.",
+            "Your task is to deeply analyze the input-output examples and understand the underlying pattern.",
+            "Focus on identifying the core transformation rule that maps inputs to outputs.",
+
+            "YOUR GOAL:",
+            "Given the training pairs and test inputs, infer a general transformation rule that:",
+            "- Correctly maps every training input to its output.",
+            "- Is general and intuitive (no memorization or hard-coded values).",
+            "- Is logical, reproducible, and object-level.",
+
+            "GUIDELINES:",
+            "- The SAME rule must successfully transform all training pairs.",
+            "- Treat all grid values (numbers/characters) as categorical labels, not magnitudes. Do not use arithmetic operations.",
+            "- Avoid rules that depend on specific values or characters.",
+            "- Make rules in a general manner using object-level reasoning (movements, shapes, fills, mirrors, rotations, bounding boxes, duplicates, etc.).",
+            "- Take as many rules as you need to achieve your goals.",
+            "",
+            "TRAINING EXAMPLES:"
+        ]
+        
+        # Add training examples with detailed formatting
+        for i, example in enumerate(training_examples):
+            prompt_parts.append(f"\nExample {i+1}:")
+            prompt_parts.append(f"Input Grid ({len(example['input'])}x{len(example['input'][0]) if example['input'] else 0}):")
+            prompt_parts.append(format_grid_for_analysis(example['input']))
+            prompt_parts.append(f"Output Grid ({len(example['output'])}x{len(example['output'][0]) if example['output'] else 0}):")
+            prompt_parts.append(format_grid_for_analysis(example['output']))
+        
+        prompt_parts.extend([
+            "",
+            "ANALYSIS INSTRUCTIONS:",
+            "Provide a ```reasoning``` block that contains your detailed analysis.",
+        ])
+        
+        return "\n".join(prompt_parts)
+    
+
+    prompt = build_initial_reasoning_prompt(training_examples)
+    # If visual cues are provided and the llm driver supports image messages,
+    # send a structured message containing the images (base64 data URLs).
+    if visual_cues:
+        pass
+
+    response = llm.invoke(prompt)
+    response_text = response.content
+
+    # Extract reasoning from response
+    reasoning = extract_reasoning_content(response_text)
+    return reasoning if reasoning else "Unable to generate reasoning trace"
+    
+
+def build_steps_text_from_transformation_steps(transformation_steps: List[str]) -> str:
+    """Build a numbered steps text block from a list of transformation steps."""
+    if not transformation_steps:
+        return "(no transformation steps provided)"
+    return "\n".join(f"{i+1}. {s}" for i, s in enumerate(transformation_steps))
+
+
+def generate_reflection_reasoning_trace(llm,
+                                       current_solution: CodeSolution,
+                                       training_results: List[ExampleResult],
+                                       training_examples: List[Dict]) -> str:
+    """Generate a reflection-focused reasoning trace using the ARC-style reflection prompt.
+
+    This is intended for refinement: it asks the model to analyze failures, explain
+    what went wrong, and produce a reasoning trace focused on correcting the logic.
+    """
+    def build_refinement_reasoning_prompt(current_solution: CodeSolution,
+                                        training_results: List[ExampleResult],
+                                        training_examples: List[Dict]) -> str:
+        """Build reflection prompt based on ARC reflection prompt style for deep analysis."""
+        
+        # Format previous solution
+        previous_code = current_solution["main_code"]
+        transformation_steps = current_solution["step_by_step_transformation"]
+        reasoning_trace = current_solution["reasoning_trace"]
+
+        # Format transformation steps
+        steps_text = build_steps_text_from_transformation_steps(transformation_steps)
+        
+        # Build detailed failure analysis
+        failure_analysis = []
+        for test in training_results:
+            example_idx = test.get("example_index", 0)
+            if example_idx < len(training_examples):
+                example = training_examples[example_idx]
+                
+                analysis = f"Training Example {example_idx + 1} - FAILED\\n"
+                analysis += "--\\n"
+                analysis += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
+                analysis += f"Expected Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
+                
+                predicted = test.get("predicted_output")
+                if predicted:
+                    analysis += f"Your Predicted Output:\\n{format_grid_for_prompt(predicted)}\\n\\n"
+                    # Calculate sizes
+                    pred_h, pred_w = len(predicted), len(predicted[0]) if predicted else 0
+                    exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
+                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: {pred_h}x{pred_w}\n"
+                    # Add a visual difference map ('.' match, 'X' mismatch; non-overlap = X)
+                    try:
+                        diff_map = format_difference_map(predicted, example['output'])
+                        analysis += f"Difference:\n{diff_map}\n\n"
+                    except Exception:
+                        analysis += "Difference: (could not compute difference map)\n\n"
+                else:
+                    analysis += "Your Predicted Output: No output generated\\n\\n"
+                    exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
+                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: 0x0\\n"
+                    # When there's no predicted output, mark the entire expected area as mismatches
+                    try:
+                        diff_map = format_difference_map(None, example['output'])
+                        analysis += f"Difference:\n{diff_map}\n\n"
+                    except Exception:
+                        analysis += "Difference: (could not compute difference map)\n\n"
+                
+                analysis += f"Overlap: {test.get('overlap_percentage', 0):.1f}%\\n"
+                analysis += f"IOU (Intersection over Union): {test.get('iou_percentage', 0):.1f}%\\n"
+                
+                error_msg = test.get("error_message")
+                if error_msg:
+                    analysis += f"Error: {error_msg}\\n"
+                
+                failure_analysis.append(analysis)
+        
+        failures_block = "\\n".join(failure_analysis)
+        
+        # Build training examples block
+        examples_block = ""
+        for i, example in enumerate(training_examples, 1):
+            examples_block += f"Training Example {i}\\n--\\n"
+            examples_block += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
+            examples_block += f"Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
+        
+        prompt_parts = [
+            "You are an expert mathematician, logistician and pattern recognizier who is solving the"
+            "Abstract Reasoning Corpus (ARC) problems.",
+            "You previously attempted to solve this task but your solution was incorrect on some training examples."
+
+            "YOUR GOAL:",
+            "Analyze your previous attempt deeply, understand why it failed"
+            "- Was there an issue with the logic of the code that led to the failure?",
+            "- If the code succeeds but the output doesn't match up, what are the difference between the intended output and your predicted output?",
+            "- What is missing from your reasoning and solution that leads to these differences?",
+            "- How to modify your reasoning and code to correct for these errors and ensure it solves the task fully?",
+            "",
+            "YOUR PREVIOUS CODE:",
+            f"{previous_code}",
+            ""
+            "YOUR PREVIOUS REASONING:",
+            f"{reasoning_trace}",
+            "",
+            "YOUR PREVIOUS TRANSFORMATION RULES:",
+            f"{steps_text}",
+            "",
+            "DETAILED FAILURE ANALYSIS",
+            f"{failures_block}",
+            "",
+            "ANALYSIS INSTRUCTIONS:",
+            "Provide a ```reasoning``` block that contains your detailed analysis.",
+        ]
+
+        prompt = "\n".join(prompt_parts)
+        return prompt
+
+    prompt = build_refinement_reasoning_prompt(current_solution, training_results, training_examples)
+    response = llm.invoke(prompt)
+    if hasattr(response, 'content'):
+        resp_content = response.content
+    else:
+        resp_content = response
+
+    def _flatten_content(c):
+        # Return a string representation of various response content shapes
+        try:
+            if isinstance(c, str):
+                return c
+            if isinstance(c, dict):
+                # common forms: {'content': '...'} or {'choices': [...]}
+                if 'content' in c and isinstance(c['content'], (str, list)):
+                    return _flatten_content(c['content'])
+                if 'choices' in c and isinstance(c['choices'], list):
+                    return '\n'.join(_flatten_content(ch) for ch in c['choices'])
+                # fallback to string
+                return str(c)
+            if isinstance(c, (list, tuple)):
+                parts = []
+                for item in c:
+                    if isinstance(item, dict):
+                        # message-like item with 'content' or 'type' fields
+                        if 'content' in item:
+                            parts.append(_flatten_content(item['content']))
+                            continue
+                        # structured content items: {'type':'text','text':...} or {'type':'image',...}
+                        if item.get('type') == 'text' and 'text' in item:
+                            parts.append(str(item['text']))
+                            continue
+                        if item.get('type') == 'image' and item.get('image_url'):
+                            parts.append('[IMAGE]')
+                            continue
+                        # generic dict
+                        parts.append(str(item))
+                    else:
+                        parts.append(str(item))
+                return '\n'.join([p for p in parts if p])
+            # fallback
+            return str(c)
+        except Exception:
+            return str(c)
+
+    response_text = _flatten_content(resp_content)
+
+    # Prefer structured reflection extraction first
+    reasoning = extract_reasoning_content(response_text)
+    return reasoning if reasoning else "Unable to generate reasoning trace"
+
+def format_grid_for_analysis(grid: List[List[int]]) -> str: 
+    """Format grid for detailed analysis in reasoning prompts."""
+    if not grid:
+        return "(empty grid)"
+    
+    formatted_rows = []
+    for row in grid:
+        formatted_rows.append("".join(str(cell) for cell in row))
+    
+    return "\n".join(formatted_rows)
+
+
+def format_difference_map(predicted: Optional[List[List[int]]], expected: Optional[List[List[int]]], indent: int = 0) -> str:
+    """Return a visual difference map where '.' indicates a matching cell and 'X' a mismatch.
+
+    If the predicted and expected grids have different sizes, the non-overlapping
+    area is marked with 'X'. The returned string contains one line per row.
+    """
+    if not expected:
+        return "(no expected output)"
+
+    pred_h = len(predicted) if predicted else 0
+    pred_w = len(predicted[0]) if pred_h > 0 and predicted[0] else 0
+    exp_h = len(expected) if expected else 0
+    exp_w = len(expected[0]) if exp_h > 0 and expected[0] else 0
+
+    h = max(exp_h, pred_h)
+    w = max(exp_w, pred_w)
+
+    rows = []
+    for i in range(h):
+        cols = []
+        for j in range(w):
+            if i < pred_h and j < pred_w and i < exp_h and j < exp_w:
+                try:
+                    cols.append('.' if predicted[i][j] == expected[i][j] else 'X')
+                except Exception:
+                    cols.append('X')
+            else:
+                # Out-of-range or missing cell => mismatch
+                cols.append('X')
+        rows.append(''.join(cols))
+
+    # Apply indentation to each row
+    indentation = " " * indent
+    rows = [indentation + row for row in rows]
+
+    return "\n".join(rows)
+
+
+def extract_reasoning_content(response_text: str) -> str:
+    """Extract reasoning content from LLM response."""
+    import re
+    
+    # Look for reasoning block
+    reasoning_match = re.search(r'```reasoning\s*(.*?)\s*```', response_text, re.DOTALL | re.IGNORECASE)
+    if reasoning_match:
+        return reasoning_match.group(1).strip()
+    
+    # Fallback: look for structured content
+    patterns = [
+        r'PATTERN OBSERVATION:(.*?)(?=TRANSFORMATION HYPOTHESIS:|$)',
+        r'TRANSFORMATION HYPOTHESIS:(.*?)(?=VERIFICATION:|$)',
+        r'VERIFICATION:(.*?)(?=CORE INSIGHT:|$)',
+        r'CORE INSIGHT:(.*?)(?=$)'
+    ]
+    
+    reasoning_parts = []
+    for pattern in patterns:
+        match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
+        if match:
+            reasoning_parts.append(match.group(1).strip())
+    
+    if reasoning_parts:
+        return '\n\n'.join(reasoning_parts)
+    
+    # Ultimate fallback: return first substantial paragraph
+    lines = response_text.split('\n')
+    substantial_lines = [line.strip() for line in lines if len(line.strip()) > 20]
+    
+    return '\n'.join(substantial_lines[:10]) if substantial_lines else response_text[:500]
+
+
+def generate_transformation_steps(llm, reasoning_trace: str, training_examples: List[Dict], num_solutions: int) -> List[Dict]:
+    """Extract clear step-by-step transformation from reasoning trace.
+
+    Returns a list of solution objects: [{"solution_number": int, "transformation_steps": [str, ...]}, ...]
+    """
+
+    def build_transformation_steps_prompt() -> str:
+        """Build prompt for extracting clear transformation steps."""
+        # Build training examples block
+        examples_block = ""
+        for i, example in enumerate(training_examples, 1):
+            examples_block += f"Training Example {i}\\n--\\n"
+            examples_block += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
+            examples_block += f"Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
+        prompt_parts = [
+            "You are an expert mathematician, logistician and pattern recognizier who is solving the Abstract Reasoning Corpus (ARC) problems.",
+            "Based on the following reasoning analysis, extract clear step-by-step transformation instructions.",
+            "",
+            "TRAINING EXAMPLES",
+            f"{examples_block}",
+            "",
+            "REASONING ANALYSIS",
+            f"{reasoning_trace}",
+            "",
+            "INSTRUCTIONS",
+            f"Produce {num_solutions} different candidate solutions. Each solution should be a numbered sequence of clear, actionable transformation steps.",
+            "Be creative: try different, plausible interpretations of the reasoning so the set of solutions explores diverse approaches (use different object-level operations, orders, or heuristics).",
+            "Each solution should be concise and concrete so it can be executed programmatically.",
+            "",
+            "RESPONSE FORMAT (JSON):",
+            f"Return a JSON array in a json block containing {num_solutions} solution objects. Each object should have two keys:",
+            f"- \"solution_number\": an integer (1..{num_solutions})",
+            "- \"transformation_steps\": a JSON array of strings, each string being a single transformation step (in order)",
+            "",
+            "Example response structure:",
+            "```json",
+            "[",
+            "  {",
+            "    \"solution_number\": 1,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  {",
+            "    \"solution_number\": 2,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  ...",
+            "]",
+            "```",
+            f"Do NOT output any additional text outside the ```json``` block. Generate the {num_solutions} solutions now."
+        ]
+
+        prompt = "\n".join(prompt_parts)
+        return prompt
+        
+    prompt = build_transformation_steps_prompt()
+    
+    try:
+        response = llm.invoke(prompt, temperature=0.7)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+
+        solutions = parse_transformation_steps(response_text)
+        if solutions:
+            return solutions
+        return [{"solution_number": 1, "transformation_steps": ["Unable to extract transformation steps"]}]
+        
+    except Exception as e:
+        print(f"Error extracting transformation steps: {e}")
+        return [{"solution_number": 1, "transformation_steps": [f"Error in step extraction: {str(e)}"]}]
+
+
+def generate_refined_transformation_steps(llm, reasoning_trace: str, sol: Dict, training_examples: List[Dict], num_solutions: int) -> List[Dict]:
+    """Extract refined step-by-step transformation from reasoning trace and previous solution failures.
+
+    Returns a list of solution objects: [{"solution_number": int, "transformation_steps": [str, ...]}, ...]
+    """
+
+    def build_refined_transformation_steps_prompt() -> str:
+        """Build a prompt that includes reasoning, the previous solution (and its failures), and training examples.
+
+        The `sol` argument is expected to be a solution dict that may contain keys like
+        'solution_number', 'transformation_steps', 'training_results', 'main_code', and any
+        failure analysis produced during evaluation. The prompt encourages the LLM to
+        produce refined candidate transformation-step sequences that take the failures
+        into account.
+        """
+        # Get relevant information out
+        training_results = sol["training_results"]
+
+        # Build detailed failure analysis
+        failure_analysis = []
+        for test in training_results:
+            example_idx = test.get("example_index", 0)
+            if example_idx < len(training_examples):
+                example = training_examples[example_idx]
+                
+                analysis = f"Training Example {example_idx + 1} - FAILED\\n"
+                analysis += "--\\n"
+                analysis += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
+                analysis += f"Expected Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
+                
+                predicted = test.get("predicted_output")
+                if predicted:
+                    analysis += f"Your Predicted Output:\\n{format_grid_for_prompt(predicted)}\\n\\n"
+                    # Calculate sizes
+                    pred_h, pred_w = len(predicted), len(predicted[0]) if predicted else 0
+                    exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
+                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: {pred_h}x{pred_w}\n"
+                    # Add a visual difference map ('.' match, 'X' mismatch; non-overlap = X)
+                    try:
+                        diff_map = format_difference_map(predicted, example['output'])
+                        analysis += f"Difference:\n{diff_map}\n\n"
+                    except Exception:
+                        analysis += "Difference: (could not compute difference map)\n\n"
+                else:
+                    analysis += "Your Predicted Output: No output generated\\n\\n"
+                    exp_h, exp_w = len(example['output']), len(example['output'][0]) if example['output'] else 0
+                    analysis += f"Expected size: {exp_h}x{exp_w}, Predicted size: 0x0\\n"
+                    # When there's no predicted output, mark the entire expected area as mismatches
+                    try:
+                        diff_map = format_difference_map(None, example['output'])
+                        analysis += f"Difference:\n{diff_map}\n\n"
+                    except Exception:
+                        analysis += "Difference: (could not compute difference map)\n\n"
+                
+                analysis += f"Overlap: {test.get('overlap_percentage', 0):.1f}%\\n"
+                analysis += f"IOU (Intersection over Union): {test.get('iou_percentage', 0):.1f}%\\n"
+                
+                error_msg = test.get("error_message")
+                if error_msg:
+                    analysis += f"Error: {error_msg}\\n"
+                
+                failure_analysis.append(analysis)
+            
+        failures_block = "\\n".join(failure_analysis) 
+
+        prompt_parts = [
+            "You are an expert mathematician, logistician and pattern recognizier who is solving the Abstract Reasoning Corpus (ARC) problems.",
+            "You previously attempted a solution which failed to solve the task. You are asked to use the failure information to generate refined candidate transformation steps.",
+            "",
+            "PREVIOUS SOLUTION & FAILURES:",
+            f"{failures_block}",
+            ""
+            "REFLECTION ON PAST FAILURE:",
+            f"{reasoning_trace}",
+            "",
+            "INSTRUCTIONS:",
+            f"Produce {num_solutions} different candidate solutions. Each solution should be a numbered sequence of clear, actionable transformation steps.",
+            "Give special attention to correcting the failure modes shown in the previous solution summary.",
+            "Each solution should be concise and concrete so it can be executed programmatically.",
+            "",
+            "RESPONSE FORMAT (JSON):",
+            f"Return a JSON array in a json block containing {num_solutions} solution objects. Each object should have two keys:",
+            f"- \"solution_number\": an integer (1..{num_solutions})",
+            "- \"transformation_steps\": a JSON array of strings, each string being a single transformation step (in order)",
+            "",
+            "Example response structure:",
+            "```json",
+            "[",
+            "  {",
+            "    \"solution_number\": 1,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  {",
+            "    \"solution_number\": 2,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  ...",
+            "]",
+            "```",
+            f"Do NOT output any additional text outside the ```json``` block. Generate the {num_solutions} solutions now."
+        ]
+
+        prompt = "\n".join(prompt_parts)
+        return prompt
+
+    prompt = build_refined_transformation_steps_prompt()
+    response = llm.invoke(prompt, temperature=0.7)
+    response_text = response.content if hasattr(response, 'content') else str(response)
+
+    # print_prompt_and_response(prompt, response)
+
+    solutions = parse_transformation_steps(response_text)
+    return solutions
+
+def parse_transformation_steps(response_text: str) -> List[str]:
+    """Parse transformation steps from LLM response."""
+    import re, json
+
+    # Attempt 1: prefer a fenced ```json``` block containing the JSON array
+    try:
+        json_block_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL | re.IGNORECASE)
+        candidate = None
+        if json_block_match:
+            candidate = json_block_match.group(1).strip()
+        else:
+            # Fallback: try to find a bare JSON array anywhere in the text
+            start = response_text.find('[')
+            end = response_text.rfind(']')
+            if start != -1 and end != -1 and end > start:
+                candidate = response_text[start:end+1]
+
+        if candidate:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, list):
+                solutions = []
+                for item in parsed:
+                    if isinstance(item, dict):
+                        sol_num = item.get('solution_number') or item.get('solution') or item.get('solution_number')
+                        steps = item.get('transformation_steps') or item.get('steps') or []
+                        # Normalize steps to list of strings
+                        if isinstance(steps, str):
+                            step_lines = [ln.strip() for ln in steps.splitlines() if ln.strip()]
+                            steps = [re.sub(r'^\d+\.\s*', '', ln).strip() for ln in step_lines]
+                        elif isinstance(steps, list):
+                            steps = [str(s).strip() for s in steps if str(s).strip()]
+                        else:
+                            steps = []
+
+                        solutions.append({
+                            "solution_number": int(sol_num) if (sol_num is not None and str(sol_num).isdigit()) else sol_num,
+                            "transformation_steps": steps
+                        })
+
+                if solutions:
+                    return solutions
+    except Exception:
+        pass
+
+    # Fallback 1: look for fenced 'steps' block
+    steps_match = re.search(r'```steps\s*(.*?)\s*```', response_text, re.DOTALL | re.IGNORECASE)
+    if steps_match:
+        steps_content = steps_match.group(1).strip()
+    else:
+        steps_content = response_text
+
+    # Try to split into multiple "Solution X" sections
+    sol_splits = re.split(r'\bSolution\s*(\d+)\b', steps_content, flags=re.IGNORECASE)
+    # re.split returns [before, num1, block1, num2, block2, ...] if matches
+    if len(sol_splits) > 1:
+        solutions = []
+        # iterate pairs
+        it = iter(sol_splits)
+        pre = next(it)
+        for token in it:
+            try:
+                num = token
+                block = next(it)
+            except StopIteration:
+                break
+            # extract numbered steps within block
+            step_pattern = r'\d+\.\s*(.+)'
+            matches = re.findall(step_pattern, block)
+            steps = [m.strip() for m in matches]
+            solutions.append({"solution_number": int(num) if num.isdigit() else num, "transformation_steps": steps})
+
+        if solutions:
+            return solutions
+
+    # Fallback 2: extract any numbered steps across the text as a single solution
+    step_pattern = r'(\d+\.\s*(.+))'
+    matches = re.findall(step_pattern, steps_content, re.MULTILINE)
+    if matches:
+        steps = [match[1].strip() for match in matches]
+        return [{"solution_number": 1, "transformation_steps": steps}]
+
+    # Ultimate fallback: split long lines and return as single solution entries
+    lines = [line.strip() for line in steps_content.split('\n') if line.strip()]
+    steps = []
+    for line in lines:
+        cleaned_line = re.sub(r'^\d+\.\s*|^-\s*|^\*\s*', '', line).strip()
+        if len(cleaned_line) > 5:
+            steps.append(cleaned_line)
+
+    return [{"solution_number": 1, "transformation_steps": steps[:50]}]
+
+
+def generate_code_from_reasoning(llm, code_llm, reasoning_trace: str, transformation_steps: List[str],
+                                 training_examples: List[Dict]) -> str:
+    """Generate Python code based on reasoning trace and transformation steps.
+
+    This function will request code from the LLM, then immediately try to execute
+    the generated `transform(input_grid)` on the first training example (if present).
+    If execution fails and a `code_llm` is provided, it will invoke that
+    LLM up to 3 times to refine the main `transform` function and retry execution.
+    The function returns the (possibly refined) Python source for the transform
+    function (or a fallback template on failure).
+    """
+
+    def build_code_from_reasoning_prompt(reasoning_trace: str, transformation_steps: List[Dict],
+                                         training_examples: List[Dict]) -> str:
+        """Build prompt for generating Python code from reasoning and steps."""
+        # Only support the new structured format: a list of solution dicts
+        if not (transformation_steps and isinstance(transformation_steps, list) and isinstance(transformation_steps[0], dict)):
+            raise ValueError("transformation_steps must be a list of solution dicts of the form {'solution_number': int, 'transformation_steps': [str,...]}")
+
+        parts = []
+        for sol in transformation_steps:
+            sol_num = sol.get('solution_number', '?')
+            parts.append(f"Solution {sol_num}:")
+            for i, s in enumerate(sol.get('transformation_steps', []) or [], 1):
+                parts.append(f"{i}. {s}")
+            parts.append("")
+        steps_text = '\n'.join(parts).strip()
+
+        prompt_parts = [
+            "You are a Python expert implementing ARC transformations.",
+            "",
+            "Given the following reasoning analysis and step-by-step transformation, implement a Python function.",
+            "",
+            "------------------",
+            "REASONING ANALYSIS",
+            "------------------",
+            f"{reasoning_trace}",
+            "",
+            "-----------------",
+            "TRAINING EXAMPLES",
+            "------------------",
+            f"{len(training_examples)} input-output example pairs are provided for validation.",
+            "",
+            "-----------------------------",
+            "TRANSFORMATION STEP SOLUTIONS",
+            "-----------------------------",
+            f"{steps_text}",
+            "",
+            "---------------------------",
+            "IMPLEMENTATION REQUIREMENTS",
+            "---------------------------",
+            "For each solutions"
+            "1. Write a function called 'transform(input_grid)' that takes a 2D list of integers as input and returns a transformed 2D list of integers",
+            "2. Implement each transformation step clearly and precisely",
+            "3. Import any necessary standard libraries at the top for EACH solution",
+            "4. Include helper functions where necessary.",
+            "5. DO NOT ADD ANY EXPLANATIONS OR COMMENTS IN THE CODE",
+            "6. Address any error cases or edge conditions mentioned in the reasoning to ensure correctness and robustness",
+            "7. Return ONLY executable Python code",
+            "The <count> will help you keep track of what-th solution are you at. Make sure you have all solutions implemented."
+            "",
+            "Example structure:",
+            "<count>1</count>",
+            "<solution>",
+            "from typing import List",
+            "import ... # Import ANY necessary standard libraries to run the code here",
+            "def helper_function_1(...):",
+            "    # Add helper functions if neeeded",
+            "def helper_function_2(...):",
+            "    # Add helper functions if needed",
+            "def transform(input_grid):",
+            "    [implementations of transformation steps]",
+            "    return transformed_grid",
+            "</solution>",
+            "<count>2</count>",
+            "<solution>...</solution>",
+            "..."
+            "",
+            "Generate the Python code now:"
+        ]
+
+        prompt = "\n".join(prompt_parts)
+
+        return prompt
+
+    prompt = build_code_from_reasoning_prompt(reasoning_trace, transformation_steps, 
+                                              training_examples)
+
+    try:
+        response = llm.invoke(prompt, temperature=0.3)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        
+        # Extract candidate python solutions (may be multiple)
+        candidate_codes = extract_python_solutions(response_text)
+        # Ensure common imports are present in each candidate code block so
+        # the probe can execute without trivial missing-import errors.
+        candidate_codes = [ensure_imports_in_code(c) for c in candidate_codes]
+        print(len(candidate_codes), "candidate code solutions generated.")
+
+        # No test input available — return all candidates
+        return candidate_codes
+
+    except Exception as e:
+        print(f"Error generating code from reasoning: {e}")
+        return [generate_fallback_code_from_steps(transformation_steps)]
+
+
+def generate_fallback_code_from_steps(transformation_steps: List[Union[str, Dict]]) -> str:
+    """Generate fallback Python code template from transformation steps."""
+    
+    code_lines = ["def transform(input_grid):"]
+    code_lines.append("    # Copy input grid to work with")
+    code_lines.append("    result = copy_grid(input_grid)")
+    code_lines.append("    height, width = get_grid_dimensions(input_grid)")
+    code_lines.append("")
+    # If the new structured format (list of solution dicts) is provided,
+    # use the first solution's steps for the fallback template.
+    steps_list = []
+    try:
+        if transformation_steps and isinstance(transformation_steps[0], dict):
+            steps_list = transformation_steps[0].get('transformation_steps', []) or []
+        else:
+            steps_list = transformation_steps or []
+    except Exception:
+        steps_list = transformation_steps or []
+
+    for i, step in enumerate(steps_list, 1):
+        s_text = str(step)
+        code_lines.append(f"    # Step {i}: {s_text[:80]}{'...' if len(s_text) > 80 else ''}")
+        code_lines.append(f"    # TODO: Implement step {i}")
+        code_lines.append("")
+    
+    code_lines.append("    return result")
+    
+    return "\n".join(code_lines)
+
+
+def ensure_imports_in_code(code: str) -> str:
+    """Ensure common imports exist at top of a generated Python code string.
+
+    This scans the provided `code` for usage of common modules and typing
+    names and prepends import lines that are missing. The function performs
+    a conservative, best-effort check and only adds imports for a small set
+    of common utilities (typing, json, re, copy, itertools, collections,
+    math, numpy).
+
+    The function attempts to combine typing imports into a single
+    `from typing import ...` line.
+    """
+    import re as _re
+
+    if not code or not isinstance(code, str):
+        return code
+
+    # Find already-present import lines to avoid duplicates
+    existing_imports = set()
+    for m in _re.finditer(r'^\s*(?:from|import)\s+([^\n]+)', code, _re.MULTILINE):
+        existing_imports.add(m.group(0).strip())
+
+    # Map usage tokens -> import statements (conservative set)
+    typing_tokens = {tok for tok in ("List", "Dict", "Any", "Tuple", "Optional", "Set") if _re.search(r'\b%s\b' % tok, code)}
+
+    imports_needed = []
+    if typing_tokens:
+        typing_line = f"from typing import {', '.join(sorted(typing_tokens))}"
+        if not any(l.startswith('from typing') for l in existing_imports):
+            imports_needed.append(typing_line)
+
+    token_map = [
+        (r'\bjson\b', 'import json'),
+        (r'\bre\b', 'import re'),
+        (r'\bcopy\b', 'import copy'),
+        (r'\bitertools\b', 'import itertools'),
+        (r'\bdefaultdict\b|\bCounter\b', 'from collections import defaultdict, Counter'),
+        (r'\bcollections\b', 'import collections'),
+        (r'\bmath\b', 'import math'),
+        (r'\bnp\.', 'import numpy as np'),
+        (r'\bnumpy\b', 'import numpy as np'),
+        (r'\bdataclass\b', 'from dataclasses import dataclass'),
+    ]
+
+    for pattern, imp in token_map:
+        if _re.search(pattern, code) and not any(imp in s for s in existing_imports):
+            imports_needed.append(imp)
+
+    # If there are no imports to add, return original code
+    if not imports_needed:
+        return code
+
+    # Prepend imports to the code, keeping a blank line separation
+    header = "\n".join(imports_needed) + "\n\n"
+    return header + code
+
+
+def extract_python_solutions(response_text: str) -> List[str]:
+    """Extract Python solution code blocks from LLM response and return a list of code strings.
+
+    The LLM response is expected to contain multiple solutions in the following structure:
+
+    <count>1</count>
+    <solution>...</solution>
+    <count>2</count>
+    <solution>...</solution>
+    ...
+
+    This function returns a list of the extracted solution bodies (strings). If a
+    `<solution>` block contains fenced python code, it will extract the inner
+    python; otherwise the raw block text is returned (trimmed).
+    """
+    import re
+
+    solutions: List[str] = []
+
+    # 1) Prefer explicit <solution>...</solution> blocks
+    sol_blocks = re.findall(r'<solution>(.*?)</solution>', response_text, re.DOTALL | re.IGNORECASE)
+    if sol_blocks:
+        for blk in sol_blocks:
+            blk = blk.strip()
+            # Use the raw content inside the <solution>...</solution> tags without further parsing.
+            # This keeps the original block exactly as the LLM returned it.
+            solutions.append(blk)
+
+        return [s for s in solutions if s]
+
+
+def execute_transformation_code(main_code: str,
+                                input_grid: List[List[int]]) -> Tuple[Optional[List[List[int]]], Optional[str]]:
+    """Execute the transformation code on an input grid.
+
+    Returns:
+        (result_grid, error_message)
+
+    - `result_grid` is the transformed grid when execution succeeds, otherwise `None`.
+    - `error_message` is `None` on success, otherwise contains the exception traceback or
+      a short error description useful for refinement.
+    """
+    try:
+        # Create execution namespace
+        namespace = {"__builtins__": __builtins__}
+
+        # Normalize code strings that contain escaped newlines (e.g. "\\n") so
+        # they become properly formatted Python source before printing/execution.
+        if isinstance(main_code, str):
+            try:
+                # If the string appears to contain literal backslash-n sequences
+                # but no real newlines, attempt to un-escape it.
+                if "\\n" in main_code and "\n" not in main_code:
+                    stripped = main_code.strip()
+                    if (stripped.startswith(('"', "'")) and stripped.endswith(('"', "'"))):
+                        try:
+                            main_code = ast.literal_eval(main_code)
+                        except Exception:
+                            main_code = main_code.encode('utf-8').decode('unicode_escape')
+                    else:
+                        main_code = main_code.encode('utf-8').decode('unicode_escape')
+                else:
+                    # Replace any remaining escaped newlines/tabs with real ones
+                    main_code = main_code.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\\t', '\t')
+
+                # Trim excessive leading/trailing blank lines
+                main_code = main_code.strip('\n') + '\n'
+            except Exception:
+                # Best-effort fallback
+                main_code = main_code.replace('\\n', '\n').replace('\\t', '\t')
+
+        # Execute the main code
+        exec(main_code, namespace)
+
+        # Call the transform function
+        if "transform" in namespace:
+            try:
+                result = namespace["transform"](input_grid)
+                return result, None
+            except Exception as inner_e:
+                tb = traceback.format_exc()
+                print(f"Error while running transform(): {inner_e}\n{tb}")
+                return None, str(inner_e) + "\n" + tb
+        else:
+            err = "transform function not found in executed code"
+            print(err)
+            return None, err
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"Error executing transformation code: {e}\n{tb}")
+        return None, str(e) + "\n" + tb
+
+
+def calculate_grid_results(predicted: List[List[int]], expected: List[List[int]]) -> Tuple[bool, float]:
+    """Compare two 2D grids and return (size_match, value_match_percent).
+
+    - size_match: True iff the predicted grid has the same dimensions as the
+      expected grid (dimensions only; values are not considered).
+    - value_match_percent: Percentage (0.0-100.0) of cells that match between
+      the predicted and expected grids. The percentage is calculated relative
+      to the expected grid's total cells. If the predicted grid is smaller or
+      larger, non-overlapping cells count as mismatches.
+
+    Args:
+        predicted: 2D list representing the predicted output grid.
+        expected: 2D list representing the expected output grid.
+
+    Returns:
+        (size_match, value_match_percent)
+    """
+    # Compute dimensions
+    pred_h = len(predicted) if predicted is not None else 0
+    pred_w = len(predicted[0]) if pred_h > 0 and predicted[0] else 0
+    exp_h = len(expected) if expected is not None else 0
+    exp_w = len(expected[0]) if exp_h > 0 and expected[0] else 0
+
+    # First return value: size match (dimensions only)
+    size_match = (pred_h == exp_h and pred_w == exp_w)
+
+    # Calculate value match percentage relative to expected grid area
+    total_cells = exp_h * exp_w
+    if total_cells == 0:
+        return (size_match, 0.0)
+
+    matching_cells = 0
+    for i in range(exp_h):
+        for j in range(exp_w):
+            if i < pred_h and j < pred_w:
+                try:
+                    if predicted[i][j] == expected[i][j]:
+                        matching_cells += 1
+                except Exception:
+                    # Treat any comparison error as mismatch
+                    pass
+            else:
+                # Out-of-range predicted cell counts as mismatch
+                pass
+
+    value_match_percent = (matching_cells / total_cells) * 100.0
+
+    return (size_match, value_match_percent)
+
+
+def evaluate_example(llm,
+                     main_code: str,
+                     transformation_steps: List[str],
+                     input_grid: List[List[int]],
+                     expected_output: List[List[int]],
+                     enable_code_predict: bool = True,
+                     enable_llm_predict: bool = True) -> Dict[str, Any]:
+    """Evaluate a single training/test example.
+
+    Runs the provided `main_code` on `input_grid`, computes grid comparison
+    metrics against `expected_output`, and asks the LLM to apply the
+    `transformation_steps` to the `input_grid` for a comparison baseline.
+
+    Returns a result dict compatible with `nodes.test_code_node` usage.
+    """
+    # Execute the code only if enabled
+    exec_predicted_output = None
+    exec_error = None
+    matching_size = False
+    overlap_percentage = 0.0
+    error_message = None
+    code_success = False
+
+    if enable_code_predict:
+        try:
+            exec_predicted_output, exec_error = execute_transformation_code(main_code, input_grid)
+        except Exception as e:
+            exec_predicted_output = None
+            exec_error = str(e)
+
+        # Compute code metrics (if execution produced an output)
+        if exec_predicted_output is not None and exec_error is None:
+            matching_size, overlap_percentage = calculate_grid_results(exec_predicted_output, expected_output)
+        else:
+            matching_size, overlap_percentage = False, 0.0
+        error_message = exec_error or None
+        code_success = bool(matching_size) and (overlap_percentage == 100.0)
+
+    else:
+        # Not executing code — leave defaults (no prediction)
+        exec_predicted_output = None
+        exec_error = None
+        matching_size = False
+        overlap_percentage = 0.0
+        error_message = None
+        code_success = False
+
+    # Ask the LLM to apply the step-by-step transformation to the input only if enabled
+    llm_predicted_output = None
+    llm_error = None
+    llm_matching_size = False
+    llm_overlap_percentage = 0.0
+    llm_error_message = None
+    llm_success = False
+
+    if enable_llm_predict:
+        try:
+            # transformation_steps is expected to be a dict with key 'transformation_steps' in our flow
+            steps_for_llm = transformation_steps["transformation_steps"] if isinstance(transformation_steps, dict) and "transformation_steps" in transformation_steps else transformation_steps
+            llm_predicted_output, llm_error = generate_llm_predicted_output(llm, steps_for_llm, input_grid)
+        except Exception as e:
+            llm_predicted_output = None
+            llm_error = str(e)
+
+        # Compute LLM-specific metrics (if LLM produced an output)
+        if llm_predicted_output is not None and llm_error is None:
+            llm_matching_size, llm_overlap_percentage = calculate_grid_results(llm_predicted_output, expected_output)
+        else:
+            llm_matching_size, llm_overlap_percentage = False, 0.0
+        llm_error_message = llm_error or None
+        llm_success = bool(llm_matching_size) and (llm_overlap_percentage == 100.0)
+    else:
+        llm_predicted_output = None
+        llm_error = None
+        llm_matching_size = False
+        llm_overlap_percentage = 0.0
+        llm_error_message = None
+        llm_success = False
+
+    result = {
+        "input": input_grid,
+        "expected_output": expected_output,
+        "predicted_output": exec_predicted_output,
+        "matching_size": matching_size,
+        "overlap_percentage": overlap_percentage,
+        "error_message": error_message,
+        "code_success": code_success,
+        "llm_predicted_output": llm_predicted_output,
+        "llm_matching_size": llm_matching_size,
+        "llm_overlap_percentage": llm_overlap_percentage,
+        "llm_error_message": llm_error_message,
+        "llm_success": llm_success,
+    }
+
+    return result
+
+
+def analyze_failures(failed_tests: List[ExampleResult], training_examples: List[Dict]) -> Dict[str, Any]:
+    """Analyze the pattern of failures to understand what went wrong."""
+    analysis = {
+        "num_failures": len(failed_tests),
+        "error_types": [],
+        "size_mismatches": [],
+        "color_issues": []
+    }
+    
+    for test in failed_tests:
+        if test["error_message"]:
+            analysis["error_types"].append(test["error_message"])
+        
+        if test["predicted_output"] and test["expected_output"]:
+            pred_shape = (len(test["predicted_output"]), len(test["predicted_output"][0]) if test["predicted_output"] else 0)
+            exp_shape = (len(test["expected_output"]), len(test["expected_output"][0]) if test["expected_output"] else 0)
+            
+            if pred_shape != exp_shape:
+                analysis["size_mismatches"].append({
+                    "predicted": pred_shape,
+                    "expected": exp_shape
+                })
+    
+    return analysis
+
+
+def refine_solutions_with_reasoning(llm,
+                                    code_llm,
+                                    current_solution: CodeSolution,
+                                    training_examples: List[Dict],
+                                    num_refined_solutions: int,
+                                    enable_visual_cue: bool = False) -> Tuple[List[str], str, List[Dict]]:
+    """Refine a CodeSolution using LLM reflection, transformation extraction, and code regeneration.
+
+    Steps:
+    1. Identify failed/partial training examples from `current_solution['training_results']`.
+    2. Ask the LLM to reflect on differences between expected vs predicted and produce a
+       corrected `reasoning_trace` (via `generate_reflection_reasoning_trace`).
+    3. Extract concrete `transformation_steps` from the reasoning.
+    4. Generate candidate Python implementations from the reasoning + steps.
+    5. Pick a candidate, evaluate on training examples, and return an updated CodeSolution
+       with updated `main_code`, `reasoning_trace`, `step_by_step_transformation`, and metrics.
+
+    Returns an updated CodeSolution dict (may be same as input if refinement fails).
+    """
+    # Defensive copy of solution to avoid mutating the caller's object
+    sol = copy.deepcopy(current_solution)
+
+    # Create visual cuesif needed
+    visual_cues = []
+    if enable_visual_cue:
+        # Build visual cues: for each training example, create a small image
+        # that shows the input and expected output stacked vertically.
+        import base64
+        for i, ex in enumerate(training_examples):
+            inp = ex.get('input') or []
+            out = ex.get('output') or []
+            inp_bytes = _grid_to_image_bytes(inp)
+            out_bytes = _grid_to_image_bytes(out)
+            b64_in = base64.b64encode(inp_bytes).decode('utf-8')
+            b64_out = base64.b64encode(out_bytes).decode('utf-8')
+            visual_cues.append({
+                'example_index': i,
+                'input_b64': b64_in,
+                'output_b64': b64_out,
+            })
+
+    training_results: List[ExampleResult] = sol.get('training_results', []) or []
+
+    # 1) Generate reflection reasoning that focuses on what went wrong
+    reasoning_trace = generate_reflection_reasoning_trace(llm, sol, training_results, training_examples)
+    sol['reasoning_trace'] = reasoning_trace
+
+    # 2) Extract transformation steps from the reflection reasoning
+    transformation_solutions_list = generate_refined_transformation_steps(llm, reasoning_trace, sol, training_examples, num_refined_solutions)
+
+    # 3) Generate candidate code implementations
+    python_codes_list = generate_code_from_reasoning(llm, code_llm, reasoning_trace, transformation_solutions_list, training_examples)
+
+    # Attach visual cue data onto each transformation dict (best-effort)
+    if enable_visual_cue:
+        # TODO: Think about a way to add the visual cues here
+        pass
+
+    # Return the list of candidate codes, plus reasoning and steps.
+    return python_codes_list, reasoning_trace, transformation_solutions_list
+
+def extract_reasoning_from_reflection(response_content: str) -> str:
+    """Extract reasoning section from ARC-style reflection response."""
+    import re
+    
+    # Look for reasoning block
+    reasoning_match = re.search(r'```reasoning\s*(.*?)\s*```', response_content, re.DOTALL | re.IGNORECASE)
+    if reasoning_match:
+        return reasoning_match.group(1).strip()
+    
+    # Fallback: look for analysis patterns
+    patterns = [
+        r'PATTERN MISINTERPRETATION:(.*?)(?=\d\.|\n\n|$)',
+        r'LOGIC ERRORS:(.*?)(?=\d\.|\n\n|$)',
+        r'EDGE CASES:(.*?)(?=\d\.|\n\n|$)',
+        r'CORE INSIGHT:(.*?)(?=\d\.|\n\n|$)'
+    ]
+    
+    reasoning_parts = []
+    for pattern in patterns:
+        match = re.search(pattern, response_content, re.DOTALL | re.IGNORECASE)
+        if match:
+            reasoning_parts.append(match.group(1).strip())
+    
+    if reasoning_parts:
+        return '; '.join(reasoning_parts)
+    
+    # Ultimate fallback
+    return "No structured reasoning found in response"
+
+
+def extract_key_insight_from_reasoning(reasoning: str) -> str:
+    """Extract the key insight from reasoning text."""
+    # Look for core insight patterns
+    import re
+    
+    patterns = [
+        r'(?:CORE INSIGHT|key insight|main insight|crucial insight)[:\s]+(.*?)(?:\n|$)',
+        r'(?:The pattern is|Pattern:|Main pattern)[:\s]+(.*?)(?:\n|$)',
+        r'(?:I need to|Should|Must)[:\s]+(.*?)(?:\n|$)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, reasoning, re.IGNORECASE)
+        if match:
+            insight = match.group(1).strip()
+            # Clean up and limit length
+            insight = re.sub(r'\s+', ' ', insight)
+            return insight[:200] + '...' if len(insight) > 200 else insight
+    
+    # Fallback: take first meaningful sentence
+    sentences = re.split(r'[.!?]+', reasoning)
+    for sentence in sentences:
+        if len(sentence.strip()) > 20:  # Skip very short sentences
+            cleaned = re.sub(r'\s+', ' ', sentence.strip())
+            return cleaned[:200] + '...' if len(cleaned) > 200 else cleaned
+    
+    return "Pattern recognition issue identified"
+
+
+def format_grid_for_prompt(grid: List[List[int]], indent: int = 0) -> str:
+    """Format grid for display in prompts."""
+    indentation = " " * indent
+    return "\n".join(indentation + " ".join(map(str, row)) for row in grid)
+
+def result_comparison_text(training_results1: List[ExampleResult],
+                           training_results2: List[ExampleResult]) -> str:
+    """Generate a comparison text of training results between two solutions."""
+
+    training_results_comparison = []
+    for i, (tr1, tr2) in enumerate(zip(training_results1, training_results2)):
+        size_match_a = tr1.get('matching_size', False)
+        overlap_a = tr1.get('overlap_percentage', 0.0)
+        size_match_b = tr2.get('matching_size', False)
+        overlap_b = tr2.get('overlap_percentage', 0.0)
+        training_results_comparison.extend([
+            f"Example {i+1}:",
+            f"  Input:\n{format_grid_for_prompt(tr1.get('input', []), indent=4)}",
+            f"  Expected Output:\n{format_grid_for_prompt(tr1.get('expected_output', []), indent=4)}",
+            f"  Solution A - size match: {size_match_a}, overlap: {overlap_a:.1f}%",
+            f"  Solution A - predicted Output:\n{format_grid_for_prompt(tr1.get('predicted_output', []), indent=4)}",
+            f"  Solution A - difference:\n{format_difference_map(tr1.get('predicted_output', []), tr1.get('expected_output', []), indent=4)}",
+            f"  Solution B - size match: {size_match_b}, overlap: {overlap_b:.1f}%",
+            f"  Solution B - predicted Output:\n{format_grid_for_prompt(tr2.get('predicted_output', []), indent=4)}",
+            f"  Solution B - difference:\n{format_difference_map(tr2.get('predicted_output', []), tr2.get('expected_output', []), indent=4)}",
+            ""
+        ])
+    training_results_text = "\n".join(training_results_comparison).strip()
+    return training_results_text
+
+
+def generate_fused_reasoning_trace(llm,
+                                   sola: Dict,
+                                   solb: Dict,
+                                   training_results1: List[ExampleResult],
+                                   training_results2: List[ExampleResult],
+                                   training_examples: List[Dict]) -> str:
+    """Generate a fused reasoning trace that reconciles two candidate solutions.
+
+    The prompt includes both solutions' reasoning, transformation steps, code (if available),
+    and the training results. The LLM is asked to produce a single, coherent reasoning
+    trace that explains how to combine their strengths and address their failure modes.
+    """
+    def build_fused_reasoning_trace_prompt():
+        reasoning_a = sola.get('reasoning_trace') or "(no reasoning)"
+        steps_text_a = build_steps_text_from_transformation_steps(sola.get('step_by_step_transformation') or [])
+        code_a = sola.get('main_code') or "(no code)"
+
+        reasoning_b = solb.get('reasoning_trace') or "(no reasoning)"
+        steps_text_b = build_steps_text_from_transformation_steps(solb.get('step_by_step_transformation') or [])
+        code_b = solb.get('main_code') or "(no code)"
+
+        training_results_text = result_comparison_text(training_results1, training_results2)
+
+        parts = [
+            "You are an expert ARC solver. Two candidate solutions were produced for the same task.",
+            "Your job is to reconcile them into a single solution that combines their strengths and remedies their weaknesses.",
+            "",
+            "----------",
+            "SOLUTION A",
+            "----------",
+            "",
+            "REASONING TRACE A:",
+            f"{reasoning_a}",
+            "",
+            "TRANSFORMATION STEPS A:",
+            f"{steps_text_a}",
+            "",
+            "CODE A:",
+            f"{code_a}",
+            "",
+            "----------",
+            "SOLUTION B",
+            "----------",
+            "",
+            "REASONING TRACE B:",
+            f"{reasoning_b}",
+            "",
+            "TRANSFORMATION STEPS B:",
+            f"{steps_text_b}",
+            "",
+            "CODE B:",
+            f"{code_b}",
+            "",
+            "---------------------------",
+            "TRAINING RESULTS COMPARISON",
+            "---------------------------",
+            "For each training example, show the performance of each solution in terms of size match and overlap percentage.",
+            "",
+            f"{training_results_text}",
+            "",
+            "---------------------",
+            "ANALYSIS INSTRUCTIONS",
+            "---------------------",
+            "Produce a single ```reasoning``` block that: "
+            "- Explains how the two solutions related to the final solution",
+            "- The strengths and weaknesses of each solution, and how they complement each other",
+            "- Proposes a fused general rule that combines the two"
+        ]
+        return "\n".join(parts)
+    
+    prompt = build_fused_reasoning_trace_prompt()
+    # If visual cues are provided and the llm driver supports image messages,
+    # send a structured message containing the images (base64 data URLs).
+    response = llm.invoke(prompt)
+
+    # Extract reasoning from response
+    response_text = response.content if hasattr(response, 'content') else str(response)
+    reasoning = extract_reasoning_content(response_text)
+    return reasoning if reasoning else "Unable to generate reasoning trace"
+
+
+def generate_fused_transformation_steps(llm,
+                                        reasoning_trace: str,
+                                        sola: Dict,
+                                        solb: Dict,
+                                        training_results_a: List[ExampleResult],
+                                        training_results_b: List[ExampleResult],
+                                        training_examples: List[Dict],
+                                        num_solutions: int) -> List[Dict]:
+    """Generate candidate fused transformation step sequences from a fused reasoning prompt.
+
+    Returns a list of solution dicts in the same shape as `generate_transformation_steps`.
+    """
+    def build_fused_transformation_steps_prompt() -> str:
+        steps_text_a = build_steps_text_from_transformation_steps(sola.get('step_by_step_transformation') or [])
+        code_a = sola.get('main_code') or "(no code)"
+
+        steps_text_b = build_steps_text_from_transformation_steps(solb.get('step_by_step_transformation') or [])
+        code_b = solb.get('main_code') or "(no code)"
+
+        training_results_text = result_comparison_text(training_results_a, training_results_b)
+
+        parts = [
+            "You are an expert ARC solver. Based on the reasoning that represents fusion of two solutions below, produce multiple candidate fused transformation rules.",
+            "Each candidate should be a clear ordered list of transformation steps that can be implemented programmatically.",
+            "",
+            "",
+            "----------",
+            "SOLUTION A",
+            "----------",
+            "",
+            "TRANSFORMATION STEPS A:",
+            f"{steps_text_a}",
+            "",
+            "CODE A:",
+            f"{code_a}",
+            "",
+            "----------",
+            "SOLUTION B",
+            "----------",
+            "",
+            "TRANSFORMATION STEPS B:",
+            f"{steps_text_b}",
+            "",
+            "CODE B:",
+            f"{code_b}",
+            "",
+            "---------------------",
+            "RESULTS COMPARISON",
+            "---------------------",
+            "",
+            f"{training_results_text}",
+            "",
+            "---------------------",
+            "FUSED REASONING TRACE",
+            "---------------------",
+            "",
+            f"{reasoning_trace}",
+            "",
+            "------------",
+            "INSTRUCTIONS",
+            "------------",
+            f"Produce {num_solutions} different candidate solutions based on the above fused reasoning which attempts to combine the strengths of both solutions.",
+            "Try to pick different aspects from each solution to create diverse candidates while still addressing the failures of individual solutions.",
+            "Each solution should be concise and concrete so it can be executed programmatically.",
+            "",
+            "RESPONSE FORMAT (JSON):",
+            f"Return a JSON array in a json block containing {num_solutions} solution objects. Each object should have two keys:",
+            f"- \"solution_number\": an integer (1..{num_solutions})",
+            "- \"transformation_steps\": a JSON array of strings, each string being a single transformation step (in order)",
+            "",
+            "Example response structure:",
+            "```json",
+            "[",
+            "  {",
+            "    \"solution_number\": 1,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  {",
+            "    \"solution_number\": 2,",
+            "    \"transformation_steps\": [\"Step 1 text\", \"Step 2 text\"]",
+            "  },",
+            "  ...",
+            "]",
+            "```",
+            f"Do NOT output any additional text outside the ```json``` block. Generate the {num_solutions} solutions now."
+        ]
+
+        for i, ex in enumerate(training_examples, 1):
+            parts.append(f"Example {i} Input:\n{format_grid_for_prompt(ex.get('input', []))}")
+            parts.append(f"Example {i} Output:\n{format_grid_for_prompt(ex.get('output', []))}")
+            parts.append("")
+
+        parts.extend([
+            "",
+            "INSTRUCTIONS:",
+            f"Produce {num_solutions} candidate fused solutions. Return them as a single JSON array inside a ```json``` fenced block. Each object should have keys: 'solution_number' (int) and 'transformation_steps' (array of strings).",
+            "Do NOT include extra commentary. Generate the JSON array now."
+        ])
+
+        return "\n".join(parts)
+
+    prompt = build_fused_transformation_steps_prompt()
+    response = llm.invoke(prompt, temperature=0.7)
+    response_text = response.content if hasattr(response, 'content') else str(response)
+    solutions = parse_transformation_steps(response_text)
+    return solutions
+
+
+def fuse_solutions_with_reasoning(llm,
+                                  code_llm,
+                                  sola: CodeSolution,
+                                  solb: CodeSolution,
+                                  training_examples: List[Dict],
+                                  num_fused_solutions: int,
+                                  enable_visual_cue: bool = False) -> Tuple[List[str], str, List[Dict]]:
+    """Attempt to fuse two CodeSolution candidates into a stronger combined solution.
+
+    Returns a tuple: (python_codes_list, fused_reasoning_trace, fused_transformation_solutions_list)
+    """
+    # Build visual cues if requested
+    if enable_visual_cue:
+        # TODO: Implement visual cue generation for fused solutions if needed
+        pass
+
+    # Merge training_results from both solutions (concatenate, allowing duplicates)
+    tra = sola.get('training_results') or []
+    trb = solb.get('training_results') or []
+
+    # 1) Generate fused reasoning trace
+    fused_reasoning = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples)
+
+    # 2) Generate fused transformation steps
+    fused_transformation_solutions = generate_fused_transformation_steps(llm, fused_reasoning, sola, solb, tra, trb, training_examples, num_fused_solutions)
+
+    # 3) Generate candidate Python implementations from fused reasoning and steps
+    python_codes_list = generate_code_from_reasoning(llm, code_llm, fused_reasoning, fused_transformation_solutions, training_examples)
+
+
+    return python_codes_list, fused_reasoning, fused_transformation_solutions

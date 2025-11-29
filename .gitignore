@@ -1,0 +1,13 @@
+*.env
+__pycache__/
+*.pyc
+db/responses.db
+output
+output_vis
+scripts
+
+# Docker and cloud deployment files
+Dockerfile
+Dockerfile.*
+cloud_scripts/
+*.dockerignore

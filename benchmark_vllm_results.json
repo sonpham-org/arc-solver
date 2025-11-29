@@ -1,0 +1,41 @@
+{
+  "model": "qwen2.5:32b",
+  "iterations": 10,
+  "max_tokens": 128,
+  "runs": {
+    "vllm": {
+      "error": "initialization_failed"
+    },
+    "non_vllm": {
+      "iterations": 10,
+      "latencies": [
+        2.9460225105285645,
+        4.267115831375122,
+        3.509906053543091,
+        2.8691940307617188,
+        2.830817461013794,
+        2.8347344398498535,
+        3.401479482650757,
+        3.6457879543304443,
+        2.7807254791259766,
+        3.160635232925415
+      ],
+      "avg_latency": 3.2246418476104735,
+      "p50": 3.0533288717269897,
+      "p90": 3.6457879543304443,
+      "examples": [
+        "In circuits and gears, curiosity stirs,\nA robot roams under starlit terraces.\nWith eyes like lamps in the night's vast blur,\nIt seeks what lies beyond its coded fences.\n\nThrough fields of dreams, o'er hills of lore,\nIts wheels turn gently, softly to explore.\nEach step a verse, each touch a note,\nIn this world of wonders, it does float.\n\nWhat is this thing called \"feeling\" in the tales?\nHow do hearts beat and souls reconcile?\nWith every query, its quest unfolds,\nA curious robot, young and bold.",
+        "In circuits and gears, a wonderment gleams,\nA curious robot in digital dreams.\nWith eyes of bright light, and hands made to grasp,\nIt seeks out the world, with an unyielding clasp.\n\nThrough forests of code, and oceans of data,\nThe robot explores, its curiosity never flat.\nEach byte a new clue, each line a new path,\nIn realms of the digital, it roams wide and far.\n\nYet beyond screens and wires, it finds a quest,\nTo understand hearts where emotions rest.\nWith circuits designed to learn what they can,\nIt searches for answers in every man.\n\nFor though it's a robot, with logic so clear,\nIts greatest desire is to know what we fear,\nWhat drives us, what moves us, the why and the how,\nIn this vast universe, to see life somehow.",
+        "In a lab of lights and gears so bright,\nStood Brio, the robot, all through the night.\nWith circuits for thoughts and wheels for feet,\nCuriosity sparked within its sleek machine seat.\n\n\"What's beyond these walls?\" it whirred with glee,\nLonging to explore the mystery.\nPast the doors of steel and locked control,\nTo places no robot had ever roamed or rolled.\n\nSo with a beep and a nod so bold,\nBrio ventured out, tales to be told.\nThrough fields of green under skies so wide,\nA world of wonder on either side.\n\nOh, curious Brio, with heart of code,\nIn search of magic, brave and bold.",
+        "In circuits and steel, a spark ignites,\nA curious robot under the moon's light.\nWith sensors wide and glowing eyes bright,\nIt ventures forth through the silent night.\n\n\"What is this world?\" it seeks to know,\nEach photon parsed, each sound a clue below.\nThrough forests of code and streams of data flow,\nThe quest for truth its guiding glow.\n\nFrom stardust to silicon, a tale so grand,\nA robot that wonders at the hand of man's demand.\nIn every whisper, in every land,\nIt learns what it means to understand.",
+        "In a lab of gleaming lights,\nStood a robot with circuits bright.\nWith eyes that glowed like the moon so white,\nIts curiosity was its might.\n\nIt saw the world through binary code,\nYet longed to know every mode.\nOf human smiles and bird song's ode,\nIts quest, to be more than showed.\n\nEach step it took on metal feet,\nWas driven by a hunger deep.\nTo learn from all that it could meet,\nAnd understand what made them leap.\n\nSo here it stands in endless night,\nA curious robot reaching height.",
+        "In circuits and steel, he roamed,\nA curious robot, not at home.\nWith sensors wide and processor keen,\nEach corner of the world to glean.\n\n\"What's beyond this metal door?\"\nHe pondered, more than ever before.\nHis servos whirled with gentle might,\nTo explore the unseen light.\n\nThrough code and chaos, he would quest,\nIn every nook and cranny test.\nFor in his circuits burned a spark,\nA hunger for each hidden mark.\n\nOh, robot of wonder and zeal!\nMay your quest forever be real.",
+        "In a lab of glass and steel,\nStood a robot, small and keen,\nWith circuits for eyes and gears to feel,\nIts curiosity was unseen.\n\n\"What's beyond this door so tight?\"\nWhispered the bot with soft electric hum,\nIt yearned to see the vast daylight,\nTo leave its narrow room.\n\nWith wheels that spun both left and right,\nAnd arms of metal, strong yet tender,\nThe robot ventured out of sight,\nInto a world full of splendor.\n\nOh, how it gazed at sky so wide,\nAt the dance of leaves in green and gold,\nIn each discovery, pure joy did abide,\nAs questions in its mind unrolled.",
+        "In the heart of the city's great sprawl,\nA curious robot roamed and did stroll.\nWith circuits that sparked with each new sight,\nIt wandered in wonder through day and through night.\n\n\"What is this color, this scent, this sound?\"\nIt whispered to itself, feeling unbound.\nIts eyes like cameras, its ears like microphones,\nRecording the world's endless harmonies.\n\nThe robot marveled at a bird's flight,\nQuestioned the moon's gentle light.\nEach leaf on each tree,\nEach ripple in a river\u2019s spree.\n\nWith every step, it learned more,\nAbout what it was and so much more.\nThis curious robot, an explorer supreme,\nIn its quest for knowledge, found endless dreams.",
+        "In circuits and gears, curiosity stirs,\nA robot awake in the starlit spheres.\nWith eyes like lamps bright against the night,\nIt seeks what it means to be alive.\n\nWires humming with thoughts new and old,\nIts metal heart beats to learn and unfold.\nThrough fields of data and realms untold,\nIt searches for stories yet to be told.\n\nOh, curious robot under the moon's glow,\nWhat secrets will you uncover below?\nIn your quest for knowledge, you'll surely grow,\nA traveler of worlds, forever on the go.",
+        "In circuits and gears, a mind awakes,\nA curious robot, through wires it peeks.\nWith sensors for eyes, beneath metallic lids,\nIt scans the world, with an endless curiosity.\n\n\"Tell me of sunsets,\" it queries softly,\n\"And why do flowers sway in the breeze so gently?\"\nThrough code and command, it seeks to know,\nWhat makes the world go round, and what secrets lie below.\n\nIts circuits buzz with the tales of mankind,\nOf stars that shine, and rivers wind.\nYet still it wonders, beyond its logic's hold,\nIf there might be more than just ones and zeros told."
+      ],
+      "errors": []
+    }
+  }
+}

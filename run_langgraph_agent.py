@@ -2,7 +2,7 @@
 """
 LangGraph multi-solution agent runner for ARC tasks.
 This script mirrors `run_langgraph_agent.py` but uses the
-`MultiSolutionARCLangGraphAgent` to collect multiple solutions per task.
+`ARCLangGraphAgent` to collect multiple solutions per task.
 """
 # Load environment variables first, before any other imports
 from dotenv import load_dotenv
@@ -41,7 +41,7 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
 # Import the MultiSolution LangGraph agent
-from agent.agent import MultiSolutionARCLangGraphAgent
+from agent.agent import ARCLangGraphAgent
 
 # Import model configurations and utilities
 from model_configs import MODEL_CONFIGS, find_model_key, get_pricing_for, estimate_cost
@@ -53,9 +53,10 @@ from model_configs import MODEL_CONFIGS, find_model_key, get_pricing_for, estima
 
 # Model selection: Choose from available models in model_configs.py
 # For fast local debugging prefer an Ollama-hosted local model (free/local).
-# Available local options in `model_configs.py` include: "llama3.1", "qwen2.5:32b".
-# Set default to `llama3.1` for quick local iteration/debugging.
-MODEL = "qwen2.5:32b"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+# Reasoning model is used for reasoning & reflection
+# Coding model is used for code generation & execution
+REASONING_MODEL = "qwen2.5:32b"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+CODING_MODEL = "qwen2.5:32b"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
 USE_VLLM = False
 
 # Test mode configuration
@@ -136,7 +137,7 @@ def get_task_by_index(
 def create_output_directory() -> str:
     """Create a timestamped output directory."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
-    output_dir = os.path.join("output", timestamp)
+    output_dir = os.path.join("output/output_agent", timestamp)
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
@@ -414,7 +415,7 @@ def summarize_and_print_result(result: Dict[str, Any], task_id: Optional[str] = 
     print(f"    Training Priority Score: {(highest_priority_score or 0.0):.1f}%  Overlap Score: {(highest_overlap_score or 0.0):.1f}%")
     print(f"    Testing Priority Score: {(highest_testing_priority_score or 0.0):.1f}%  Testing Overlap Score: {(highest_testing_overlap_score or 0.0):.1f}%")
 
-def print_summary(agent: MultiSolutionARCLangGraphAgent, all_results: List[Dict[str, Any]], task_ids: List[str], model_name: Optional[str] = None) -> Dict[str, Any]:
+def print_summary(agent: ARCLangGraphAgent, all_results: List[Dict[str, Any]], task_ids: List[str], model_name: Optional[str] = None) -> Dict[str, Any]:
     """Save summary of all task results to summary.json."""
     total_tasks = len(all_results)
     workflow_completions = sum(1 for r in all_results if r.get('workflow_completed'))
@@ -481,8 +482,10 @@ def print_summary(agent: MultiSolutionARCLangGraphAgent, all_results: List[Dict[
 def parse_arguments():
     """Parse command line arguments with defaults from ALL_CAPS variables."""
     parser = argparse.ArgumentParser(description="LangGraph multi-solution agent runner for ARC tasks")
-    parser.add_argument("--model", type=str, default=MODEL,
-                       help=f"Model to use (e.g., gpt-4o-mini, gemini-2.0-flash) (default: {MODEL})")
+    parser.add_argument("--reasoning-model", type=str, default=REASONING_MODEL,
+                       help=f"Model to use (e.g., gpt-4o-mini, gemini-2.0-flash) (default: {REASONING_MODEL})")
+    parser.add_argument("--coding-model", type=str, default=CODING_MODEL,
+                       help=f"Coding model to use (e.g., gpt-4o-mini, gemini-2.0-flash) (default: {CODING_MODEL})")
     parser.add_argument("--mode", type=str, choices=["single", "batch"], default=MODE,
                        help=f"Test mode: single task or batch (default: {MODE})")
     parser.add_argument("--evaluate-only", action="store_true", dest="evaluate_only",
@@ -523,9 +526,11 @@ def main():
     use_print_lock = getattr(args, 'use_print_lock', False)
     
     # Initialize LLM (optionally using vLLM if requested)
-    llm_backend = initialize_llm_from_config(args.model, use_vllm=args.use_vllm)
-    llm = TokenTrackingLLM(llm_backend)
+    llm = TokenTrackingLLM(initialize_llm_from_config(args.reasoning_model, use_vllm=args.use_vllm))
     if llm is None:
+        return 1
+    coding_model = TokenTrackingLLM(initialize_llm_from_config(args.coding_model, use_vllm=args.use_vllm))
+    if coding_model is None:
         return 1
     
     # Create output directory first
@@ -552,16 +557,16 @@ def main():
         active_solutions = training_solutions
     
     # Save parameters
-    save_params(output_dir, args, args.model)
+    save_params(output_dir, args, args.reasoning_model)
     
     # Save task IDs
     save_task_ids(output_dir, training_tasks, evaluation_tasks)
 
     # Create a MultiSolution agent for this run
     print(f"Initialize the multi-solution LangGraph agent...")
-    agent = MultiSolutionARCLangGraphAgent(
+    agent = ARCLangGraphAgent(
         llm=llm,
-        code_llm=llm,
+        code_llm=coding_model,
         num_initial_solutions=NUM_INITIAL_SOLUTIONS,
         num_loops=NUM_LOOPS,
         num_seed_solutions=NUM_SEED_SOLUTIONS,
@@ -646,7 +651,7 @@ def main():
             task_solution = active_solutions.get(task_id)
 
             # Create a per-task multi-solution agent and attach helpers snapshot
-            local_agent = MultiSolutionARCLangGraphAgent(
+            local_agent = ARCLangGraphAgent(
                 llm=llm,
                 code_llm=llm,
                 num_initial_solutions=NUM_INITIAL_SOLUTIONS,
@@ -725,7 +730,7 @@ def main():
                 summarize_and_print_result(langgraph_result, task_id=task_id)
     
     # Save summary (include model name so we can estimate cost)
-    print_summary(agent, all_results, task_ids_processed, model_name=args.model)
+    print_summary(agent, all_results, task_ids_processed, model_name=args.reasoning_model)
     return 0
 
 
@@ -853,9 +858,20 @@ def initialize_llm_from_config(model_name: str, use_vllm: bool = False):
         # If the caller explicitly requested vLLM, try to initialize that first.
         if use_vllm:
             try:
-                from langchain_vllm import VLLM
-                return VLLM(model=model_key, temperature=0.6,
-                            max_output_tokens=100000)
+                from langchain_community.llms import VLLM
+                # Resolve a HuggingFace/vLLM identifier if possible
+                try:
+                    from model_configs import resolve_hf_model
+                    model_for_vllm = resolve_hf_model(model_name) or config.get("hf_model") or model_key
+                except Exception:
+                    model_for_vllm = config.get("hf_model") or model_key
+
+                # Ensure HuggingFace hub is allowed to perform repo lookups/downloads
+                os.environ.pop("HF_HUB_OFFLINE", None)
+                os.environ.pop("HUGGINGFACE_HUB_OFFLINE", None)
+
+                return VLLM(model=model_for_vllm, local_files_only=False,
+                            temperature=0.6, max_output_tokens=100000)
             except ImportError as e:
                 print(f"vLLM requested but package not installed: {e}")
                 print("Install with: pip install vllm langchain-vllm")

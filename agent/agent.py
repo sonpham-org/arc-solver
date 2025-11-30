@@ -117,7 +117,7 @@ def create_initial_state(task_id: str,
         "enable_visual_cue": agent.enable_visual_cue,
     }
 
-class MultiSolutionARCLangGraphAgent:
+class ARCLangGraphAgent:
     """
     LangGraph-based agent for solving ARC problems.
     

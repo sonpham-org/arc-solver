@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 from flask import Flask, render_template, request, url_for, redirect
 
 APP_ROOT = Path(__file__).resolve().parent
-OUTPUT_ROOT = APP_ROOT / "output"
+OUTPUT_ROOT = APP_ROOT / "output" / "output_agent"
 
 
 def find_runs(output_root: Path) -> List[Path]:

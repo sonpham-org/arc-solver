@@ -55,19 +55,19 @@ def out_of_loops(state):
     max_loops = int(state.get('num_loops', 0))
     return cur_loop >= max_loops
 
-def create_arc_workflow(llm, code_llm) -> StateGraph:
+def create_arc_workflow(llm, transformation_llm, code_llm) -> StateGraph:
     """
     Create the LangGraph workflow for ARC problem solving.
     """
     workflow = StateGraph(AgentState)
 
     # Add nodes with LLM access
-    workflow.add_node("generate_code", lambda state: generate_code_node(state, llm, code_llm))
+    workflow.add_node("generate_code", lambda state: generate_code_node(state, llm, transformation_llm, code_llm))
 
     # Add test and refine nodes. Keep `test_code_node` as the node body
     # and use conditional edges (predicates) to decide the next step.
-    workflow.add_node("test_code", lambda state: test_code_node(state, llm, code_llm))
-    workflow.add_node("evolve_code", lambda state: evolve_code_node(state, llm, code_llm))
+    workflow.add_node("test_code", lambda state: test_code_node(state, llm, transformation_llm, code_llm))
+    workflow.add_node("evolve_code", lambda state: evolve_code_node(state, llm, transformation_llm, code_llm))
     workflow.add_node("finalize", finalize_node)
 
     # Add edges. Use conditional edges out of `test_code` so the graph can
@@ -115,6 +115,7 @@ def create_initial_state(task_id: str,
         "num_fusions": agent.num_fusions,
         "num_solutions_per_fusion": agent.num_solutions_per_fusion,
         "enable_visual_cue": agent.enable_visual_cue,
+        "enable_rag_hint": agent.enable_rag_hint,
     }
 
 class ARCLangGraphAgent:
@@ -125,7 +126,7 @@ class ARCLangGraphAgent:
     storing all solutions in the workflow state.
     """
 
-    def __init__(self, llm, code_llm,
+    def __init__(self, llm, transformation_llm, code_llm,
                  num_initial_solutions: int = 10,
                  num_loops: int = 3,
                  num_seed_solutions: int = 10,
@@ -137,6 +138,7 @@ class ARCLangGraphAgent:
                  enable_code_predict: bool = True,
                  enable_llm_predict: bool = False,
                  enable_visual_cue: bool = False,
+                 enable_rag_hint: bool = False,
                  max_generations: int = 3):
         """
         Initialize the ARC LangGraph Agent.
@@ -150,6 +152,7 @@ class ARCLangGraphAgent:
         # LLM instances
         self.llm = llm
         self.code_llm = code_llm
+        self.transformation_llm = transformation_llm
 
         # Evolutionary parameters
         self.num_initial_solutions = num_initial_solutions
@@ -165,10 +168,11 @@ class ARCLangGraphAgent:
         self.enable_llm_predict = enable_llm_predict  # Whether to enable LLM-predicted outputs during testing
         self.enable_parallel_eval = enable_parallel_eval  # Whether to parallelize evaluation with threads and tqdm
         self.enable_visual_cue = enable_visual_cue
+        self.enable_rag_hint = enable_rag_hint
         self.max_generations = int(max_generations)
 
         # Create arc workflow
-        self.workflow = create_arc_workflow(llm, code_llm).compile()
+        self.workflow = create_arc_workflow(llm, transformation_llm, code_llm).compile()
 
     def solve_task(self, task_id: str, task_data: Dict[str, Any], task_solution: Optional[List[List[List[int]]]] = None, max_attempts: int = 5) -> WorkflowOutput:
         """
@@ -282,32 +286,3 @@ class ARCLangGraphAgent:
             "execution_time": execution_time,
         }
         return output
-    
-    def solve_multiple_tasks(self, tasks: Dict[str, Dict[str, Any]]) -> Dict[str, WorkflowOutput]:
-        """
-        Solve multiple ARC tasks. Which bascially calls solve_task in a loop or in parallel.
-        
-        Args:
-            tasks: Dictionary mapping task_id to task_data
-            
-        Returns:
-            Dictionary mapping task_id to WorkflowOutput
-        """
-        results = {}
-        
-        for task_id, task_data in tasks.items():
-            print(f"Solving task: {task_id}")
-            result = self.solve_task(task_id, task_data)
-            results[task_id] = result
-            
-            # Print summary
-            success_rate = result.get("training_success_rate", 0.0)
-            attempts = result.get("attempts", 0)
-            time_taken = result.get("execution_time", 0.0)
-            
-            print(f"  Success rate: {success_rate:.2%}")
-            print(f"  Attempts: {attempts}/{self.max_attempts}")
-            print(f"  Time: {time_taken:.2f}s")
-            print()
-        
-        return results

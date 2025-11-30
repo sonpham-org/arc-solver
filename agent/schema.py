@@ -5,6 +5,7 @@ This module defines the TypedDict structures used to maintain state
 throughout the LangGraph workflow for ARC problem solving.
 """
 
+from dataclasses import dataclass
 from typing import TypedDict, List, Dict, Any, Optional, Union, Annotated
 from langchain_core.messages import BaseMessage
 
@@ -57,6 +58,9 @@ class CodeSolution(TypedDict):
     """Represents a complete code solution."""
     main_code: str
     reasoning_trace: str  # Full reasoning analysis of patterns. Maybe should just do some summary.
+    reasoning_summary: str  # Concise summary of reasoning
+    concepts: List[str]  # Key concepts identified
+    vector: List[float]  # Embedding vector for the solution
     step_by_step_transformation: List[str]  # Clear transformation steps
 
     evaluated: bool
@@ -135,6 +139,17 @@ class WorkflowOutput(TypedDict):
     highest_training_solution_overlap_score: float
     num_loops: int
     execution_time: float
+
+
+@dataclass
+class ReasoningTraceRecord:
+    """Dataclass to record reasoning trace steps."""
+    id: str
+    reasoning_text: str
+    reasoning_summary: str
+    concepts: List[str]
+    helpers: List[Dict[str, str]]
+    vector: list                   # Embedding vector
 
 
 # Type aliases for common data structures

@@ -18,7 +18,7 @@ from .schema import AgentState, CodeSolution, ExampleResult, Grid
 # Import actions (helpers, prompts, execution, refinement)
 from .actions import (
     fuse_solutions_with_reasoning,
-    generate_solutions_with_reasoning,
+    create_solutions_with_reasoning,
     refine_solutions_with_reasoning,
     execute_transformation_code,
     generate_llm_predicted_output,
@@ -130,7 +130,7 @@ def calculate_solution_statistics(solution: CodeSolution) -> CodeSolution:
     return solution
 
 
-def generate_code_node(state: AgentState, llm, code_llm) -> AgentState:
+def generate_code_node(state: AgentState, llm, transformation_llm, code_llm) -> AgentState:
     """
     Generate Python code to solve the ARC problem using reasoning-first approach.
 
@@ -147,22 +147,23 @@ def generate_code_node(state: AgentState, llm, code_llm) -> AgentState:
     # Read visual cue flag from node state and pass through to generation
     enable_visual_cue = state.get('enable_visual_cue', False)
 
-    python_codes, reasoning_trace, transformation_solutions_list = generate_solutions_with_reasoning(
+    python_codes, reasoning_trace, transformation_solutions_list, rag_entry = create_solutions_with_reasoning(
         llm,
+        transformation_llm,
         code_llm,
         training_examples,
         num_solutions=num_initial_solutions,
         enable_visual_cue=enable_visual_cue
     )
 
-    print(len(python_codes), "python codes generated.")
-    print(len(transformation_solutions_list), "transformation solutions generated.")
-
     solutions_list = []
     for transformation, code in zip(transformation_solutions_list, python_codes):
         solution = {
             "main_code": code,
             "reasoning_trace": reasoning_trace,
+            "reasoning_summary": rag_entry.reasoning_summary if rag_entry else "",
+            "concepts": rag_entry.concepts if rag_entry else [],
+            "vector": rag_entry.vector if rag_entry else [],
             "step_by_step_transformation": transformation,
         }
         solutions_list.append(solution)
@@ -170,17 +171,17 @@ def generate_code_node(state: AgentState, llm, code_llm) -> AgentState:
     # Update state
     new_state = copy.deepcopy(state)
     new_state["seed_solutions_list"] = solutions_list
-    print(len(new_state["seed_solutions_list"]), "initial code solutions generated.")
     new_state["fused_solutions_list"] = []
     new_state["mutated_solutions_list"] = []
     return new_state
 
 
-def evolve_code_node(state, llm, code_llm):
+def evolve_code_node(state, llm, transformation_llm, code_llm):
     """Module-level evolve node: increment generation and re-run generator."""
     # Get necessary variables
     training_examples = state["task_data"]["train"]
     enable_visual_cue = state.get("enable_visual_cue", False)
+    enable_rag_hint = state.get("enable_rag_hint", False)
     num_seed_solutions = state["num_seed_solutions"]
     num_refinements = state["num_refinements"]
     num_solutions_per_refinement = state["num_solutions_per_refinement"]
@@ -236,14 +237,16 @@ def evolve_code_node(state, llm, code_llm):
 
             # Randomly select two distinct partner solutions. Sample without replacement
             sola, solb = random.sample(seed_solutions, 2)
-            python_codes, reasoning_trace, transformation_solutions_list = fuse_solutions_with_reasoning(
+            python_codes, reasoning_trace, transformation_solutions_list, rag_entry = fuse_solutions_with_reasoning(
                 llm,
+                transformation_llm,
                 code_llm,
                 sola,
                 solb,
                 training_examples,
                 num_fused_solutions=num_solutions_per_fusion,
-                enable_visual_cue=enable_visual_cue
+                enable_visual_cue=enable_visual_cue,
+                enable_rag_hint=enable_rag_hint,
             )
 
             for transformation, code in zip(transformation_solutions_list, python_codes):
@@ -251,6 +254,9 @@ def evolve_code_node(state, llm, code_llm):
                     "main_code": code,
                     "reasoning_trace": reasoning_trace,
                     "step_by_step_transformation": transformation,
+                    "reasoning_summary": rag_entry.reasoning_summary if rag_entry else "",
+                    "concepts": rag_entry.concepts if rag_entry else [],
+                    "vector": rag_entry.vector if rag_entry else [],
                 }
                 sol_arr.append(solution)
             fused_solutions.append(sol_arr)
@@ -258,13 +264,15 @@ def evolve_code_node(state, llm, code_llm):
         # 6) Mutation (self-reflection)
         for i, solution in enumerate(seed_solutions[:num_refinements]):
             sol_arr = []
-            python_codes, reasoning_trace, transformation_solutions_list = refine_solutions_with_reasoning(
+            python_codes, reasoning_trace, transformation_solutions_list, rag_entry = refine_solutions_with_reasoning(
                 llm,
+                transformation_llm,
                 code_llm,
                 solution,
                 training_examples,
                 num_solutions_per_refinement,
-                enable_visual_cue=enable_visual_cue
+                enable_visual_cue=enable_visual_cue,
+                enable_rag_hint=enable_rag_hint,
             )
 
             for transformation, code in zip(transformation_solutions_list, python_codes):
@@ -272,6 +280,9 @@ def evolve_code_node(state, llm, code_llm):
                     "main_code": code,
                     "reasoning_trace": reasoning_trace,
                     "step_by_step_transformation": transformation,
+                    "reasoning_summary": rag_entry.reasoning_summary if rag_entry else "",
+                    "concepts": rag_entry.concepts if rag_entry else [],
+                    "vector": rag_entry.vector if rag_entry else [],
                 }
                 sol_arr.append(solution)
             mutated_solutions.append(sol_arr)
@@ -283,7 +294,7 @@ def evolve_code_node(state, llm, code_llm):
     return new_state
 
 
-def test_code_node(state: AgentState, llm, code_llm) -> AgentState:
+def test_code_node(state: AgentState, llm, transformation_llm, code_llm) -> AgentState:
     """
     Test the generated code against training examples.
 
@@ -293,7 +304,6 @@ def test_code_node(state: AgentState, llm, code_llm) -> AgentState:
     # Deep copy the new state, and shove in the training results to previous_training_results
     # And then reset training results
     new_state = copy.deepcopy(state)
-    print("Testing code solutions at loop ", state.get("current_loop"))
     # Read runtime flags from the state (propagated by the agent)
     enable_code_predict = new_state.get("enable_code_predict", True)
     enable_llm_predict = new_state.get("enable_llm_predict", True)

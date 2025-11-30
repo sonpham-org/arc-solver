@@ -13,11 +13,16 @@ import ast
 import sys
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
+import hashlib
+import math
+import uuid
+import os
+import textwrap
 import traceback
 import re
 
 # Import schema and tools
-from .schema import AgentState, CodeSolution, ExampleResult
+from .schema import AgentState, CodeSolution, ExampleResult, ReasoningTraceRecord
 from .tools import FUNCTION_MAP
 from .debug import print_prompt_and_response, print_python_code
 
@@ -202,7 +207,337 @@ def _grid_to_image_bytes(grid: List[List[int]], cell_size: int = 24, padding: in
     return buf.getvalue()
 
 
-def generate_solutions_with_reasoning(llm, code_llm, training_examples: List[Dict], num_solutions: int, enable_visual_cue: bool = False) -> Tuple[List[str], str, List[Dict]]:
+def generate_distilled_reasoning(llm, reasoning_trace, transformation_steps, python_codes):
+    """Distill a detailed `reasoning_trace` into a JSON-like structure.
+
+    Returns a dict with keys:
+      - 'strategy': concise single-paragraph summary (<=150 words)
+      - 'concepts': list of short concept strings
+
+    The LLM is instructed to return ONLY valid JSON. This function will try
+    to robustly parse common response shapes (```json``` fenced block, bare
+    JSON, or a JSON-like substring). On failure it will produce a best-effort
+    dict with empty `concepts`.
+    """
+
+    def build_distill_reasoning_prompt() -> str:
+        prompt_parts = [
+            "---------------",
+            "REASONING TRACE",
+            "---------------",
+            reasoning_trace,
+            "",
+            "------------",
+            "INSTRUCTIONS",
+            "------------",
+            "Read ONLY the reasoning trace above and produce a JSON object with exactly two fields:\n",
+            "1) \"strategy\": a concise single-paragraph summary (<=150 words) describing the high-level strategy used to solve the task;\n",
+            "2) \"concepts\": an array of short strings naming the key operations or concepts used (e.g., \"connected components\", \"symmetry\", \"color mapping\").\n",
+            "Return ONLY valid JSON within a ```json```. Do NOT include any additional text, commentary, or markdown.\n",
+            "Example output:",
+            '```json',
+            '{"strategy": "Brief summary...", "concepts": ["symmetry", "fill", "mirror"]}',
+            '```',
+            "Perform the distillation now:"
+        ]
+        return "\n".join(prompt_parts)
+
+    prompt = build_distill_reasoning_prompt()
+
+    try:
+        response = llm.invoke(prompt)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+    except Exception as e:
+        return {"strategy": f"(LLM error during distillation: {e})", "concepts": []}
+
+    # Extract JSON candidate
+    json_candidate = None
+    m = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL | re.IGNORECASE)
+    if m:
+        json_candidate = m.group(1).strip()
+    else:
+        m2 = re.search(r'\{.*?\}', response_text, re.DOTALL)
+        if m2 and 'strategy' in m2.group(0):
+            json_candidate = m2.group(0)
+
+    if json_candidate:
+        try:
+            parsed = json.loads(json_candidate)
+            strategy = str(parsed.get('strategy', '')).strip()
+            concepts = parsed.get('concepts') or parsed.get('concept') or []
+            if isinstance(concepts, str):
+                concepts = [c.strip() for c in re.split(r'[;,\n]', concepts) if c.strip()]
+            elif not isinstance(concepts, (list, tuple)):
+                concepts = []
+
+            words = strategy.split()
+            if len(words) > 150:
+                strategy = " ".join(words[:150]) + "..."
+
+            return {"strategy": strategy, "concepts": concepts}
+        except Exception:
+            pass
+
+    # Forgiving fallback
+    text = textwrap.dedent(str(response_text)).strip()
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+    strategy = paragraphs[0] if paragraphs else text
+    words = strategy.split()
+    if len(words) > 150:
+        strategy = " ".join(words[:150]) + "..."
+
+    concepts = []
+    for line in paragraphs[1:4]:
+        if len(line) < 200 and (',' in line or ';' in line or line.lower().startswith('concepts') or len(line.split()) <= 6):
+            cand = re.sub(r'^(concepts?:\s*)', '', line, flags=re.IGNORECASE)
+            parts = [c.strip() for c in re.split(r'[;,\n]', cand) if c.strip()]
+            for p in parts:
+                if 2 <= len(p) <= 60:
+                    concepts.append(p)
+        if concepts:
+            break
+
+    return {"strategy": strategy, "concepts": concepts}
+
+
+def generate_embedding_from_distilled_reasoning(distilled_text) -> List[float]:
+    """Generate an embedding vector from the distilled reasoning text.
+
+    This is a placeholder function. In a real implementation, this would
+    call an embedding model (e.g., OpenAI's text-embedding-ada-002)
+    to generate a vector representation of the text.
+    """
+    # Try Google Generative AI (GenAI) embeddings first, if available.
+    # This keeps the dependency optional and falls back to a deterministic
+    # SHA-256-based vector when the GenAI client or credentials are absent.
+    if not distilled_text:
+        return []
+
+    # Local import to avoid hard dependency at module import time
+    try:
+        import google.generativeai as genai  # type: ignore
+        # genai uses environment or configure() for credentials.
+        # Model name example: 'textembedding-gecko@001' — change as needed.
+        model = getattr(genai, 'DEFAULT_EMBEDDING_MODEL', None) or 'textembedding-gecko@001'
+        resp = genai.embeddings.create(model=model, input=distilled_text)
+        # Response shape: resp.data[0].embedding (list[float])
+        emb = None
+        try:
+            emb = resp.data[0].embedding
+        except Exception:
+            # Some client versions may use resp['data'][0]['embedding']
+            try:
+                emb = resp['data'][0]['embedding']
+            except Exception:
+                emb = None
+        if emb is not None:
+            try:
+                vec = [float(x) for x in emb]
+                # Optionally normalize to unit length
+                norm = math.sqrt(sum(x * x for x in vec))
+                if norm > 0:
+                    vec = [x / norm for x in vec]
+                return vec
+            except Exception:
+                # If provider returned an unexpected shape, fall back
+                pass
+    except Exception:
+        # Fall through to deterministic fallback
+        pass
+
+    # Fallback: deterministic SHA-256 based vector (length = 768)
+    dim = 768
+    seed = (distilled_text or "").encode('utf-8')
+    vec = []
+    for i in range(dim):
+        h = hashlib.sha256()
+        h.update(seed)
+        h.update(b'||')
+        h.update(str(i).encode('utf-8'))
+        digest = h.digest()
+        u64 = int.from_bytes(digest[:8], 'big')
+        f = (u64 / float(2**64 - 1)) * 2.0 - 1.0
+        vec.append(float(f))
+
+    # Normalize
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm > 0:
+        vec = [x / norm for x in vec]
+
+    return vec
+
+
+def store_record(record, qdrant_client=None, collection_name=None) -> bool:
+    """Store a ReasoningTraceRecord into a Qdrant collection if available.
+
+    - `record` may be a dataclass-like object (ReasoningTraceRecord) or a dict.
+    - If `qdrant_client` is not provided we will attempt to construct one by
+      importing `qdrant_client` and connecting to `http://localhost:6333`.
+    - If `collection_name` is not provided we will try to read the
+      `QDRANT_COLLECTION_NAME` environment variable or a nearby
+      `collection_info.json` file.
+
+    Returns True on success (or when the store was skipped because qdrant is
+    unavailable), False only on explicit failure to upsert when qdrant is
+    available but the upsert fails.
+    """
+    try:
+        if not record:
+            return False
+
+        # Extract fields from the record (object or dict)
+        def _get(obj, key):
+            return getattr(obj, key, None) if not isinstance(obj, dict) else obj.get(key)
+
+        payload = {
+            "reasoning_text": _get(record, 'reasoning_text'),
+            "reasoning_summary": _get(record, 'reasoning_summary'),
+            "concepts": _get(record, 'concepts') or _get(record, 'concept'),
+            "helpers": _get(record, 'helpers'),
+        }
+        vector = _get(record, 'vector')
+        point_id = _get(record, 'id') or str(uuid.uuid4())
+
+        # Determine collection name
+        if not collection_name:
+            collection_name = os.environ.get('QDRANT_COLLECTION_NAME')
+        # Try to locate collection_info.json if env var not set
+        if not collection_name:
+            try:
+                for root, dirs, files in os.walk(os.getcwd()):
+                    if 'collection_info.json' in files:
+                        try:
+                            with open(os.path.join(root, 'collection_info.json'), 'r') as f:
+                                info = json.load(f)
+                            collection_name = info.get('collection_name') or info.get('name')
+                            if collection_name:
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                # If os.walk fails for any reason, ignore and proceed
+                pass
+
+        # If no qdrant info available, silently skip storing (not an error)
+        if not qdrant_client and not collection_name:
+            return False
+
+        # Lazily import/connect to qdrant if needed
+        if not qdrant_client:
+            try:
+                from qdrant_client import QdrantClient
+                qdrant_client = QdrantClient(url=os.environ.get('QDRANT_URL', 'http://localhost:6333'))
+            except Exception as e:
+                # Qdrant not available in this environment
+                return False
+
+        # Prepare point and upsert
+        try:
+            # Prefer the typed PointStruct when available
+            try:
+                from qdrant_client.http.models import PointStruct
+                point = PointStruct(id=point_id, vector=vector, payload=payload)
+                qdrant_client.upsert(collection_name=collection_name, points=[point])
+            except Exception:
+                # Fallback: use dict shape accepted by many qdrant client versions
+                qdrant_client.upsert(collection_name=collection_name, points=[{"id": point_id, "vector": vector, "payload": payload}])
+            return True
+        except Exception as e:
+            print(f"Warning: failed to upsert record to Qdrant collection '{collection_name}': {e}")
+            return False
+
+    except Exception as e:
+        print(f"Warning: unexpected error in store_record: {e}")
+        return False
+
+
+def retrieve_similar_distillations(vector: List[float], top_k: int = 5, qdrant_client=None, collection_name=None) -> List[Dict[str, Any]]:
+    """Retrieve top_k most similar distilled reasoning records from Qdrant.
+
+    This function requires an explicit embedding `vector` (list of floats).
+    Returns a list of dicts with keys: `id`, `score`, `payload`, `vector`.
+    If Qdrant is unavailable or an error occurs, returns an empty list.
+    """
+    try:
+        if not vector:
+            return []
+
+        # Determine collection name if not provided
+        if not collection_name:
+            collection_name = os.environ.get('QDRANT_COLLECTION_NAME')
+
+        # Try to locate collection_info.json if env var not set
+        if not collection_name:
+            try:
+                for root, dirs, files in os.walk(os.getcwd()):
+                    if 'collection_info.json' in files:
+                        try:
+                            with open(os.path.join(root, 'collection_info.json'), 'r') as f:
+                                info = json.load(f)
+                            collection_name = info.get('collection_name') or info.get('name')
+                            if collection_name:
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if not qdrant_client:
+            try:
+                from qdrant_client import QdrantClient
+                qdrant_client = QdrantClient(url=os.environ.get('QDRANT_URL', 'http://localhost:6333'))
+            except Exception:
+                return []
+
+        # Perform search (different client versions have slightly different APIs)
+        try:
+            # Preferred modern API
+            hits = qdrant_client.search(collection_name=collection_name, query_vector=vector, limit=top_k, with_payload=True, with_vector=False)
+        except TypeError:
+            # Older variants: positional args
+            try:
+                hits = qdrant_client.search(collection_name, vector, top_k, with_payload=True, with_vector=False)
+            except Exception:
+                # Try the very old http client method name
+                try:
+                    hits = qdrant_client.search_points(collection_name=collection_name, query_vector=vector, limit=top_k, with_payload=True)
+                except Exception as e:
+                    print(f"Warning: Qdrant search failed: {e}")
+                    return []
+        except Exception as e:
+            print(f"Warning: Qdrant search failed: {e}")
+            return []
+
+        results = []
+        for h in hits or []:
+            try:
+                # hit may be a typed object or dict-like depending on client
+                if isinstance(h, dict):
+                    item_id = h.get('id')
+                    score = h.get('score') or h.get('payload', {}).get('score')
+                    payload = h.get('payload')
+                    vec = h.get('vector')
+                else:
+                    item_id = getattr(h, 'id', None)
+                    score = getattr(h, 'score', None) or (getattr(h, 'payload', {}) or {}).get('score')
+                    payload = getattr(h, 'payload', None)
+                    vec = getattr(h, 'vector', None)
+
+                results.append({"id": item_id, "score": score, "payload": payload, "vector": vec})
+            except Exception:
+                continue
+
+        return results
+
+    except Exception as e:
+        print(f"Warning: unexpected error in retrieve_similar_distillations: {e}")
+        return []
+
+
+def create_solutions_with_reasoning(llm, transformation_llm, code_llm, 
+                                      training_examples: List[Dict], num_solutions: int,
+                                      enable_visual_cue: bool = False,
+                                      enable_rag_hint: bool = False) -> Tuple[List[str], str, List[Dict]]:
     """Generate Python transformation code using reasoning-first approach.
 
     When `enable_visual_cue` is True, this function will render training
@@ -235,21 +570,48 @@ def generate_solutions_with_reasoning(llm, code_llm, training_examples: List[Dic
     reasoning_trace = generate_reasoning_trace(llm, training_examples) if not enable_visual_cue else generate_reasoning_trace(llm, training_examples, visual_cues=visual_cues)
 
     # Step 2: Extract step-by-step transformation from reasoning
-    transoformation_solutions_list = generate_transformation_steps(llm, reasoning_trace, training_examples, num_solutions)
+    transformation_solutions_list = generate_transformation_steps(transformation_llm, reasoning_trace, training_examples, num_solutions)
 
     # Step 3: Generate Python code(s) based on reasoning and steps
     # Note: `generate_code_from_reasoning` may return multiple candidate code strings.
-    python_codes_list = generate_code_from_reasoning(llm, code_llm, reasoning_trace, transoformation_solutions_list,
+    python_codes_list = generate_code_from_reasoning(code_llm, reasoning_trace, transformation_solutions_list,
                                                      training_examples)
+    
+    # Step 4: Create rag entry if enabled
+    if enable_rag_hint:
+        distilled_reasoning = generate_distilled_reasoning(llm, reasoning_trace, transformation_solutions_list, python_codes_list)
+        distilled_text = f"Strategy: {distilled_reasoning.get('strategy', '')}\nConcepts: {', '.join(distilled_reasoning.get('concepts', []))}"
+        embedding = generate_embedding_from_distilled_reasoning(distilled_text)
+        helpers = extract_helpers_from_python_codes(python_codes_list)
+        rag_entry = ReasoningTraceRecord(
+            id=str(uuid.uuid4()),
+            reasoning_text=reasoning_trace,
+            reasoning_summary=distilled_reasoning.get('strategy', ''),
+            concepts=distilled_reasoning.get('concepts', []),
+            helpers=helpers,
+            vector=embedding,
+        )
+
+        # Best-effort: store the distilled reasoning into the Qdrant vector store
+        # If qdrant is not available this will be a no-op and will not raise.
+        try:
+            stored = store_record(rag_entry)
+            if not stored:
+                # Quietly continue if storing was skipped or unavailable
+                pass
+        except Exception as e:
+            print(f"Warning: store_record raised an exception: {e}")
+    else:
+        rag_entry = None
 
     # Attach visual cue data onto each transformation dict (best-effort)
     if enable_visual_cue and visual_cues:
         # Try to attach example-level cues to the first solution dict to be saved later
-        for sol in transoformation_solutions_list:
+        for sol in transformation_solutions_list:
             sol['_visual_cues'] = visual_cues
 
     # Return the list of candidate codes, plus reasoning and steps.
-    return python_codes_list, reasoning_trace, transoformation_solutions_list
+    return python_codes_list, reasoning_trace, transformation_solutions_list, rag_entry
 
 def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Optional[List[Dict]] = None) -> str:
     """Generate detailed reasoning trace analyzing ARC patterns."""
@@ -318,17 +680,16 @@ def build_steps_text_from_transformation_steps(transformation_steps: List[str]) 
 
 
 def generate_reflection_reasoning_trace(llm,
-                                       current_solution: CodeSolution,
-                                       training_results: List[ExampleResult],
-                                       training_examples: List[Dict]) -> str:
+                                        current_solution: CodeSolution,
+                                        training_results: List[ExampleResult],
+                                        training_examples: List[Dict],
+                                        enable_rag_hint: bool) -> str:
     """Generate a reflection-focused reasoning trace using the ARC-style reflection prompt.
 
     This is intended for refinement: it asks the model to analyze failures, explain
     what went wrong, and produce a reasoning trace focused on correcting the logic.
     """
-    def build_refinement_reasoning_prompt(current_solution: CodeSolution,
-                                        training_results: List[ExampleResult],
-                                        training_examples: List[Dict]) -> str:
+    def build_refinement_reasoning_prompt() -> str:
         """Build reflection prompt based on ARC reflection prompt style for deep analysis."""
         
         # Format previous solution
@@ -336,6 +697,33 @@ def generate_reflection_reasoning_trace(llm,
         transformation_steps = current_solution["step_by_step_transformation"]
         reasoning_trace = current_solution["reasoning_trace"]
 
+        # Retrieve the relevant concepts based on RAG hints if enabled
+        rag_concepts = set()
+        rag_hints_parts = []
+        if enable_rag_hint:
+            vector = current_solution.get('vector')
+            entries = retrieve_similar_distillations(vector=vector, top_k=5)
+
+            rag_concepts = set()
+            for entry in entries:
+                payload = entry.get('payload', {})
+                concepts = payload.get('concepts') or []
+                if isinstance(concepts, str):
+                    concepts = [c.strip() for c in re.split(r'[;,\n]', concepts) if c.strip()]
+                elif not isinstance(concepts, (list, tuple)):
+                    concepts = []
+                for c in concepts:
+                    rag_concepts.add(c)
+        
+        if rag_concepts:
+            rag_hints_parts = [
+                "---------------------",
+                "RELATED CONCEPT HINTS",
+                "---------------------",
+                "The following concepts were found in similar prior solutions. Feel free to consider them in your analysis:",
+                "\n".join(f"- {c}" for c in rag_concepts),
+                "",
+            ]
         # Format transformation steps
         steps_text = build_steps_text_from_transformation_steps(transformation_steps)
         
@@ -397,27 +785,39 @@ def generate_reflection_reasoning_trace(llm,
             "You are an expert mathematician, logistician and pattern recognizier who is solving the"
             "Abstract Reasoning Corpus (ARC) problems.",
             "You previously attempted to solve this task but your solution was incorrect on some training examples."
-
-            "YOUR GOAL:",
+            "",
+            "---------"
+            "YOUR GOAL",
+            "---------"
             "Analyze your previous attempt deeply, understand why it failed"
             "- Was there an issue with the logic of the code that led to the failure?",
             "- If the code succeeds but the output doesn't match up, what are the difference between the intended output and your predicted output?",
             "- What is missing from your reasoning and solution that leads to these differences?",
             "- How to modify your reasoning and code to correct for these errors and ensure it solves the task fully?",
             "",
-            "YOUR PREVIOUS CODE:",
+            "------------------"
+            "YOUR PREVIOUS CODE",
+            "------------------",
             f"{previous_code}",
             ""
-            "YOUR PREVIOUS REASONING:",
+            "-----------------------"
+            "YOUR PREVIOUS REASONING",
+            "-----------------------",
             f"{reasoning_trace}",
             "",
-            "YOUR PREVIOUS TRANSFORMATION RULES:",
+            "----------------------------------"
+            "YOUR PREVIOUS TRANSFORMATION RULES",
+            "----------------------------------",
             f"{steps_text}",
             "",
+            "-------------------------",
             "DETAILED FAILURE ANALYSIS",
+            "-------------------------",
             f"{failures_block}",
-            "",
-            "ANALYSIS INSTRUCTIONS:",
+            ""] + rag_hints_parts if rag_hints_parts else [] + [
+            "---------------------",
+            "ANALYSIS INSTRUCTIONS",
+            "---------------------",
             "Provide a ```reasoning``` block that contains your detailed analysis.",
         ]
 
@@ -834,7 +1234,7 @@ def parse_transformation_steps(response_text: str) -> List[str]:
     return [{"solution_number": 1, "transformation_steps": steps[:50]}]
 
 
-def generate_code_from_reasoning(llm, code_llm, reasoning_trace: str, transformation_steps: List[str],
+def generate_code_from_reasoning(code_llm, reasoning_trace: str, transformation_steps: List[str],
                                  training_examples: List[Dict]) -> str:
     """Generate Python code based on reasoning trace and transformation steps.
 
@@ -923,7 +1323,7 @@ def generate_code_from_reasoning(llm, code_llm, reasoning_trace: str, transforma
                                               training_examples)
 
     try:
-        response = llm.invoke(prompt, temperature=0.3)
+        response = code_llm.invoke(prompt, temperature=0.3)
         response_text = response.content if hasattr(response, 'content') else str(response)
         
         # Extract candidate python solutions (may be multiple)
@@ -1057,6 +1457,78 @@ def extract_python_solutions(response_text: str) -> List[str]:
             solutions.append(blk)
 
         return [s for s in solutions if s]
+
+
+def extract_helpers_from_python_codes(python_codes: List[str]) -> List[Dict[str, str]]:
+    """Extract deduplicated helper function signatures and short descriptions.
+
+    Args:
+        python_codes: list of Python source strings (each may contain multiple functions).
+
+    Returns:
+        A list of dictionaries in the form {"signature": "func(arg1, arg2)",
+        "description": "short one-line description"} deduplicated by
+        function name and argument names.
+
+    Strategy:
+    - Parse each source string using `ast`.
+    - For every `FunctionDef`, build a signature using the argument names
+        (positional args only for brevity).
+    - Prefer the function docstring (first line) as description. If missing,
+        fall back to the first source line of the function body.
+    - Deduplicate by (name, arg-names) tuple.
+    """
+
+    results: List[Dict[str, str]] = []
+    seen = set()
+
+    for src in python_codes or []:
+        if not isinstance(src, str) or not src.strip():
+            continue
+        try:
+            tree = ast.parse(src)
+        except Exception:
+            # Skip code that doesn't parse
+            continue
+
+        for node in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            name = node.name
+            # Collect positional/keyword-only arg names (skip varargs/kw)
+            arg_names = []
+            try:
+                for a in node.args.args:
+                    arg_names.append(a.arg)
+                for a in getattr(node.args, 'kwonlyargs', []) or []:
+                    arg_names.append(a.arg)
+            except Exception:
+                pass
+
+            key = (name, tuple(arg_names))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            signature = f"{name}({', '.join(arg_names)})"
+
+            # Prefer docstring first
+            desc = ast.get_docstring(node) or ""
+            if desc:
+                desc = desc.strip().splitlines()[0]
+            else:
+                # Fallback: try to get the first statement source inside the function
+                desc = ""
+                try:
+                    if node.body:
+                        first_stmt = node.body[0]
+                        snippet = ast.get_source_segment(src, first_stmt) or ""
+                        # Clean up snippet onto one line
+                        desc = " ".join(snippet.strip().splitlines())[:200]
+                except Exception:
+                    desc = ""
+
+            results.append({"signature": signature, "description": desc})
+
+    return results
 
 
 def execute_transformation_code(main_code: str,
@@ -1202,22 +1674,35 @@ def evaluate_example(llm,
             exec_predicted_output = None
             exec_error = str(e)
 
-        # Compute code metrics (if execution produced an output)
-        if exec_predicted_output is not None and exec_error is None:
-            matching_size, overlap_percentage = calculate_grid_results(exec_predicted_output, expected_output)
+        # If there is no expected output available, report comparison-related
+        # metrics as None rather than attempting to compute them.
+        if expected_output is None:
+            matching_size, overlap_percentage = None, None
+            error_message = None
+            code_success = None
         else:
-            matching_size, overlap_percentage = False, 0.0
-        error_message = exec_error or None
-        code_success = bool(matching_size) and (overlap_percentage == 100.0)
+            # Compute code metrics (if execution produced an output)
+            if exec_predicted_output is not None and exec_error is None:
+                matching_size, overlap_percentage = calculate_grid_results(exec_predicted_output, expected_output)
+            else:
+                matching_size, overlap_percentage = False, 0.0
+            error_message = exec_error or None
+            code_success = bool(matching_size) and (overlap_percentage == 100.0)
 
     else:
         # Not executing code — leave defaults (no prediction)
         exec_predicted_output = None
         exec_error = None
-        matching_size = False
-        overlap_percentage = 0.0
-        error_message = None
-        code_success = False
+        if expected_output is None:
+            matching_size = None
+            overlap_percentage = None
+            error_message = None
+            code_success = None
+        else:
+            matching_size = False
+            overlap_percentage = 0.0
+            error_message = None
+            code_success = False
 
     # Ask the LLM to apply the step-by-step transformation to the input only if enabled
     llm_predicted_output = None
@@ -1236,20 +1721,33 @@ def evaluate_example(llm,
             llm_predicted_output = None
             llm_error = str(e)
 
-        # Compute LLM-specific metrics (if LLM produced an output)
-        if llm_predicted_output is not None and llm_error is None:
-            llm_matching_size, llm_overlap_percentage = calculate_grid_results(llm_predicted_output, expected_output)
+        # If there is no expected output available, report comparison-related
+        # metrics as None rather than attempting to compute them.
+        if expected_output is None:
+            llm_matching_size, llm_overlap_percentage = None, None
+            llm_error_message = None
+            llm_success = None
         else:
-            llm_matching_size, llm_overlap_percentage = False, 0.0
-        llm_error_message = llm_error or None
-        llm_success = bool(llm_matching_size) and (llm_overlap_percentage == 100.0)
+            # Compute LLM-specific metrics (if LLM produced an output)
+            if llm_predicted_output is not None and llm_error is None:
+                llm_matching_size, llm_overlap_percentage = calculate_grid_results(llm_predicted_output, expected_output)
+            else:
+                llm_matching_size, llm_overlap_percentage = False, 0.0
+            llm_error_message = llm_error or None
+            llm_success = bool(llm_matching_size) and (llm_overlap_percentage == 100.0)
     else:
         llm_predicted_output = None
         llm_error = None
-        llm_matching_size = False
-        llm_overlap_percentage = 0.0
-        llm_error_message = None
-        llm_success = False
+        if expected_output is None:
+            llm_matching_size = None
+            llm_overlap_percentage = None
+            llm_error_message = None
+            llm_success = None
+        else:
+            llm_matching_size = False
+            llm_overlap_percentage = 0.0
+            llm_error_message = None
+            llm_success = False
 
     result = {
         "input": input_grid,
@@ -1296,11 +1794,13 @@ def analyze_failures(failed_tests: List[ExampleResult], training_examples: List[
 
 
 def refine_solutions_with_reasoning(llm,
+                                    transformation_llm,
                                     code_llm,
                                     current_solution: CodeSolution,
                                     training_examples: List[Dict],
                                     num_refined_solutions: int,
-                                    enable_visual_cue: bool = False) -> Tuple[List[str], str, List[Dict]]:
+                                    enable_visual_cue: bool = False,
+                                    enable_rag_hint: bool = False) -> Tuple[List[str], str, List[Dict]]:
     """Refine a CodeSolution using LLM reflection, transformation extraction, and code regeneration.
 
     Steps:
@@ -1338,15 +1838,41 @@ def refine_solutions_with_reasoning(llm,
 
     training_results: List[ExampleResult] = sol.get('training_results', []) or []
 
-    # 1) Generate reflection reasoning that focuses on what went wrong
-    reasoning_trace = generate_reflection_reasoning_trace(llm, sol, training_results, training_examples)
+    # Step 1: Generate reflection reasoning that focuses on what went wrong
+    reasoning_trace = generate_reflection_reasoning_trace(llm, sol, training_results, training_examples, enable_rag_hint)
     sol['reasoning_trace'] = reasoning_trace
 
-    # 2) Extract transformation steps from the reflection reasoning
-    transformation_solutions_list = generate_refined_transformation_steps(llm, reasoning_trace, sol, training_examples, num_refined_solutions)
+    # Step 2: Extract transformation steps from the reflection reasoning
+    transformation_solutions_list = generate_refined_transformation_steps(transformation_llm, reasoning_trace, sol, training_examples, num_refined_solutions)
 
-    # 3) Generate candidate code implementations
-    python_codes_list = generate_code_from_reasoning(llm, code_llm, reasoning_trace, transformation_solutions_list, training_examples)
+    # Step 3: Generate candidate code implementations
+    python_codes_list = generate_code_from_reasoning(code_llm, reasoning_trace, transformation_solutions_list, training_examples)
+    
+    # Step 4: Create rag entry if enabled
+    if enable_rag_hint:
+        distilled_reasoning = generate_distilled_reasoning(llm, reasoning_trace, transformation_solutions_list, python_codes_list)
+        distilled_text = f"Strategy: {distilled_reasoning.get('strategy', '')}\nConcepts: {', '.join(distilled_reasoning.get('concepts', []))}"
+        embedding = generate_embedding_from_distilled_reasoning(distilled_text)
+        helpers = extract_helpers_from_python_codes(python_codes_list)
+        rag_entry = ReasoningTraceRecord(
+            id=str(uuid.uuid4()),
+            reasoning_text=reasoning_trace,
+            reasoning_summary=distilled_reasoning.get('strategy', ''),
+            concepts=distilled_reasoning.get('concepts', []),
+            helpers=helpers,
+            vector=embedding,
+        )
+        # Best-effort: store the distilled reasoning into the Qdrant vector store
+        # If qdrant is not available this will be a no-op and will not raise.
+        try:
+            stored = store_record(rag_entry)
+            if not stored:
+                # Quietly continue if storing was skipped or unavailable
+                pass
+        except Exception as e:
+            print(f"Warning: store_record raised an exception: {e}")
+    else:
+        rag_entry = None
 
     # Attach visual cue data onto each transformation dict (best-effort)
     if enable_visual_cue:
@@ -1354,7 +1880,7 @@ def refine_solutions_with_reasoning(llm,
         pass
 
     # Return the list of candidate codes, plus reasoning and steps.
-    return python_codes_list, reasoning_trace, transformation_solutions_list
+    return python_codes_list, reasoning_trace, transformation_solutions_list, rag_entry
 
 def extract_reasoning_from_reflection(response_content: str) -> str:
     """Extract reasoning section from ARC-style reflection response."""
@@ -1451,7 +1977,8 @@ def generate_fused_reasoning_trace(llm,
                                    solb: Dict,
                                    training_results1: List[ExampleResult],
                                    training_results2: List[ExampleResult],
-                                   training_examples: List[Dict]) -> str:
+                                   training_examples: List[Dict],
+                                   enable_rag_hint: bool) -> str:
     """Generate a fused reasoning trace that reconciles two candidate solutions.
 
     The prompt includes both solutions' reasoning, transformation steps, code (if available),
@@ -1468,6 +1995,36 @@ def generate_fused_reasoning_trace(llm,
         code_b = solb.get('main_code') or "(no code)"
 
         training_results_text = result_comparison_text(training_results1, training_results2)
+
+        rag_concepts = set()
+        rag_hints_parts = []
+
+        if enable_rag_hint:
+            vectora = sola.get('vector')
+            vectorb = solb.get('vector')
+            entries_a = retrieve_similar_distillations(vector=vectora, top_k=5)
+            entries_b = retrieve_similar_distillations(vector=vectorb, top_k=5)
+
+            rag_concepts = set()
+            for entry in entries_a + entries_b:
+                payload = entry.get('payload', {})
+                concepts = payload.get('concepts') or []
+                if isinstance(concepts, str):
+                    concepts = [c.strip() for c in re.split(r'[;,\n]', concepts) if c.strip()]
+                elif not isinstance(concepts, (list, tuple)):
+                    concepts = []
+                for c in concepts:
+                    rag_concepts.add(c)
+        
+        if rag_concepts:
+            rag_hints_parts = [
+                "---------------------",
+                "RELATED CONCEPT HINTS",
+                "---------------------",
+                "The following concepts were found in similar prior solutions. Feel free to consider them in your analysis:",
+                "\n".join(f"- {c}" for c in rag_concepts),
+                ""
+            ]
 
         parts = [
             "You are an expert ARC solver. Two candidate solutions were produced for the same task.",
@@ -1505,7 +2062,7 @@ def generate_fused_reasoning_trace(llm,
             "For each training example, show the performance of each solution in terms of size match and overlap percentage.",
             "",
             f"{training_results_text}",
-            "",
+            ""] + rag_hints_parts + [
             "---------------------",
             "ANALYSIS INSTRUCTIONS",
             "---------------------",
@@ -1636,12 +2193,14 @@ def generate_fused_transformation_steps(llm,
 
 
 def fuse_solutions_with_reasoning(llm,
+                                  transformation_llm,
                                   code_llm,
                                   sola: CodeSolution,
                                   solb: CodeSolution,
                                   training_examples: List[Dict],
                                   num_fused_solutions: int,
-                                  enable_visual_cue: bool = False) -> Tuple[List[str], str, List[Dict]]:
+                                  enable_visual_cue: bool = False,
+                                  enable_rag_hint: bool = False) -> Tuple[List[str], str, List[Dict]]:
     """Attempt to fuse two CodeSolution candidates into a stronger combined solution.
 
     Returns a tuple: (python_codes_list, fused_reasoning_trace, fused_transformation_solutions_list)
@@ -1656,13 +2215,38 @@ def fuse_solutions_with_reasoning(llm,
     trb = solb.get('training_results') or []
 
     # 1) Generate fused reasoning trace
-    fused_reasoning = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples)
+    fused_reasoning = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples, enable_rag_hint)
 
     # 2) Generate fused transformation steps
-    fused_transformation_solutions = generate_fused_transformation_steps(llm, fused_reasoning, sola, solb, tra, trb, training_examples, num_fused_solutions)
+    fused_transformation_solutions = generate_fused_transformation_steps(transformation_llm, fused_reasoning, sola, solb, tra, trb, training_examples, num_fused_solutions)
 
     # 3) Generate candidate Python implementations from fused reasoning and steps
-    python_codes_list = generate_code_from_reasoning(llm, code_llm, fused_reasoning, fused_transformation_solutions, training_examples)
+    python_codes_list = generate_code_from_reasoning(code_llm, fused_reasoning, fused_transformation_solutions, training_examples)
 
+    # Step 4: Create rag entry if enabled
+    if enable_rag_hint:
+        distilled_reasoning = generate_distilled_reasoning(llm, fused_reasoning, fused_transformation_solutions, python_codes_list)
+        distilled_text = f"Strategy: {distilled_reasoning.get('strategy', '')}\nConcepts: {', '.join(distilled_reasoning.get('concepts', []))}"
+        embedding = generate_embedding_from_distilled_reasoning(distilled_text)
+        helpers = extract_helpers_from_python_codes(python_codes_list)
+        rag_entry = ReasoningTraceRecord(
+            id=str(uuid.uuid4()),
+            reasoning_text=fused_reasoning,
+            reasoning_summary=distilled_reasoning.get('strategy', ''),
+            concepts=distilled_reasoning.get('concepts', []),
+            helpers=helpers,
+            vector=embedding,
+        )
+        # Best-effort: store the distilled reasoning into the Qdrant vector store
+        # If qdrant is not available this will be a no-op and will not raise.
+        try:
+            stored = store_record(rag_entry)
+            if not stored:
+                # Quietly continue if storing was skipped or unavailable
+                pass
+        except Exception as e:
+            print(f"Warning: store_record raised an exception: {e}")
+    else:
+        rag_entry = None
 
-    return python_codes_list, fused_reasoning, fused_transformation_solutions
+    return python_codes_list, fused_reasoning, fused_transformation_solutions, rag_entry

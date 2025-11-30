@@ -46,6 +46,18 @@ from agent.agent import ARCLangGraphAgent
 # Import model configurations and utilities
 from model_configs import MODEL_CONFIGS, find_model_key, get_pricing_for, estimate_cost
 
+# Optional Qdrant imports - keep at module import time so missing packages
+# are detected early. If unavailable, `QDRANT_AVAILABLE` will be False.
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import VectorParams, Distance
+    QDRANT_AVAILABLE = True
+except Exception:
+    QDRANT_AVAILABLE = False
+    QdrantClient = None
+    VectorParams = None
+    Distance = None
+
 
 # ==========================================================================
 # CONFIGURATION VARIABLES - Modify these as needed
@@ -55,13 +67,14 @@ from model_configs import MODEL_CONFIGS, find_model_key, get_pricing_for, estima
 # For fast local debugging prefer an Ollama-hosted local model (free/local).
 # Reasoning model is used for reasoning & reflection
 # Coding model is used for code generation & execution
-REASONING_MODEL = "qwen2.5:32b"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
-CODING_MODEL = "qwen2.5:32b"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+REASONING_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+TRANSFORMATION_STEPS_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+CODING_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
 USE_VLLM = False
 
 # Test mode configuration
 MODE = "batch"  # "single" or "batch"
-NUM_WORKERS = 1  # Number of parallel workers for batch mode
+NUM_WORKERS = 8  # Number of parallel workers for batch mode
 
 # Task selection for single mode
 TASK_ID = None  # Specific task ID to test (for single mode)
@@ -78,9 +91,10 @@ ENABLE_PARALLEL_EVAL = True  # Whether to enable parallel evaluation of examples
 ENABLE_CODE_PREDICT = True  # Whether to enable code-predicted outputs during testing
 ENABLE_LLM_PREDICT = False # Whether to enable LLM-predicted outputs during testing
 ENABLE_VISUAL_CUE = False  # When True, generate and pass input/output images to the LLM
+ENABLE_RAG_HINT = False  # When True, enable retrieval-augmented generation hints from past reasoning traces
 
 NUM_INITIAL_SOLUTIONS = 10
-NUM_LOOPS = 5
+NUM_LOOPS = 3
 NUM_SEED_SOLUTIONS = 10
 NUM_REFINEMENTS = 2
 NUM_SOLUTIONS_PER_REFINEMENT = 5
@@ -96,7 +110,16 @@ TRAINING_SOLUTIONS_JSON = f"data/arc-{YEAR}/arc-agi_training_solutions.json"
 EVALUATION_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_evaluation_challenges.json"
 EVALUATION_SOLUTIONS_JSON = f"data/arc-{YEAR}/arc-agi_evaluation_solutions.json"
 TEST_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_test_challenges.json"
-TEST_SOLUTIONS_JSON = f"data/arc-{YEAR}/arc-agi_test_solutions.json"
+
+# Qdrant client and collection (populated if RAG hints are initialized)
+# These are module-level to make it easy for other helper functions (e.g.
+# `store_record`) to access the active client/collection without threading
+# the values through many call sites. If you prefer to avoid globals,
+# initialize_qdrant_vector_store can return `(client, collection_name)` and
+# the caller can hold them explicitly.
+QDRANT_CLIENT = None
+QDRANT_COLLECTION_NAME = None
+QDRANT_AVAILABLE = globals().get('QDRANT_AVAILABLE', False)
 
 
 def load_arc_tasks(file_path: str) -> Dict[str, Dict]:
@@ -134,54 +157,115 @@ def get_task_by_index(
     return task_id, task_data, task_solution
 
 
-def create_output_directory() -> str:
-    """Create a timestamped output directory."""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
+def create_output_directory(timestamp: str) -> str:
+    """Create an output directory using an externally provided timestamp.
+
+    The `timestamp` should be a string produced by `datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")`.
+    """
     output_dir = os.path.join("output/output_agent", timestamp)
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
 
-def save_params(output_dir: str, args: argparse.Namespace, model: str) -> None:
-    """Save run parameters to params.json."""
-    params = {
-        "model": model,
-        "mode": args.mode,
-        "max_attempts": args.max_attempts,
-        "random_seed": args.random_seed,
-        "timestamp": datetime.datetime.now().isoformat()
-    }
-    # Include year and file paths when available
-    if hasattr(args, 'YEAR') and args.YEAR is not None:
-        params['year'] = args.YEAR
-    for key in ('TRAINING_TASKS_JSON', 'TRAINING_SOLUTIONS_JSON', 'EVALUATION_TASKS_JSON', 'EVALUATION_SOLUTIONS_JSON'):
-        if hasattr(args, key) and getattr(args, key):
-            params[key.lower()] = getattr(args, key)
-    if args.mode == "single":
-        if args.task_id:
-            params["task_id"] = args.task_id
-        elif args.task_index is not None:
-            params["task_index"] = args.task_index
-    elif args.mode == "batch":
-        params["num_tasks"] = args.num_tasks
+def save_params(output_dir: str, args: argparse.Namespace) -> None:
+    """Save run parameters to params.json by serializing the argparse Namespace.
 
-    # Record evaluate-only flag when present
-    if hasattr(args, 'evaluate_only') and args.evaluate_only:
-        params['evaluate_only'] = True
+    This function simply converts `args` to a dictionary (using `vars`) and
+    writes it to `params.json` inside `output_dir`. It also records a
+    `timestamp` for the run.
+    """
+    # Convert Namespace to dict; fall back to __dict__ if necessary
+    try:
+        params = dict(vars(args) or {})
+    except Exception:
+        params = dict(getattr(args, '__dict__', {}) or {})
+
+    # Add/override a timestamp field
+    params['timestamp'] = datetime.datetime.now().isoformat()
+
+    # Ensure output directory exists and write the params file
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception:
+        pass
 
     with open(os.path.join(output_dir, "params.json"), 'w') as f:
         json.dump(params, f, indent=2)
 
 
-def save_task_ids(output_dir: str, training_tasks: Dict, evaluation_tasks: Dict) -> None:
-    """Save task ID lists to separate files."""
+def save_task_ids(output_dir: str, training_tasks: Dict, evaluation_tasks: Dict, test_tasks: Optional[Dict] = None) -> None:
+    """Save task ID lists to separate files.
+
+    Writes three files into `output_dir`:
+      - `training_task_ids.txt`
+      - `evaluation_task_ids.txt`
+      - `test_task_ids.txt` (only if `test_tasks` is provided)
+    """
     with open(os.path.join(output_dir, "training_task_ids.txt"), 'w') as f:
-        for task_id in sorted(training_tasks.keys()):
+        for task_id in sorted((training_tasks or {}).keys()):
             f.write(f"{task_id}\n")
-    
+
     with open(os.path.join(output_dir, "evaluation_task_ids.txt"), 'w') as f:
-        for task_id in sorted(evaluation_tasks.keys()):
+        for task_id in sorted((evaluation_tasks or {}).keys()):
             f.write(f"{task_id}\n")
+
+    with open(os.path.join(output_dir, "test_task_ids.txt"), 'w') as f:
+        for task_id in sorted((test_tasks or {}).keys()):
+            f.write(f"{task_id}\n")
+
+
+def initialize_qdrant_vector_store(database_dir: str, timestamp: Optional[str] = None):
+    """Initialize a Qdrant vector collection for reasoning traces.
+
+    Creates a timestamped collection name (so multiple runs can coexist)
+    and writes a small `collection_info.json` file under `database_dir`.
+
+    Returns a tuple `(client, collection_name)` on success, or `None` on failure.
+    """
+    global QDRANT_CLIENT, QDRANT_COLLECTION_NAME
+    if not QDRANT_AVAILABLE:
+        print("Qdrant client not available (missing dependency)")
+        return None
+
+    try:
+        os.makedirs(database_dir, exist_ok=True)
+    except Exception:
+        pass
+
+    # Use provided timestamp (preferred) or generate one for the collection name
+    if timestamp:
+        # normalize timestamp for collection name (remove separators)
+        ts = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H-%M-%S-%f").strftime("%Y%m%dT%H%M%S%f")
+    else:
+        ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+
+    collection_name = f"arc_reasoning_{ts}"
+
+    try:
+        client = QdrantClient(host="localhost", port=6333)
+
+        # Recreate collection so schema is deterministic for this run
+        client.recreate_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+        )
+
+        # Persist collection info for later lookup
+        info = {"collection_name": collection_name, "timestamp": ts}
+        try:
+            with open(os.path.join(database_dir, "collection_info.json"), 'w') as f:
+                json.dump(info, f)
+        except Exception:
+            pass
+
+        QDRANT_CLIENT = client
+        QDRANT_COLLECTION_NAME = collection_name
+        print(f"Initialized Qdrant collection: {collection_name}")
+        return client, collection_name
+
+    except Exception as e:
+        print(f"Failed to initialize Qdrant client/collection: {e}")
+        return None
 
 
 def save_task_result(output_dir: str, task_id: str, result: Dict[str, Any]) -> None:
@@ -486,9 +570,11 @@ def parse_arguments():
                        help=f"Model to use (e.g., gpt-4o-mini, gemini-2.0-flash) (default: {REASONING_MODEL})")
     parser.add_argument("--coding-model", type=str, default=CODING_MODEL,
                        help=f"Coding model to use (e.g., gpt-4o-mini, gemini-2.0-flash) (default: {CODING_MODEL})")
+    parser.add_argument("--transformation-steps-model", type=str, default=TRANSFORMATION_STEPS_MODEL,
+                        help=f"Model to use for transformation steps (e.g., gpt-4o-mini, gemini-2.0-flash) (default: {TRANSFORMATION_STEPS_MODEL})")
     parser.add_argument("--mode", type=str, choices=["single", "batch"], default=MODE,
                        help=f"Test mode: single task or batch (default: {MODE})")
-    parser.add_argument("--evaluate-only", action="store_true", dest="evaluate_only",
+    parser.add_argument("--evaluate-only", action="store_true",
                        help="When set, run ONLY on the evaluation dataset (applies to single or batch mode)")
     parser.add_argument("--task-id", type=str, default=TASK_ID,
                        help=f"Specific task ID to test (for single mode) (default: {TASK_ID})")
@@ -503,20 +589,60 @@ def parse_arguments():
     parser.add_argument("--workers", type=int, default=NUM_WORKERS,
                        help="Number of parallel workers for batch mode (default: 1 = sequential)")
     # Year and file path overrides for ARC data
-    parser.add_argument("--year", type=int, default=YEAR, dest="YEAR",
+    parser.add_argument("--year", type=int, default=YEAR,
                        help=f"Year for ARC dataset directory (default: {YEAR})")
-    parser.add_argument("--training-tasks-json", type=str, default=TRAINING_TASKS_JSON, dest="TRAINING_TASKS_JSON",
+    parser.add_argument("--training-tasks-json", type=str, default=TRAINING_TASKS_JSON,
                        help=f"Path to training tasks JSON (default: {TRAINING_TASKS_JSON})")
-    parser.add_argument("--training-solutions-json", type=str, default=TRAINING_SOLUTIONS_JSON, dest="TRAINING_SOLUTIONS_JSON",
+    parser.add_argument("--training-solutions-json", type=str, default=TRAINING_SOLUTIONS_JSON,
                        help=f"Path to training solutions JSON (default: {TRAINING_SOLUTIONS_JSON})")
-    parser.add_argument("--evaluation-tasks-json", type=str, default=EVALUATION_TASKS_JSON, dest="EVALUATION_TASKS_JSON",
+    parser.add_argument("--evaluation-tasks-json", type=str, default=EVALUATION_TASKS_JSON,
                        help=f"Path to evaluation tasks JSON (default: {EVALUATION_TASKS_JSON})")
-    parser.add_argument("--evaluation-solutions-json", type=str, default=EVALUATION_SOLUTIONS_JSON, dest="EVALUATION_SOLUTIONS_JSON",
+    parser.add_argument("--evaluation-solutions-json", type=str, default=EVALUATION_SOLUTIONS_JSON,
                        help=f"Path to evaluation solutions JSON (default: {EVALUATION_SOLUTIONS_JSON})")
-    parser.add_argument("--use-print-lock", action="store_true", dest="use_print_lock",
+    parser.add_argument("--test-tasks-json", type=str, default=TEST_TASKS_JSON,
+                       help=f"Path to test tasks JSON (default: {TEST_TASKS_JSON})")
+    parser.add_argument("--use-print-lock", action="store_true",
                        help="Enable a thread-printing lock to serialize prints (default: disabled)")
-    parser.add_argument("--use-vllm", action="store_true", dest="use_vllm", default=USE_VLLM,
+    parser.add_argument("--use-vllm", action="store_true", default=USE_VLLM,
                        help="When set, initialize the LLM using vLLM/langchain_vllm (local) instead of other providers")
+    # Flags to override behaviour of the multi-solution agent
+    parser.add_argument("--enable-parallel-eval", action="store_true",
+                       default=ENABLE_PARALLEL_EVAL,
+                       help=f"Enable parallel evaluation of examples (default: {ENABLE_PARALLEL_EVAL})")
+    parser.add_argument("--enable-code-predict", action="store_true",
+                       default=ENABLE_CODE_PREDICT,
+                       help=f"Enable code-predicted outputs during testing (default: {ENABLE_CODE_PREDICT})")
+    parser.add_argument("--enable-llm-predict", action="store_true",
+                       default=ENABLE_LLM_PREDICT,
+                       help=f"Enable LLM-predicted outputs during testing (default: {ENABLE_LLM_PREDICT})")
+    parser.add_argument("--enable-visual-cue", action="store_true",
+                       default=ENABLE_VISUAL_CUE,
+                       help=f"Generate and pass input/output images to the LLM (default: {ENABLE_VISUAL_CUE})")
+    parser.add_argument("--enable-rag-hint", action="store_true",
+                       default=ENABLE_RAG_HINT,
+                       help=f"Enable retrieval-augmented generation hints from past traces (default: {ENABLE_RAG_HINT})")
+    # Numeric workflow configuration exposed as CLI flags
+    parser.add_argument("--num-initial-solutions", type=int,
+                        default=NUM_INITIAL_SOLUTIONS,
+                        help=f"Number of initial solutions to generate (default: {NUM_INITIAL_SOLUTIONS})")
+    parser.add_argument("--num-loops", type=int,
+                        default=NUM_LOOPS,
+                        help=f"Number of main algorithm loops (default: {NUM_LOOPS})")
+    parser.add_argument("--num-seed-solutions", type=int,
+                        default=NUM_SEED_SOLUTIONS,
+                        help=f"Number of seed solutions to start from (default: {NUM_SEED_SOLUTIONS})")
+    parser.add_argument("--num-refinements", type=int,
+                        default=NUM_REFINEMENTS,
+                        help=f"Number of refinement rounds (default: {NUM_REFINEMENTS})")
+    parser.add_argument("--num-solutions-per-refinement", type=int,
+                        default=NUM_SOLUTIONS_PER_REFINEMENT,
+                        help=f"Solutions generated per refinement (default: {NUM_SOLUTIONS_PER_REFINEMENT})")
+    parser.add_argument("--num-fusions", type=int,
+                        default=NUM_FUSIONS,
+                        help=f"Number of fusion rounds (default: {NUM_FUSIONS})")
+    parser.add_argument("--num-solutions-per-fusion", type=int,
+                        default=NUM_SOLUTIONS_PER_FUSION,
+                        help=f"Solutions generated per fusion (default: {NUM_SOLUTIONS_PER_FUSION})")
     
     return parser.parse_args()
 
@@ -529,55 +655,82 @@ def main():
     llm = TokenTrackingLLM(initialize_llm_from_config(args.reasoning_model, use_vllm=args.use_vllm))
     if llm is None:
         return 1
-    coding_model = TokenTrackingLLM(initialize_llm_from_config(args.coding_model, use_vllm=args.use_vllm))
-    if coding_model is None:
+    transformation_llm = TokenTrackingLLM(initialize_llm_from_config(args.transformation_steps_model, use_vllm=args.use_vllm))
+    if transformation_llm is None:
+        return 1
+    code_llm = TokenTrackingLLM(initialize_llm_from_config(args.coding_model, use_vllm=args.use_vllm))
+    if code_llm is None:
         return 1
     
-    # Create output directory first
-    output_dir = create_output_directory()
+    # Create output directory first (generate timestamp here so other
+    # components can reuse it, e.g. for Qdrant collection naming)
+    run_timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
+    output_dir = create_output_directory(run_timestamp)
     print(f"Output directory: {output_dir}")
     
     # Load tasks and solutions
     try:
-        training_tasks = load_arc_tasks(args.TRAINING_TASKS_JSON)
-        training_solutions = load_arc_solutions(args.TRAINING_SOLUTIONS_JSON)
-        evaluation_tasks = load_arc_tasks(args.EVALUATION_TASKS_JSON)
-        evaluation_solutions = load_arc_solutions(args.EVALUATION_SOLUTIONS_JSON)
+        training_tasks = load_arc_tasks(args.training_tasks_json)
+        training_solutions = load_arc_solutions(args.training_solutions_json)
+        evaluation_tasks = load_arc_tasks(args.evaluation_tasks_json)
+        evaluation_solutions = load_arc_solutions(args.evaluation_solutions_json)
+        test_tasks = load_arc_tasks(args.test_tasks_json)
     except FileNotFoundError as e:
         print(f"Error: Could not load ARC data: {e}")
         return 1
 
-    # Determine which dataset to use based on evaluate-only flag
+    # Determine which dataset to use based on evaluate-only flag.
+    # - If `--evaluate-only` is set, use ONLY the evaluation dataset.
+    # - Otherwise, combine training and evaluation datasets so runs cover both.
     if getattr(args, 'evaluate_only', False):
         active_tasks = evaluation_tasks
         active_solutions = evaluation_solutions
         print("EVALUATE-ONLY mode: using evaluation dataset for all runs")
     else:
-        active_tasks = training_tasks
-        active_solutions = training_solutions
-    
-    # Save parameters
-    save_params(output_dir, args, args.reasoning_model)
-    
-    # Save task IDs
-    save_task_ids(output_dir, training_tasks, evaluation_tasks)
+        # Merge training + evaluation tasks + test tasks. Training entries will override
+        # identical task IDs from evaluation (if any) by updating with
+        # training after evaluation.
+        active_tasks = {}
+        active_tasks.update(evaluation_tasks or {})
+        active_tasks.update(training_tasks or {})
+        active_tasks.update(test_tasks or {})
 
-    # Create a MultiSolution agent for this run
+        # Merge solutions similarly, preferring training solutions when
+        # a task ID exists in both sets.
+        active_solutions = {}
+        active_solutions.update(evaluation_solutions or {})
+        active_solutions.update(training_solutions or {})
+
+        print("Using combined training + evaluation + test dataset for runs")
+    
+    # Save parameters (serialize args — includes model selections)
+    save_params(output_dir, args)
+
+    # Save task IDs (include test tasks as well)
+    save_task_ids(output_dir, training_tasks, evaluation_tasks, test_tasks)
+
+    # Initialize Qdrant Vector Store database if they are available
+    if args.enable_rag_hint:
+        initialize_qdrant_vector_store(database_dir=os.path.join(output_dir, "qdrant_db"), timestamp=run_timestamp)
+
+    # Create a MultiSolution agent for this run (use parsed flags to override defaults)
     print(f"Initialize the multi-solution LangGraph agent...")
     agent = ARCLangGraphAgent(
         llm=llm,
-        code_llm=coding_model,
-        num_initial_solutions=NUM_INITIAL_SOLUTIONS,
-        num_loops=NUM_LOOPS,
-        num_seed_solutions=NUM_SEED_SOLUTIONS,
-        num_refinements=NUM_REFINEMENTS,
-        num_solutions_per_refinement=NUM_SOLUTIONS_PER_REFINEMENT,
-        num_fusions=NUM_FUSIONS,
-        num_solutions_per_fusion=NUM_SOLUTIONS_PER_FUSION,
-        enable_parallel_eval=ENABLE_PARALLEL_EVAL,
-        enable_visual_cue=ENABLE_VISUAL_CUE,
-        enable_code_predict=ENABLE_CODE_PREDICT,
-        enable_llm_predict=ENABLE_LLM_PREDICT)
+        transformation_llm=transformation_llm,
+        code_llm=code_llm,
+        num_initial_solutions=getattr(args, 'num_initial_solutions', NUM_INITIAL_SOLUTIONS),
+        num_loops=getattr(args, 'num_loops', NUM_LOOPS),
+        num_seed_solutions=getattr(args, 'num_seed_solutions', NUM_SEED_SOLUTIONS),
+        num_refinements=getattr(args, 'num_refinements', NUM_REFINEMENTS),
+        num_solutions_per_refinement=getattr(args, 'num_solutions_per_refinement', NUM_SOLUTIONS_PER_REFINEMENT),
+        num_fusions=getattr(args, 'num_fusions', NUM_FUSIONS),
+        num_solutions_per_fusion=getattr(args, 'num_solutions_per_fusion', NUM_SOLUTIONS_PER_FUSION),
+        enable_parallel_eval=args.enable_parallel_eval,
+        enable_visual_cue=args.enable_visual_cue,
+        enable_rag_hint=args.enable_rag_hint,
+        enable_code_predict=args.enable_code_predict,
+        enable_llm_predict=args.enable_llm_predict)
 
     all_results = []
     task_ids_processed = []
@@ -585,28 +738,15 @@ def main():
     if args.mode == "single":
         # Single task test
         if args.task_id:
-            # When evaluate-only is set, only search evaluation tasks
-            if getattr(args, 'evaluate_only', False):
-                if args.task_id in evaluation_tasks:
-                    task_id = args.task_id
-                    task_data = evaluation_tasks[task_id]
-                    task_solution = evaluation_solutions.get(task_id)
-                else:
-                    print(f"Error: Task ID '{args.task_id}' not found in evaluation tasks (evaluate-only mode)")
-                    return 1
+            # Look up the requested task ID in the active dataset (which may be
+            # evaluation-only or the merged training+evaluation set).
+            if args.task_id in active_tasks:
+                task_id = args.task_id
+                task_data = active_tasks[task_id]
+                task_solution = active_solutions.get(task_id)
             else:
-                # Default behavior: prefer training tasks, fall back to evaluation tasks
-                if args.task_id in training_tasks:
-                    task_id = args.task_id
-                    task_data = training_tasks[task_id]
-                    task_solution = training_solutions.get(task_id)
-                elif args.task_id in evaluation_tasks:
-                    task_id = args.task_id
-                    task_data = evaluation_tasks[task_id]
-                    task_solution = evaluation_solutions.get(task_id)
-                else:
-                    print(f"Error: Task ID '{args.task_id}' not found")
-                    return 1
+                print(f"Error: Task ID '{args.task_id}' not found in the active dataset")
+                return 1
         elif args.task_index is not None:
             task_id, task_data, task_solution = get_task_by_index(active_tasks, active_solutions, args.task_index)
         else:
@@ -648,23 +788,25 @@ def main():
 
         def run_single_task(task_id: str):
             task_data = active_tasks[task_id]
-            task_solution = active_solutions.get(task_id)
+            task_solution = active_solutions.get(task_id, None)
 
             # Create a per-task multi-solution agent and attach helpers snapshot
             local_agent = ARCLangGraphAgent(
                 llm=llm,
-                code_llm=llm,
-                num_initial_solutions=NUM_INITIAL_SOLUTIONS,
-                num_loops=NUM_LOOPS,
-                num_seed_solutions=NUM_SEED_SOLUTIONS,
-                num_refinements=NUM_REFINEMENTS,
-                num_solutions_per_refinement=NUM_SOLUTIONS_PER_REFINEMENT,
-                num_fusions=NUM_FUSIONS,
-                num_solutions_per_fusion=NUM_SOLUTIONS_PER_FUSION,
-                enable_parallel_eval=ENABLE_PARALLEL_EVAL,
-                enable_visual_cue=ENABLE_VISUAL_CUE,
-                enable_code_predict=ENABLE_CODE_PREDICT,
-                enable_llm_predict=ENABLE_LLM_PREDICT)
+                transformation_llm=transformation_llm,
+                code_llm=code_llm,
+                num_initial_solutions=getattr(args, 'num_initial_solutions', NUM_INITIAL_SOLUTIONS),
+                num_loops=getattr(args, 'num_loops', NUM_LOOPS),
+                num_seed_solutions=getattr(args, 'num_seed_solutions', NUM_SEED_SOLUTIONS),
+                num_refinements=getattr(args, 'num_refinements', NUM_REFINEMENTS),
+                num_solutions_per_refinement=getattr(args, 'num_solutions_per_refinement', NUM_SOLUTIONS_PER_REFINEMENT),
+                num_fusions=getattr(args, 'num_fusions', NUM_FUSIONS),
+                num_solutions_per_fusion=getattr(args, 'num_solutions_per_fusion', NUM_SOLUTIONS_PER_FUSION),
+                enable_parallel_eval=args.enable_parallel_eval,
+                enable_visual_cue=args.enable_visual_cue,
+                enable_rag_hint=args.enable_rag_hint,
+                enable_code_predict=args.enable_code_predict,
+                enable_llm_predict=args.enable_llm_predict)
 
             start_time = time.time()
             result = local_agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)

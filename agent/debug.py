@@ -1,4 +1,13 @@
+"""Debug utilities using Python's logging system.
+
+Use logging.getLogger(__name__).debug() for debug output.
+The logging level is configured in run_langgraph_agent.py via the --debug flag.
+"""
+import logging
 from typing import Any
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
 # ANSI color codes for terminal output (used for debugging LLM prompts/responses)
 BLUE = "\033[34m"
@@ -21,22 +30,46 @@ def _unescape_escapes(text: str) -> str:
     except Exception:
         return text.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
 
-def print_prompt_and_response(prompt: str, response: Any) -> None:
-    """Print the LLM prompt and response with ANSI colors for easier reading in terminals."""
-    response_text = response.content if hasattr(response, 'content') else str(response)
+def print_prompt_and_response(prompt: str, response: str) -> None:
+    """Log the LLM prompt and response at DEBUG level.
+    
+    This will only show output when --debug flag is enabled.
+    Uses ANSI colors for easier reading in terminals.
+    """
+    # Only proceed if debug logging is enabled
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
 
+    # Check if either strings are None or empty
+    if not prompt:
+        prompt = "<EMPTY PROMPT>"
+    if not response:
+        response = "<EMPTY RESPONSE>"
+        
     # Convert any literal escape sequences into actual characters (e.g. "\\n" -> newline)
     prompt_to_print = _unescape_escapes(prompt)
-    response_to_print = _unescape_escapes(response_text)
+    response_to_print = _unescape_escapes(response)
 
-    # Print prompt and response with ANSI colors for easier reading in terminals
-    print(f"{BLUE}--- LLM Prompt ---{RESET}")
-    print(f"{BLUE}{prompt_to_print}{RESET}")
-    print(f"{GREEN}--- LLM Response ---{RESET}")
-    print(f"{GREEN}{response_to_print}{RESET}")
+    # Log prompt and response with ANSI colors
+    logger.debug(f"{BLUE}--- LLM Prompt ---{RESET}")
+    logger.debug(f"{BLUE}{prompt_to_print}{RESET}")
+    logger.debug(f"{GREEN}--- LLM Response ---{RESET}")
+    logger.debug(f"{GREEN}{response_to_print}{RESET}")
 
 def print_python_code(code: str) -> None:
-    """Print Python code with ANSI colors for easier reading in terminals."""
+    """Log generated Python code at DEBUG level.
+    
+    This will only show output when --debug flag is enabled.
+    Uses ANSI colors for easier reading in terminals.
+    """
+    # Only proceed if debug logging is enabled
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    
+    # Check if code string is None or empty
+    if not code:
+        code = "<EMPTY CODE>"
+        
     code_to_print = _unescape_escapes(code)
-    print(f"{YELLOW}--- Generated Python Code ---{RESET}")
-    print(f"{YELLOW}{code_to_print}{RESET}")
+    logger.debug(f"{YELLOW}--- Generated Python Code ---{RESET}")
+    logger.debug(f"{YELLOW}{code_to_print}{RESET}")

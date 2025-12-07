@@ -56,9 +56,10 @@ def generate_llm_predicted_output(llm,
         ]
 
         prompt = "\n".join(prompt_parts)
-
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, 'content') else str(response)
+
+        # print_prompt_and_response(prompt, response_text)
 
         # Prefer a fenced block labelled ```llm_predicted_output``` containing
         # the grid as lines of numbers (space-separated or run-together digits).
@@ -345,8 +346,8 @@ def generate_embedding_from_distilled_reasoning(distilled_text) -> List[float]:
         # Fall through to deterministic fallback
         pass
 
-    # Fallback: deterministic SHA-256 based vector (length = 768)
-    dim = 768
+    # Fallback: deterministic SHA-256 based vector (length = 1536 to match Qdrant collection)
+    dim = 1536
     seed = (distilled_text or "").encode('utf-8')
     vec = []
     for i in range(dim):
@@ -371,11 +372,10 @@ def store_record(record, qdrant_client=None, collection_name=None) -> bool:
     """Store a ReasoningTraceRecord into a Qdrant collection if available.
 
     - `record` may be a dataclass-like object (ReasoningTraceRecord) or a dict.
-    - If `qdrant_client` is not provided we will attempt to construct one by
-      importing `qdrant_client` and connecting to `http://localhost:6333`.
-    - If `collection_name` is not provided we will try to read the
-      `QDRANT_COLLECTION_NAME` environment variable or a nearby
-      `collection_info.json` file.
+    - If `qdrant_client` is not provided, we will try to import the global
+      QDRANT_CLIENT from run_langgraph_agent (which uses embedded Qdrant).
+    - If `collection_name` is not provided we will try to use the global
+      QDRANT_COLLECTION_NAME or read from environment/collection_info.json.
 
     Returns True on success (or when the store was skipped because qdrant is
     unavailable), False only on explicit failure to upsert when qdrant is
@@ -398,9 +398,20 @@ def store_record(record, qdrant_client=None, collection_name=None) -> bool:
         vector = _get(record, 'vector')
         point_id = _get(record, 'id') or str(uuid.uuid4())
 
-        # Determine collection name
+        # Try to get global client/collection from run_langgraph_agent module
+        if not qdrant_client:
+            try:
+                import run_langgraph_agent
+                qdrant_client = run_langgraph_agent.QDRANT_CLIENT
+                if not collection_name:
+                    collection_name = run_langgraph_agent.QDRANT_COLLECTION_NAME
+            except Exception:
+                pass
+
+        # Determine collection name from environment if still not set
         if not collection_name:
             collection_name = os.environ.get('QDRANT_COLLECTION_NAME')
+        
         # Try to locate collection_info.json if env var not set
         if not collection_name:
             try:
@@ -419,31 +430,50 @@ def store_record(record, qdrant_client=None, collection_name=None) -> bool:
                 pass
 
         # If no qdrant info available, silently skip storing (not an error)
-        if not qdrant_client and not collection_name:
+        if not qdrant_client or not collection_name:
+            # Provide debug info only on first call (avoid spam)
+            if not hasattr(store_record, '_warned'):
+                store_record._warned = True
+                print(f"Debug: store_record skipped - qdrant_client={'available' if qdrant_client else 'None'}, collection_name={collection_name or 'None'}")
             return False
-
-        # Lazily import/connect to qdrant if needed
-        if not qdrant_client:
-            try:
-                from qdrant_client import QdrantClient
-                qdrant_client = QdrantClient(url=os.environ.get('QDRANT_URL', 'http://localhost:6333'))
-            except Exception as e:
-                # Qdrant not available in this environment
-                return False
 
         # Prepare point and upsert
         try:
-            # Prefer the typed PointStruct when available
+            # Ensure point_id is a string (Qdrant requires string IDs)
+            point_id = str(point_id)
+            
+            # Try different import paths for PointStruct
+            PointStruct = None
             try:
-                from qdrant_client.http.models import PointStruct
+                from qdrant_client.http.models import PointStruct as PS
+                PointStruct = PS
+            except ImportError:
+                try:
+                    from qdrant_client.models import PointStruct as PS
+                    PointStruct = PS
+                except ImportError:
+                    pass
+            
+            if PointStruct is not None:
                 point = PointStruct(id=point_id, vector=vector, payload=payload)
                 qdrant_client.upsert(collection_name=collection_name, points=[point])
-            except Exception:
-                # Fallback: use dict shape accepted by many qdrant client versions
-                qdrant_client.upsert(collection_name=collection_name, points=[{"id": point_id, "vector": vector, "payload": payload}])
+            else:
+                # If PointStruct unavailable, use the client's upsert method directly with kwargs
+                qdrant_client.upsert(
+                    collection_name=collection_name,
+                    points=[
+                        {
+                            "id": point_id,
+                            "vector": vector,
+                            "payload": payload
+                        }
+                    ]
+                )
             return True
         except Exception as e:
             print(f"Warning: failed to upsert record to Qdrant collection '{collection_name}': {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     except Exception as e:
@@ -461,6 +491,16 @@ def retrieve_similar_distillations(vector: List[float], top_k: int = 5, qdrant_c
     try:
         if not vector:
             return []
+
+        # Try to get global client/collection from run_langgraph_agent module
+        if not qdrant_client:
+            try:
+                import run_langgraph_agent
+                qdrant_client = run_langgraph_agent.QDRANT_CLIENT
+                if not collection_name:
+                    collection_name = run_langgraph_agent.QDRANT_COLLECTION_NAME
+            except Exception:
+                pass
 
         # Determine collection name if not provided
         if not collection_name:
@@ -482,31 +522,67 @@ def retrieve_similar_distillations(vector: List[float], top_k: int = 5, qdrant_c
             except Exception:
                 pass
 
-        if not qdrant_client:
-            try:
-                from qdrant_client import QdrantClient
-                qdrant_client = QdrantClient(url=os.environ.get('QDRANT_URL', 'http://localhost:6333'))
-            except Exception:
-                return []
-
-        # Perform search (different client versions have slightly different APIs)
-        try:
-            # Preferred modern API
-            hits = qdrant_client.search(collection_name=collection_name, query_vector=vector, limit=top_k, with_payload=True, with_vector=False)
-        except TypeError:
-            # Older variants: positional args
-            try:
-                hits = qdrant_client.search(collection_name, vector, top_k, with_payload=True, with_vector=False)
-            except Exception:
-                # Try the very old http client method name
-                try:
-                    hits = qdrant_client.search_points(collection_name=collection_name, query_vector=vector, limit=top_k, with_payload=True)
-                except Exception as e:
-                    print(f"Warning: Qdrant search failed: {e}")
-                    return []
-        except Exception as e:
-            print(f"Warning: Qdrant search failed: {e}")
+        # If no qdrant client or collection available, return empty
+        if not qdrant_client or not collection_name:
             return []
+
+        # Perform search - embedded Qdrant uses different API
+        hits = []
+        try:
+            # Try the query method with proper parameters
+            results = qdrant_client.query(
+                collection_name=collection_name,
+                query_vector=vector,
+                limit=top_k
+            )
+            # results should be a list of ScoredPoint objects
+            hits = results
+        except (AttributeError, TypeError) as e:
+            # If query doesn't work, try using scroll + manual similarity
+            try:
+                # Get all points and manually compute similarities
+                import numpy as np
+                
+                # Scroll through collection
+                all_points, _ = qdrant_client.scroll(
+                    collection_name=collection_name,
+                    limit=100,  # Get more points to search through
+                    with_payload=True,
+                    with_vectors=True
+                )
+                
+                # Compute cosine similarities
+                query_vec = np.array(vector)
+                query_norm = np.linalg.norm(query_vec)
+                
+                scored_points = []
+                for point in all_points:
+                    try:
+                        point_vec = point.vector if hasattr(point, 'vector') else None
+                        if point_vec:
+                            point_vec_arr = np.array(point_vec)
+                            point_norm = np.linalg.norm(point_vec_arr)
+                            if query_norm > 0 and point_norm > 0:
+                                similarity = float(np.dot(query_vec, point_vec_arr) / (query_norm * point_norm))
+                            else:
+                                similarity = 0.0
+                            
+                            scored_points.append({
+                                'id': point.id if hasattr(point, 'id') else None,
+                                'score': similarity,
+                                'payload': point.payload if hasattr(point, 'payload') else {},
+                                'vector': point_vec
+                            })
+                    except Exception:
+                        continue
+                
+                # Sort by similarity and take top_k
+                scored_points.sort(key=lambda x: x['score'], reverse=True)
+                hits = scored_points[:top_k]
+                
+            except Exception as e2:
+                print(f"Warning: Qdrant search/scroll failed: {e}, {e2}")
+                return []
 
         results = []
         for h in hits or []:
@@ -567,15 +643,27 @@ def create_solutions_with_reasoning(llm, transformation_llm, code_llm,
             })
 
     # Step 1: Generate reasoning trace
-    reasoning_trace = generate_reasoning_trace(llm, training_examples) if not enable_visual_cue else generate_reasoning_trace(llm, training_examples, visual_cues=visual_cues)
+    reasoning_trace, reasoning_retries = (generate_reasoning_trace(llm, training_examples) if not enable_visual_cue 
+                                          else generate_reasoning_trace(llm, training_examples, visual_cues=visual_cues))
 
     # Step 2: Extract step-by-step transformation from reasoning
-    transformation_solutions_list = generate_transformation_steps(transformation_llm, reasoning_trace, training_examples, num_solutions)
+    transformation_solutions_list, transformation_retries = generate_transformation_steps(transformation_llm, reasoning_trace, training_examples, num_solutions)
 
     # Step 3: Generate Python code(s) based on reasoning and steps
     # Note: `generate_code_from_reasoning` may return multiple candidate code strings.
-    python_codes_list = generate_code_from_reasoning(code_llm, reasoning_trace, transformation_solutions_list,
-                                                     training_examples)
+    if not transformation_solutions_list:
+        python_codes_list = generate_code_from_reasoning(code_llm, reasoning_trace, training_examples)
+    else:
+        python_codes_list = generate_code_from_reasoning_and_transformations(code_llm, reasoning_trace, transformation_solutions_list,
+                                                                             training_examples)
+    # Trial-run + automatic fix: run candidates on a probe example and
+    # request fixes from the code LLM if needed. This logic is encapsulated
+    # in `test_and_fix_code_from_trial_run` which returns possibly-updated
+    # candidates and the trial run diagnostics.
+    try:
+        python_codes_list, trial_run_results = test_and_fix_code_from_trial_run(code_llm, python_codes_list, training_examples)
+    except Exception as e:
+        print(f"Warning: test_and_fix_code_from_trial_run failed: {e}")
     
     # Step 4: Create rag entry if enabled
     if enable_rag_hint:
@@ -611,10 +699,49 @@ def create_solutions_with_reasoning(llm, transformation_llm, code_llm,
             sol['_visual_cues'] = visual_cues
 
     # Return the list of candidate codes, plus reasoning and steps.
-    return python_codes_list, reasoning_trace, transformation_solutions_list, rag_entry
+    return python_codes_list, reasoning_trace, transformation_solutions_list, rag_entry, reasoning_retries, transformation_retries
 
-def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Optional[List[Dict]] = None) -> str:
-    """Generate detailed reasoning trace analyzing ARC patterns."""
+def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Optional[List[Dict]] = None, max_retries: int = 3) -> Tuple[str, int]:
+    """Generate detailed reasoning trace analyzing ARC patterns.
+    
+    Returns:
+        Tuple of (reasoning_trace, num_retries_used)
+    """
+    
+    def _flatten_content(c):
+        """Flatten various response content types to a single string."""
+        try:
+            if isinstance(c, str):
+                return c
+            if isinstance(c, dict):
+                # Common forms: {'content': '...'} or {'choices': [...]}
+                if 'content' in c and isinstance(c['content'], (str, list)):
+                    return _flatten_content(c['content'])
+                if 'choices' in c and isinstance(c['choices'], list):
+                    return '\n'.join(_flatten_content(ch) for ch in c['choices'])
+                return str(c)
+            if isinstance(c, (list, tuple)):
+                parts = []
+                for item in c:
+                    if isinstance(item, dict):
+                        # Message-like item with 'content' or 'type' fields
+                        if 'content' in item:
+                            parts.append(_flatten_content(item['content']))
+                            continue
+                        # Structured content items: {'type':'text','text':...} or {'type':'image',...}
+                        if item.get('type') == 'text' and 'text' in item:
+                            parts.append(str(item['text']))
+                            continue
+                        if item.get('type') == 'image':
+                            parts.append('[IMAGE]')
+                            continue
+                        parts.append(str(item))
+                    else:
+                        parts.append(str(item))
+                return '\n'.join([p for p in parts if p])
+            return str(c)
+        except Exception:
+            return str(c)
 
     def build_initial_reasoning_prompt(training_examples: List[Dict]) -> str:
         """Build prompt for generating detailed reasoning about ARC patterns."""
@@ -664,12 +791,37 @@ def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Op
     if visual_cues:
         pass
 
-    response = llm.invoke(prompt)
-    response_text = response.content
+    # Retry up to max_retries times if extraction fails
+    for attempt in range(max_retries):
+        try:
+            response = llm.invoke(prompt)
+            # Flatten content to handle list/dict/string responses
+            if hasattr(response, 'content'):
+                resp_content = response.content
+            else:
+                resp_content = response
+            
+            response_text = _flatten_content(resp_content)
+            # print_prompt_and_response(prompt, response_text)
 
-    # Extract reasoning from response
-    reasoning = extract_reasoning_content(response_text)
-    return reasoning if reasoning else "Unable to generate reasoning trace"
+            # Extract reasoning from response
+            reasoning = extract_reasoning_content(response_text)
+            if reasoning and reasoning != "Unable to generate reasoning trace":
+                return reasoning, attempt
+            
+            # If this isn't the last attempt, log and retry
+            if attempt < max_retries - 1:
+                print(f"Warning: Failed to extract reasoning content (attempt {attempt + 1}/{max_retries}). Retrying...")
+        
+        except Exception as e:
+            print(f"Warning: Error in generate_reasoning_trace (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print("Retrying...")
+            else:
+                traceback.print_exc()
+    
+    # After all retries failed
+    return "Unable to generate reasoning trace", max_retries
     
 
 def build_steps_text_from_transformation_steps(transformation_steps: List[str]) -> str:
@@ -683,11 +835,15 @@ def generate_reflection_reasoning_trace(llm,
                                         current_solution: CodeSolution,
                                         training_results: List[ExampleResult],
                                         training_examples: List[Dict],
-                                        enable_rag_hint: bool) -> str:
+                                        enable_rag_hint: bool,
+                                        max_retries: int = 3) -> Tuple[str, int]:
     """Generate a reflection-focused reasoning trace using the ARC-style reflection prompt.
 
     This is intended for refinement: it asks the model to analyze failures, explain
     what went wrong, and produce a reasoning trace focused on correcting the logic.
+    
+    Returns:
+        Tuple of (reasoning_trace, num_retries_used)
     """
     def build_refinement_reasoning_prompt() -> str:
         """Build reflection prompt based on ARC reflection prompt style for deep analysis."""
@@ -824,13 +980,8 @@ def generate_reflection_reasoning_trace(llm,
         prompt = "\n".join(prompt_parts)
         return prompt
 
-    prompt = build_refinement_reasoning_prompt(current_solution, training_results, training_examples)
-    response = llm.invoke(prompt)
-    if hasattr(response, 'content'):
-        resp_content = response.content
-    else:
-        resp_content = response
-
+    prompt = build_refinement_reasoning_prompt()
+    
     def _flatten_content(c):
         # Return a string representation of various response content shapes
         try:
@@ -868,12 +1019,28 @@ def generate_reflection_reasoning_trace(llm,
             return str(c)
         except Exception:
             return str(c)
+    
+    # Retry up to max_retries times if extraction fails
+    for attempt in range(max_retries):
+        response = llm.invoke(prompt)
+        if hasattr(response, 'content'):
+            resp_content = response.content
+        else:
+            resp_content = response
 
-    response_text = _flatten_content(resp_content)
+        response_text = _flatten_content(resp_content)
 
-    # Prefer structured reflection extraction first
-    reasoning = extract_reasoning_content(response_text)
-    return reasoning if reasoning else "Unable to generate reasoning trace"
+        # Prefer structured reflection extraction first
+        reasoning = extract_reasoning_content(response_text)
+        if reasoning and reasoning != "Unable to generate reasoning trace":
+            return reasoning, attempt
+        
+        # If this isn't the last attempt, log and retry
+        if attempt < max_retries - 1:
+            print(f"Warning: Failed to extract reflection reasoning content (attempt {attempt + 1}/{max_retries}). Retrying...")
+    
+    # After all retries failed
+    return "Unable to generate reasoning trace", max_retries
 
 def format_grid_for_analysis(grid: List[List[int]]) -> str: 
     """Format grid for detailed analysis in reasoning prompts."""
@@ -929,10 +1096,28 @@ def extract_reasoning_content(response_text: str) -> str:
     """Extract reasoning content from LLM response."""
     import re
     
+    # Ensure we have a string to work with
+    if not isinstance(response_text, str):
+        try:
+            # Try to convert to string if it's not already
+            if isinstance(response_text, (list, dict)):
+                response_text = str(response_text)
+            else:
+                response_text = str(response_text)
+        except Exception:
+            return "Unable to generate reasoning trace"
+    
+    if not response_text or not response_text.strip():
+        return "Unable to generate reasoning trace"
+    
     # Look for reasoning block
-    reasoning_match = re.search(r'```reasoning\s*(.*?)\s*```', response_text, re.DOTALL | re.IGNORECASE)
-    if reasoning_match:
-        return reasoning_match.group(1).strip()
+    try:
+        reasoning_match = re.search(r'```reasoning\s*(.*?)\s*```', response_text, re.DOTALL | re.IGNORECASE)
+        if reasoning_match:
+            return reasoning_match.group(1).strip()
+    except (TypeError, AttributeError) as e:
+        print(f"Warning: regex search failed in extract_reasoning_content: {e}")
+        # Continue to fallback extraction methods
     
     # Fallback: look for structured content
     patterns = [
@@ -943,25 +1128,33 @@ def extract_reasoning_content(response_text: str) -> str:
     ]
     
     reasoning_parts = []
-    for pattern in patterns:
-        match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
-        if match:
-            reasoning_parts.append(match.group(1).strip())
-    
-    if reasoning_parts:
-        return '\n\n'.join(reasoning_parts)
+    try:
+        for pattern in patterns:
+            match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
+            if match:
+                reasoning_parts.append(match.group(1).strip())
+        
+        if reasoning_parts:
+            return '\n\n'.join(reasoning_parts)
+    except (TypeError, AttributeError) as e:
+        print(f"Warning: pattern matching failed in extract_reasoning_content: {e}")
     
     # Ultimate fallback: return first substantial paragraph
-    lines = response_text.split('\n')
-    substantial_lines = [line.strip() for line in lines if len(line.strip()) > 20]
-    
-    return '\n'.join(substantial_lines[:10]) if substantial_lines else response_text[:500]
+    try:
+        lines = response_text.split('\n')
+        substantial_lines = [line.strip() for line in lines if len(line.strip()) > 20]
+        
+        return '\n'.join(substantial_lines[:10]) if substantial_lines else response_text[:500]
+    except Exception:
+        return response_text[:500] if len(response_text) > 500 else response_text
 
 
-def generate_transformation_steps(llm, reasoning_trace: str, training_examples: List[Dict], num_solutions: int) -> List[Dict]:
+def generate_transformation_steps(llm, reasoning_trace: str, training_examples: List[Dict], num_solutions: int, max_retries: int = 3) -> Tuple[List[Dict], int]:
     """Extract clear step-by-step transformation from reasoning trace.
 
-    Returns a list of solution objects: [{"solution_number": int, "transformation_steps": [str, ...]}, ...]
+    Returns:
+        Tuple of (solution_objects_list, num_retries_used)
+        Where solution_objects_list is [{"solution_number": int, "transformation_steps": [str, ...]}, ...]
     """
 
     def build_transformation_steps_prompt() -> str:
@@ -1014,24 +1207,37 @@ def generate_transformation_steps(llm, reasoning_trace: str, training_examples: 
         
     prompt = build_transformation_steps_prompt()
     
-    try:
-        response = llm.invoke(prompt, temperature=0.7)
-        response_text = response.content if hasattr(response, 'content') else str(response)
+    # Retry up to max_retries times if parsing fails
+    for attempt in range(max_retries):
+        try:
+            response = llm.invoke(prompt, temperature=0.7)
+            response_text = response.content if hasattr(response, 'content') else str(response)
+            
+            # print_prompt_and_response(prompt, response_text)
 
-        solutions = parse_transformation_steps(response_text)
-        if solutions:
-            return solutions
-        return [{"solution_number": 1, "transformation_steps": ["Unable to extract transformation steps"]}]
-        
-    except Exception as e:
-        print(f"Error extracting transformation steps: {e}")
-        return [{"solution_number": 1, "transformation_steps": [f"Error in step extraction: {str(e)}"]}]
+            solutions = parse_transformation_steps(response_text)
+            if solutions:
+                return solutions, attempt
+            
+            # If parsing failed and this isn't the last attempt, log and retry
+            if attempt < max_retries - 1:
+                print(f"Warning: Failed to parse transformation steps (attempt {attempt + 1}/{max_retries}). Retrying...")
+                
+        except Exception as e:
+            print(f"Error extracting transformation steps (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print("Retrying...")
+    
+    # After all retries failed, return empty list
+    return [], max_retries
 
 
-def generate_refined_transformation_steps(llm, reasoning_trace: str, sol: Dict, training_examples: List[Dict], num_solutions: int) -> List[Dict]:
+def generate_refined_transformation_steps(llm, reasoning_trace: str, sol: Dict, training_examples: List[Dict], num_solutions: int, max_retries: int = 3) -> Tuple[List[Dict], int]:
     """Extract refined step-by-step transformation from reasoning trace and previous solution failures.
 
-    Returns a list of solution objects: [{"solution_number": int, "transformation_steps": [str, ...]}, ...]
+    Returns:
+        Tuple of (solution_objects_list, num_retries_used)
+        Where solution_objects_list is [{"solution_number": int, "transformation_steps": [str, ...]}, ...]
     """
 
     def build_refined_transformation_steps_prompt() -> str:
@@ -1134,13 +1340,30 @@ def generate_refined_transformation_steps(llm, reasoning_trace: str, sol: Dict, 
         return prompt
 
     prompt = build_refined_transformation_steps_prompt()
-    response = llm.invoke(prompt, temperature=0.7)
-    response_text = response.content if hasattr(response, 'content') else str(response)
+    
+    # Retry up to max_retries times if parsing fails
+    for attempt in range(max_retries):
+        try:
+            response = llm.invoke(prompt, temperature=0.7)
+            response_text = response.content if hasattr(response, 'content') else str(response)
 
-    # print_prompt_and_response(prompt, response)
+            # print_prompt_and_response(prompt, response_text)
 
-    solutions = parse_transformation_steps(response_text)
-    return solutions
+            solutions = parse_transformation_steps(response_text)
+            if solutions:
+                return solutions, attempt
+            
+            # If parsing failed and this isn't the last attempt, log and retry
+            if attempt < max_retries - 1:
+                print(f"Warning: Failed to parse refined transformation steps (attempt {attempt + 1}/{max_retries}). Retrying...")
+                
+        except Exception as e:
+            print(f"Error extracting refined transformation steps (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print("Retrying...")
+    
+    # After all retries failed, return empty list
+    return [], max_retries
 
 def parse_transformation_steps(response_text: str) -> List[str]:
     """Parse transformation steps from LLM response."""
@@ -1234,7 +1457,108 @@ def parse_transformation_steps(response_text: str) -> List[str]:
     return [{"solution_number": 1, "transformation_steps": steps[:50]}]
 
 
-def generate_code_from_reasoning(code_llm, reasoning_trace: str, transformation_steps: List[str],
+def generate_code_from_reasoning(code_llm, reasoning_trace: str, training_examples: List[Dict], num_solutions: int, max_retries: int = 3) -> Tuple[List[str], int]:
+    """Generate Python code based on reasoning trace only (without transformation steps).
+
+    Returns:
+        Tuple of (python_codes_list, num_retries_used)
+    """
+
+    def build_code_from_reasoning_only_prompt(reasoning_trace: str, training_examples: List[Dict], num_solutions: int) -> str:
+        """Build prompt for generating Python code from reasoning only."""
+        prompt_parts = [
+            "You are a Python expert implementing ARC transformations.",
+            "",
+            "Given the following reasoning analysis, implement Python functions that solve the task.",
+            "",
+            "------------------",
+            "REASONING ANALYSIS",
+            "------------------",
+            f"{reasoning_trace}",
+            "",
+            "-----------------",
+            "TRAINING EXAMPLES",
+            "------------------",
+            f"{len(training_examples)} input-output example pairs are provided for validation.",
+            "",
+        ]
+        
+        for i, ex in enumerate(training_examples, 1):
+            prompt_parts.append(f"Example {i} Input:")
+            prompt_parts.append(format_grid_for_prompt(ex.get('input', [])))
+            prompt_parts.append(f"Example {i} Output:")
+            prompt_parts.append(format_grid_for_prompt(ex.get('output', [])))
+            prompt_parts.append("")
+        
+        prompt_parts.extend([
+            "---------------------------",
+            "IMPLEMENTATION REQUIREMENTS",
+            "---------------------------",
+            f"Produce {num_solutions} different candidate solutions based on the reasoning above.",
+            "For each solution:",
+            "1. Write a function called 'transform(input_grid)' that takes a 2D list of integers as input and returns a transformed 2D list of integers",
+            "2. Implement the transformation clearly and precisely based on the reasoning",
+            "3. Import any necessary standard libraries at the top for EACH solution",
+            "4. Include helper functions where necessary",
+            "5. DO NOT ADD ANY EXPLANATIONS OR COMMENTS IN THE CODE",
+            "6. Address any error cases or edge conditions mentioned in the reasoning to ensure correctness and robustness",
+            "7. Return ONLY executable Python code",
+            "The <count> will help you keep track of what-th solution you are at. Make sure you have all solutions implemented.",
+            "",
+            "Example structure:",
+            "<count>1</count>",
+            "<solution>",
+            "from typing import List",
+            "import ... # Import ANY necessary standard libraries to run the code here",
+            "def helper_function_1(...):",
+            "    # Add helper functions if needed",
+            "def helper_function_2(...):",
+            "    # Add helper functions if needed",
+            "def transform(input_grid):",
+            "    [implementation based on reasoning]",
+            "    return transformed_grid",
+            "</solution>",
+            "<count>2</count>",
+            "<solution>...</solution>",
+            "...",
+            "",
+            "Generate the Python code now:"
+        ])
+
+        prompt = "\n".join(prompt_parts)
+        return prompt
+
+    prompt = build_code_from_reasoning_only_prompt(reasoning_trace, training_examples, num_solutions)
+    
+    # Retry up to max_retries times if extraction fails
+    for attempt in range(max_retries):
+        try:
+            response = code_llm.invoke(prompt, temperature=0.3)
+            response_text = response.content if hasattr(response, 'content') else str(response)
+            # print_prompt_and_response(prompt, response_text)
+            
+            # Extract candidate python solutions (may be multiple)
+            candidate_codes = extract_python_solutions(response_text)
+            # Ensure common imports are present in each candidate code block
+            candidate_codes = [ensure_imports_in_code(c) for c in candidate_codes]
+            
+            if candidate_codes:
+                print(f"{len(candidate_codes)} candidate code solutions generated.")
+                return candidate_codes, attempt
+                
+        except Exception as e:
+            print(f"Warning: Failed to generate code from reasoning (attempt {attempt + 1}/{max_retries}). Error: {e}")
+        
+        # If this isn't the last attempt, log and retry
+        if attempt < max_retries - 1:
+            print(f"Warning: Retrying code generation (attempt {attempt + 1}/{max_retries})...")
+    
+    # After all retries failed, return empty list
+    print(f"Error: Failed to generate code from reasoning after {max_retries} attempts.")
+    return [], max_retries
+
+
+def generate_code_from_reasoning_and_transformations(code_llm, reasoning_trace: str, transformation_steps: List[str],
                                  training_examples: List[Dict]) -> str:
     """Generate Python code based on reasoning trace and transformation steps.
 
@@ -1285,7 +1609,7 @@ def generate_code_from_reasoning(code_llm, reasoning_trace: str, transformation_
             "---------------------------",
             "IMPLEMENTATION REQUIREMENTS",
             "---------------------------",
-            "For each solutions"
+            "For each solution",
             "1. Write a function called 'transform(input_grid)' that takes a 2D list of integers as input and returns a transformed 2D list of integers",
             "2. Implement each transformation step clearly and precisely",
             "3. Import any necessary standard libraries at the top for EACH solution",
@@ -1325,6 +1649,8 @@ def generate_code_from_reasoning(code_llm, reasoning_trace: str, transformation_
     try:
         response = code_llm.invoke(prompt, temperature=0.3)
         response_text = response.content if hasattr(response, 'content') else str(response)
+
+        # print_prompt_and_response(prompt, response_text)
         
         # Extract candidate python solutions (may be multiple)
         candidate_codes = extract_python_solutions(response_text)
@@ -1457,6 +1783,128 @@ def extract_python_solutions(response_text: str) -> List[str]:
             solutions.append(blk)
 
         return [s for s in solutions if s]
+
+
+def test_and_fix_code_from_trial_run(code_llm, python_codes_list: List[str], training_examples: List[Dict], probe_index: int = 0) -> Tuple[List[str], List[Dict]]:
+    """Run candidate codes on a training example, collect diagnostics,
+    and, if failures exist, ask the LLM to produce fixed implementations.
+
+    Returns a tuple: (possibly_updated_python_codes_list, trial_run_results)
+    """
+    python_codes_list = python_codes_list[:]  # Make a copy
+    trial_run_results: List[Dict] = []
+
+    # Quick exit if nothing to test
+    if not python_codes_list or not training_examples:
+        return python_codes_list, trial_run_results
+
+    example_index = 0
+    example_input = training_examples[example_index].get('input', [])
+
+    # Execute each candidate and record results/errors
+    for idx, code in enumerate(python_codes_list, start=1):
+        try:
+            src = ensure_imports_in_code(code)
+        except Exception:
+            src = code
+        result, error = execute_transformation_code(src, example_input)
+        trial_run_results.append({
+            'index': idx,
+            'code': src,
+            'predicted': result,
+            'error': error
+        })
+
+    # Collect failing candidates
+    errors = [r for r in trial_run_results if r.get('error')]
+    if not errors or not code_llm:
+        return python_codes_list, trial_run_results
+
+    # Build prompt for fixes
+    def build_fix_prompt():
+        parts = [
+            "You are an expert Python programmer tasked with fixing implementations of a function `transform(input_grid)` for the ARC task.",
+            "However, several candidate implementations have failed when tested against a training example.",
+            "Your job is to analyze each failing candidate, understand the error and produce a corrected implementation that runs successfully and produces output",
+        
+            "----------------",
+            "TRAINING EXAMPLE",
+            "----------------",
+            format_grid_for_prompt(example_input),
+            "",
+        ]
+
+        # Include per-candidate code and error info
+        for r in trial_run_results:
+            if r.get('error'):
+                parts.extend([
+                    f"CANDIDATE {r.get('index')} DETAILS",
+                    "Code:",
+                    r.get('code', '') or '',
+                    "",
+                ])
+                err_text = r.get('error') or ''
+                parts.extend([
+                    "Execution failed with error:",
+                    err_text if len(err_text) < 4000 else err_text[:4000]
+                ])
+
+        parts += [
+            "------------"
+            "INSTRUCTIONS",
+            "------------",
+            "- Only return fixed solutions for the candidates that failed. If a candidate already succeeded, you may paste the solution as is.",
+            "- Each solution must be a standalone Python code block that defines `transform(input_grid)` and any helpers it needs.",
+            "- Return solutions using the XML-like tags exactly as: <count>n</count> followed by <solution>...code...</solution>.",
+            "- Make sure you respect the original candidate numbering.",
+            "- Ensure that each solution includes any necessary imports at the top.",
+            "- Do NOT add any explanations or comments outside the code blocks.",
+            "",
+            "Example structure:",
+            "<count>1</count>",
+            "<solution>",
+            "from typing import List",
+            "import ... # Import ANY necessary standard libraries to run the code here",
+            "def helper_function_1(...):",
+            "    # Add helper functions if neeeded",
+            "def helper_function_2(...):",
+            "    # Add helper functions if needed",
+            "def transform(input_grid):",
+            "    [implementations of transformation steps]",
+            "    return transformed_grid",
+            "</solution>",
+            "<count>2</count>",
+            "<solution>...</solution>",
+            "...",
+            "",
+            "Generate the Python code now:",
+            "",
+        ]
+        return "\n".join(parts)
+
+    prompt = build_fix_prompt()
+    try:
+        response = code_llm.invoke(prompt, temperature=0.2)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        # print_prompt_and_response(prompt, response_text)
+    except Exception as e:
+        print(f"test_and_fix_code_from_trial_run: LLM invocation failed: {e}")
+        return python_codes_list, trial_run_results
+
+    fixed_solutions = extract_python_solutions(response_text)
+    if not fixed_solutions:
+        return python_codes_list, trial_run_results
+
+    # Normalize by ensuring imports are present and return
+    fixed_idx = 0
+    fixed_solutions = [ensure_imports_in_code(s) for s in fixed_solutions]
+    for r in trial_run_results:
+        idx = r.get('index', 0)
+        if r.get('error'):
+            if fixed_idx < len(fixed_solutions):
+                python_codes_list[idx - 1] = fixed_solutions[fixed_idx]
+                fixed_idx += 1
+    return python_codes_list, trial_run_results
 
 
 def extract_helpers_from_python_codes(python_codes: List[str]) -> List[Dict[str, str]]:
@@ -1839,14 +2287,17 @@ def refine_solutions_with_reasoning(llm,
     training_results: List[ExampleResult] = sol.get('training_results', []) or []
 
     # Step 1: Generate reflection reasoning that focuses on what went wrong
-    reasoning_trace = generate_reflection_reasoning_trace(llm, sol, training_results, training_examples, enable_rag_hint)
+    reasoning_trace, reasoning_retries = generate_reflection_reasoning_trace(llm, sol, training_results, training_examples, enable_rag_hint)
     sol['reasoning_trace'] = reasoning_trace
 
     # Step 2: Extract transformation steps from the reflection reasoning
-    transformation_solutions_list = generate_refined_transformation_steps(transformation_llm, reasoning_trace, sol, training_examples, num_refined_solutions)
-
+    transformation_solutions_list, transformation_retries = generate_refined_transformation_steps(transformation_llm, reasoning_trace, sol, training_examples, num_refined_solutions)
+    
     # Step 3: Generate candidate code implementations
-    python_codes_list = generate_code_from_reasoning(code_llm, reasoning_trace, transformation_solutions_list, training_examples)
+    if not transformation_solutions_list:
+        python_codes_list = generate_code_from_reasoning(code_llm, reasoning_trace, training_examples)
+    else:
+        python_codes_list = generate_code_from_reasoning_and_transformations(code_llm, reasoning_trace, transformation_solutions_list, training_examples)
     
     # Step 4: Create rag entry if enabled
     if enable_rag_hint:
@@ -1866,9 +2317,8 @@ def refine_solutions_with_reasoning(llm,
         # If qdrant is not available this will be a no-op and will not raise.
         try:
             stored = store_record(rag_entry)
-            if not stored:
-                # Quietly continue if storing was skipped or unavailable
-                pass
+            if stored:
+                print(f"✓ Stored refined RAG entry (concepts: {len(rag_entry.concepts)}, helpers: {len(rag_entry.helpers)})")
         except Exception as e:
             print(f"Warning: store_record raised an exception: {e}")
     else:
@@ -1880,7 +2330,7 @@ def refine_solutions_with_reasoning(llm,
         pass
 
     # Return the list of candidate codes, plus reasoning and steps.
-    return python_codes_list, reasoning_trace, transformation_solutions_list, rag_entry
+    return python_codes_list, reasoning_trace, transformation_solutions_list, rag_entry, reasoning_retries, transformation_retries
 
 def extract_reasoning_from_reflection(response_content: str) -> str:
     """Extract reasoning section from ARC-style reflection response."""
@@ -1978,12 +2428,16 @@ def generate_fused_reasoning_trace(llm,
                                    training_results1: List[ExampleResult],
                                    training_results2: List[ExampleResult],
                                    training_examples: List[Dict],
-                                   enable_rag_hint: bool) -> str:
+                                   enable_rag_hint: bool,
+                                   max_retries: int = 3) -> Tuple[str, int]:
     """Generate a fused reasoning trace that reconciles two candidate solutions.
 
     The prompt includes both solutions' reasoning, transformation steps, code (if available),
     and the training results. The LLM is asked to produce a single, coherent reasoning
     trace that explains how to combine their strengths and address their failure modes.
+    
+    Returns:
+        Tuple of (reasoning_trace, num_retries_used)
     """
     def build_fused_reasoning_trace_prompt():
         reasoning_a = sola.get('reasoning_trace') or "(no reasoning)"
@@ -2003,7 +2457,11 @@ def generate_fused_reasoning_trace(llm,
             vectora = sola.get('vector')
             vectorb = solb.get('vector')
             entries_a = retrieve_similar_distillations(vector=vectora, top_k=5)
+            if entries_a:
+                print("✓ Retrieved RAG entries for Solution A")
             entries_b = retrieve_similar_distillations(vector=vectorb, top_k=5)
+            if entries_b:
+                print("✓ Retrieved RAG entries for Solution B")
 
             rag_concepts = set()
             for entry in entries_a + entries_b:
@@ -2015,6 +2473,8 @@ def generate_fused_reasoning_trace(llm,
                     concepts = []
                 for c in concepts:
                     rag_concepts.add(c)
+            if rag_concepts:
+                print(f"✓ Found {len(rag_concepts)} RAG concepts for fused reasoning prompt")
         
         if rag_concepts:
             rag_hints_parts = [
@@ -2076,12 +2536,25 @@ def generate_fused_reasoning_trace(llm,
     prompt = build_fused_reasoning_trace_prompt()
     # If visual cues are provided and the llm driver supports image messages,
     # send a structured message containing the images (base64 data URLs).
-    response = llm.invoke(prompt)
+    
+    # Retry up to max_retries times if extraction fails
+    for attempt in range(max_retries):
+        response = llm.invoke(prompt)
 
-    # Extract reasoning from response
-    response_text = response.content if hasattr(response, 'content') else str(response)
-    reasoning = extract_reasoning_content(response_text)
-    return reasoning if reasoning else "Unable to generate reasoning trace"
+        # Extract reasoning from response
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        print_prompt_and_response(prompt, response_text)
+
+        reasoning = extract_reasoning_content(response_text)
+        if reasoning and reasoning != "Unable to generate reasoning trace":
+            return reasoning, attempt
+        
+        # If this isn't the last attempt, log and retry
+        if attempt < max_retries - 1:
+            print(f"Warning: Failed to extract fused reasoning content (attempt {attempt + 1}/{max_retries}). Retrying...")
+    
+    # After all retries failed
+    return "Unable to generate reasoning trace", max_retries
 
 
 def generate_fused_transformation_steps(llm,
@@ -2091,10 +2564,13 @@ def generate_fused_transformation_steps(llm,
                                         training_results_a: List[ExampleResult],
                                         training_results_b: List[ExampleResult],
                                         training_examples: List[Dict],
-                                        num_solutions: int) -> List[Dict]:
+                                        num_solutions: int,
+                                        max_retries: int = 3) -> Tuple[List[Dict], int]:
     """Generate candidate fused transformation step sequences from a fused reasoning prompt.
 
-    Returns a list of solution dicts in the same shape as `generate_transformation_steps`.
+    Returns:
+        Tuple of (solution_objects_list, num_retries_used)
+        Where solution_objects_list is [{{"solution_number": int, "transformation_steps": [str, ...]}}, ...]
     """
     def build_fused_transformation_steps_prompt() -> str:
         steps_text_a = build_steps_text_from_transformation_steps(sola.get('step_by_step_transformation') or [])
@@ -2186,10 +2662,27 @@ def generate_fused_transformation_steps(llm,
         return "\n".join(parts)
 
     prompt = build_fused_transformation_steps_prompt()
-    response = llm.invoke(prompt, temperature=0.7)
-    response_text = response.content if hasattr(response, 'content') else str(response)
-    solutions = parse_transformation_steps(response_text)
-    return solutions
+    
+    # Retry up to max_retries times if parsing fails
+    for attempt in range(max_retries):
+        try:
+            response = llm.invoke(prompt, temperature=0.7)
+            response_text = response.content if hasattr(response, 'content') else str(response)
+            # print_prompt_and_response(prompt, response_text)
+            solutions = parse_transformation_steps(response_text)
+            
+            if solutions:
+                return solutions, attempt
+                
+        except Exception as e:
+            print(f"Warning: Failed to generate fused transformation steps (attempt {attempt + 1}/{max_retries}). Error: {e}")
+        
+        # If this isn't the last attempt, log and retry
+        if attempt < max_retries - 1:
+            print(f"Warning: Failed to parse fused transformation steps (attempt {attempt + 1}/{max_retries}). Retrying...")
+    
+    # After all retries failed, return empty list
+    return [], max_retries
 
 
 def fuse_solutions_with_reasoning(llm,
@@ -2215,13 +2708,16 @@ def fuse_solutions_with_reasoning(llm,
     trb = solb.get('training_results') or []
 
     # 1) Generate fused reasoning trace
-    fused_reasoning = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples, enable_rag_hint)
+    fused_reasoning, reasoning_retries = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples, enable_rag_hint)
 
     # 2) Generate fused transformation steps
-    fused_transformation_solutions = generate_fused_transformation_steps(transformation_llm, fused_reasoning, sola, solb, tra, trb, training_examples, num_fused_solutions)
+    fused_transformation_solutions, transformation_retries = generate_fused_transformation_steps(transformation_llm, fused_reasoning, sola, solb, tra, trb, training_examples, num_fused_solutions)
 
     # 3) Generate candidate Python implementations from fused reasoning and steps
-    python_codes_list = generate_code_from_reasoning(code_llm, fused_reasoning, fused_transformation_solutions, training_examples)
+    if not fused_transformation_solutions:
+        python_codes_list = generate_code_from_reasoning(code_llm, fused_reasoning, training_examples)
+    else:
+        python_codes_list = generate_code_from_reasoning_and_transformations(code_llm, fused_reasoning, fused_transformation_solutions, training_examples)
 
     # Step 4: Create rag entry if enabled
     if enable_rag_hint:
@@ -2241,12 +2737,9 @@ def fuse_solutions_with_reasoning(llm,
         # If qdrant is not available this will be a no-op and will not raise.
         try:
             stored = store_record(rag_entry)
-            if not stored:
-                # Quietly continue if storing was skipped or unavailable
-                pass
+            if stored:
+                print(f"✓ Stored fused RAG entry (concepts: {len(rag_entry.concepts)}, helpers: {len(rag_entry.helpers)})")
         except Exception as e:
             print(f"Warning: store_record raised an exception: {e}")
-    else:
-        rag_entry = None
 
-    return python_codes_list, fused_reasoning, fused_transformation_solutions, rag_entry
+    return python_codes_list, fused_reasoning, fused_transformation_solutions, rag_entry, reasoning_retries, transformation_retries

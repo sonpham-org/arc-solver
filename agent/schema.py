@@ -93,8 +93,9 @@ class AgentState(TypedDict):
     """Main state for the ARC LangGraph Agent workflow."""
     
     # Task information (immutable)
-    task_id: Annotated[str, take_first]
+    task_id: str
     task_data: Annotated[Dict[str, Any], immutable_dict]
+    task_folder: str
 
     # Runtime visual flag: prefer the latest provided value (allow agent to set)
     enable_visual_cue: Annotated[bool, take_latest]
@@ -114,6 +115,7 @@ class AgentState(TypedDict):
     num_solutions_per_refinement: Annotated[Optional[int], take_latest]
     num_fusions: Annotated[Optional[int], take_latest]
     num_solutions_per_fusion: Annotated[Optional[int], take_latest]
+    num_retries: int
 
     # Generations of mutated solutions
     current_generation: Annotated[Optional[int], take_latest]
@@ -124,6 +126,7 @@ class AgentState(TypedDict):
     enable_code_predict: Annotated[bool, take_latest]
     enable_llm_predict: Annotated[bool, take_latest]
     enable_parallel_eval: Annotated[bool, take_latest]
+    enable_rag_hint: Annotated[bool, take_latest]
     
     # Additional metadata
     metadata: Annotated[Dict[str, Any], lambda x, y: {**x, **y}]  # Merge metadata dicts

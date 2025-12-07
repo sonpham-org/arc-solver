@@ -34,6 +34,9 @@ import sys as _sys
 import time
 import concurrent.futures
 import threading
+import signal
+import atexit
+import logging
 from typing import Dict, List, Any, Tuple, Optional
 
 # Add the project root to the path for imports
@@ -67,9 +70,9 @@ except Exception:
 # For fast local debugging prefer an Ollama-hosted local model (free/local).
 # Reasoning model is used for reasoning & reflection
 # Coding model is used for code generation & execution
-REASONING_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
-TRANSFORMATION_STEPS_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
-CODING_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+REASONING_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+TRANSFORMATION_STEPS_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+CODING_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
 USE_VLLM = False
 
 # Test mode configuration
@@ -81,28 +84,38 @@ TASK_ID = None  # Specific task ID to test (for single mode)
 TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
-NUM_TASKS = 20  # Number of tasks for batch mode
+NUM_TASKS = 100  # Number of tasks for batch mode
+EVALUATE_ONLY = True
 
 # Processing configuration
-MAX_ATTEMPTS = 3  # Maximum attempts per task
+MAX_ATTEMPTS = 10  # Maximum attempts per task
 RANDOM_SEED = 42  # Random seed for reproducibility
+DEBUG = False  # Enable debug logging (prompts, responses, code generation)
 
-ENABLE_PARALLEL_EVAL = True  # Whether to enable parallel evaluation of examples
+ENABLE_PARALLEL_EVAL = False  # Whether to enable parallel evaluation of examples
 ENABLE_CODE_PREDICT = True  # Whether to enable code-predicted outputs during testing
 ENABLE_LLM_PREDICT = False # Whether to enable LLM-predicted outputs during testing
 ENABLE_VISUAL_CUE = False  # When True, generate and pass input/output images to the LLM
-ENABLE_RAG_HINT = False  # When True, enable retrieval-augmented generation hints from past reasoning traces
+ENABLE_RAG_HINT = True  # When True, enable retrieval-augmented generation hints from past reasoning traces
 
 NUM_INITIAL_SOLUTIONS = 10
-NUM_LOOPS = 3
+NUM_LOOPS = 5
 NUM_SEED_SOLUTIONS = 10
 NUM_REFINEMENTS = 2
 NUM_SOLUTIONS_PER_REFINEMENT = 5
 NUM_FUSIONS = 2
 NUM_SOLUTIONS_PER_FUSION = 5
+RECURSION_LIMIT = 50  # LangGraph recursion limit (default is 25, increase for long workflows)
 
 # Year selection for ARC dataset directory (change to 2025 if using 2025 data)
-YEAR = 2025
+YEAR = 2024
+ 
+# Optional resume run identifier used when starting the script. If set to
+# 'latest' the runner will resume the most recent folder under
+# `output/output_agent`. If set to a specific folder name, the runner will
+# attempt to resume that folder. When `None`, a new timestamped output
+# folder is created for the run.
+RESUME_RUN = None
 
 # Default ARC JSON paths (will be exposed as argparse defaults)
 TRAINING_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_training_challenges.json"
@@ -120,6 +133,36 @@ TEST_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_test_challenges.json"
 QDRANT_CLIENT = None
 QDRANT_COLLECTION_NAME = None
 QDRANT_AVAILABLE = globals().get('QDRANT_AVAILABLE', False)
+
+
+def setup_logging(debug: bool = False) -> None:
+    """Configure logging for the entire application.
+    
+    When debug=True, sets logging to DEBUG level and shows detailed LLM interactions.
+    When debug=False, sets logging to INFO level for normal operation.
+    
+    This only needs to be called once at startup. All modules that import logging
+    will automatically use this configuration.
+    """
+    level = logging.DEBUG if debug else logging.INFO
+    
+    # Configure root logger
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        force=True  # Override any existing configuration
+    )
+    
+    # Set level for agent modules specifically
+    logging.getLogger('agent').setLevel(level)
+    logging.getLogger('agent.actions').setLevel(level)
+    logging.getLogger('agent.debug').setLevel(level)
+    
+    if debug:
+        logging.info("Debug logging enabled - will show LLM prompts and responses")
+    else:
+        logging.info("Normal logging enabled - use --debug for detailed output")
 
 
 def load_arc_tasks(file_path: str) -> Dict[str, Dict]:
@@ -214,11 +257,17 @@ def save_task_ids(output_dir: str, training_tasks: Dict, evaluation_tasks: Dict,
             f.write(f"{task_id}\n")
 
 
-def initialize_qdrant_vector_store(database_dir: str, timestamp: Optional[str] = None):
+def initialize_qdrant_vector_store(database_dir: str, timestamp: Optional[str] = None, resume: bool = False):
     """Initialize a Qdrant vector collection for reasoning traces.
 
+    Uses embedded (file-based) Qdrant client that doesn't require external service.
     Creates a timestamped collection name (so multiple runs can coexist)
     and writes a small `collection_info.json` file under `database_dir`.
+
+    Args:
+        database_dir: Directory to store Qdrant database files
+        timestamp: Optional timestamp for collection naming
+        resume: If True, attempt to load existing collection from database_dir
 
     Returns a tuple `(client, collection_name)` on success, or `None` on failure.
     """
@@ -232,35 +281,70 @@ def initialize_qdrant_vector_store(database_dir: str, timestamp: Optional[str] =
     except Exception:
         pass
 
-    # Use provided timestamp (preferred) or generate one for the collection name
-    if timestamp:
-        # normalize timestamp for collection name (remove separators)
-        ts = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H-%M-%S-%f").strftime("%Y%m%dT%H%M%S%f")
-    else:
-        ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
-
-    collection_name = f"arc_reasoning_{ts}"
-
     try:
-        client = QdrantClient(host="localhost", port=6333)
+        # Use embedded (file-based) Qdrant - no external service needed!
+        # This persists to disk and starts/stops automatically
+        client = QdrantClient(path=database_dir)
+        print(f"Initialized embedded Qdrant client at: {database_dir}")
 
-        # Recreate collection so schema is deterministic for this run
-        client.recreate_collection(
-            collection_name=collection_name,
-            vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
-        )
+        # Check if resuming from existing database
+        collection_name = None
+        if resume:
+            # Try to load existing collection info
+            info_path = os.path.join(database_dir, "collection_info.json")
+            if os.path.exists(info_path):
+                try:
+                    with open(info_path, 'r') as f:
+                        info = json.load(f)
+                        collection_name = info.get('collection_name')
+                        
+                    # Verify collection exists
+                    if collection_name and client.collection_exists(collection_name):
+                        print(f"Resuming existing Qdrant collection: {collection_name}")
+                        QDRANT_CLIENT = client
+                        QDRANT_COLLECTION_NAME = collection_name
+                        return client, collection_name
+                    else:
+                        print(f"Collection '{collection_name}' not found in database, creating new...")
+                        collection_name = None
+                except Exception as e:
+                    print(f"Could not resume Qdrant collection: {e}")
+                    collection_name = None
 
-        # Persist collection info for later lookup
-        info = {"collection_name": collection_name, "timestamp": ts}
-        try:
-            with open(os.path.join(database_dir, "collection_info.json"), 'w') as f:
-                json.dump(info, f)
-        except Exception:
-            pass
+        # Create new collection if not resuming or resume failed
+        if not collection_name:
+            # Use provided timestamp (preferred) or generate one for the collection name
+            if timestamp:
+                # normalize timestamp for collection name (remove separators)
+                ts = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H-%M-%S-%f").strftime("%Y%m%dT%H%M%S%f")
+            else:
+                ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+
+            collection_name = f"arc_reasoning_{ts}"
+
+            # Check if collection exists (shouldn't for new timestamps, but be safe)
+            if client.collection_exists(collection_name):
+                print(f"Collection {collection_name} already exists, deleting...")
+                client.delete_collection(collection_name=collection_name)
+
+            # Create the collection with the desired vector schema
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+            )
+
+            # Persist collection info for later lookup
+            info = {"collection_name": collection_name, "timestamp": ts}
+            try:
+                with open(os.path.join(database_dir, "collection_info.json"), 'w') as f:
+                    json.dump(info, f)
+            except Exception:
+                pass
+
+            print(f"Created new Qdrant collection: {collection_name}")
 
         QDRANT_CLIENT = client
         QDRANT_COLLECTION_NAME = collection_name
-        print(f"Initialized Qdrant collection: {collection_name}")
         return client, collection_name
 
     except Exception as e:
@@ -268,8 +352,37 @@ def initialize_qdrant_vector_store(database_dir: str, timestamp: Optional[str] =
         return None
 
 
-def save_task_result(output_dir: str, task_id: str, result: Dict[str, Any]) -> None:
-    """Save individual task result to JSON file."""
+def cleanup_qdrant():
+    """Cleanup function to gracefully close Qdrant client."""
+    global QDRANT_CLIENT
+    if QDRANT_CLIENT is not None:
+        try:
+            # Embedded Qdrant client closes automatically, but we can explicitly close
+            if hasattr(QDRANT_CLIENT, 'close'):
+                QDRANT_CLIENT.close()
+            print("\nClosed Qdrant client successfully")
+        except Exception as e:
+            print(f"\nError closing Qdrant client: {e}")
+        finally:
+            QDRANT_CLIENT = None
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C and other termination signals gracefully."""
+    print("\n\nReceived interrupt signal, cleaning up...")
+    cleanup_qdrant()
+    sys.exit(0)
+
+
+def save_task_result(task_folder: str, result: Dict[str, Any]) -> None:
+    """Save individual task result to JSON file.
+
+    `task_folder` must be the full path to the per-task output directory
+    (typically `os.path.join(output_dir, task_id)`). The function will
+    ensure the folder exists and write `<task_id>.json` inside it. If the
+    task_id cannot be inferred from the `result`, the folder basename will
+    be used as the task id.
+    """
     def grid_to_string_lines(grid: Optional[List[List[Any]]]) -> List[str]:
         """Convert a 2D grid of values into a list of string lines for easy viewing."""
         if not grid:
@@ -300,35 +413,37 @@ def save_task_result(output_dir: str, task_id: str, result: Dict[str, Any]) -> N
             visual_files = []
             if isinstance(trans, dict) and trans.get('_visual_cues'):
                 import base64
-                # Ensure per-task folder exists
-                task_folder = os.path.join(output_dir, task_id)
+
+                # Ensure provided per-task folder exists
                 try:
                     os.makedirs(task_folder, exist_ok=True)
                 except Exception:
-                    task_folder = output_dir
+                    pass
 
                 for vc in trans.get('_visual_cues'):
                     ex_idx = vc.get('example_index')
                     in_b64 = vc.get('input_b64')
                     out_b64 = vc.get('output_b64')
+                    # Derive task_id for filenames: prefer result's task_id if present
+                    task_id_for_name = result.get('task_id') or os.path.basename(task_folder)
                     if in_b64:
                         try:
                             img_bytes = base64.b64decode(in_b64)
-                            fname_in = f"{task_id}_sol{si}_ex{ex_idx}_input.png"
+                            fname_in = f"{task_id_for_name}_sol{si}_ex{ex_idx}_input.png"
                             fpath_in = os.path.join(task_folder, fname_in)
                             with open(fpath_in, 'wb') as imgf:
                                 imgf.write(img_bytes)
-                            visual_files.append(os.path.join(task_id, fname_in) if task_folder != output_dir else fname_in)
+                            visual_files.append(os.path.join(os.path.basename(task_folder), fname_in))
                         except Exception:
                             pass
                     if out_b64:
                         try:
                             img_bytes = base64.b64decode(out_b64)
-                            fname_out = f"{task_id}_sol{si}_ex{ex_idx}_expected.png"
+                            fname_out = f"{task_id_for_name}_sol{si}_ex{ex_idx}_expected.png"
                             fpath_out = os.path.join(task_folder, fname_out)
                             with open(fpath_out, 'wb') as imgf:
                                 imgf.write(img_bytes)
-                            visual_files.append(os.path.join(task_id, fname_out) if task_folder != output_dir else fname_out)
+                            visual_files.append(os.path.join(os.path.basename(task_folder), fname_out))
                         except Exception:
                             pass
             if visual_files:
@@ -336,13 +451,15 @@ def save_task_result(output_dir: str, task_id: str, result: Dict[str, Any]) -> N
         except Exception:
             pass
 
-    # Ensure the JSON is saved inside the per-task folder for easier inspection by the visualizer
-    task_folder = os.path.join(output_dir, task_id)
+    # Ensure the JSON is saved inside the supplied per-task folder
     try:
         os.makedirs(task_folder, exist_ok=True)
-        out_path = os.path.join(task_folder, f"{task_id}.json")
     except Exception:
-        out_path = os.path.join(output_dir, f"{task_id}.json")
+        pass
+
+    # Try to determine the task_id; fall back to folder basename
+    task_id = result.get('task_id') or os.path.basename(task_folder)
+    out_path = os.path.join(task_folder, f"{task_id}.json")
 
     with open(out_path, 'w') as f:
         json.dump(result, f, indent=2)
@@ -499,8 +616,8 @@ def summarize_and_print_result(result: Dict[str, Any], task_id: Optional[str] = 
     print(f"    Training Priority Score: {(highest_priority_score or 0.0):.1f}%  Overlap Score: {(highest_overlap_score or 0.0):.1f}%")
     print(f"    Testing Priority Score: {(highest_testing_priority_score or 0.0):.1f}%  Testing Overlap Score: {(highest_testing_overlap_score or 0.0):.1f}%")
 
-def print_summary(agent: ARCLangGraphAgent, all_results: List[Dict[str, Any]], task_ids: List[str], model_name: Optional[str] = None) -> Dict[str, Any]:
-    """Save summary of all task results to summary.json."""
+def print_summary(agent: ARCLangGraphAgent, all_results: List[Dict[str, Any]], task_ids: List[str], output_dir: str, reasoning_model: Optional[str] = None, transformation_model: Optional[str] = None, coding_model: Optional[str] = None) -> Dict[str, Any]:
+    """Print and save summary of all task results to summary.json."""
     total_tasks = len(all_results)
     workflow_completions = sum(1 for r in all_results if r.get('workflow_completed'))
     num_tests_successful = sum(1 for r in all_results if r.get('highest_testing_solution_priority_score', 0) >= 1.0)
@@ -514,53 +631,131 @@ def print_summary(agent: ARCLangGraphAgent, all_results: List[Dict[str, Any]], t
     print(f"Number of tests fully successful: {num_tests_successful}")
     print(f"Test success rate: {num_tests_successful / total_tasks * 100:.1f}%")
     print(f"{'='*80}\n")
-    # Token usage & cost summary (if the agent exposes a TokenTrackingLLM)
+    
+    # Build summary dictionary
+    summary = {
+        'total_tasks': total_tasks,
+        'workflow_completions': workflow_completions,
+        'workflow_completion_rate': workflow_completions / total_tasks * 100 if total_tasks > 0 else 0.0,
+        'num_tests_successful': num_tests_successful,
+        'test_success_rate': num_tests_successful / total_tasks * 100 if total_tasks > 0 else 0.0,
+        'task_ids': task_ids,
+        'models': {
+            'reasoning': reasoning_model,
+            'transformation': transformation_model,
+            'code': coding_model
+        }
+    }
+    
+    # Token usage & cost summary for all 3 LLMs
     try:
-        token_counts = None
+        # Collect token counts from all three LLMs
+        llm_counts = {}
+        total_input = 0
+        total_output = 0
+        total_tokens = 0
+        
+        # Reasoning LLM
         if hasattr(agent, 'llm') and hasattr(agent.llm, 'get_token_counts'):
-            token_counts = agent.llm.get_token_counts()
-        elif hasattr(agent, 'get_token_counts'):
-            token_counts = agent.get_token_counts()
+            llm_counts['reasoning'] = agent.llm.get_token_counts()
+            total_input += llm_counts['reasoning'].get('input_tokens', 0)
+            total_output += llm_counts['reasoning'].get('output_tokens', 0)
+            total_tokens += llm_counts['reasoning'].get('total_tokens', 0)
+        
+        # Transformation LLM
+        if hasattr(agent, 'transformation_llm') and hasattr(agent.transformation_llm, 'get_token_counts'):
+            llm_counts['transformation'] = agent.transformation_llm.get_token_counts()
+            total_input += llm_counts['transformation'].get('input_tokens', 0)
+            total_output += llm_counts['transformation'].get('output_tokens', 0)
+            total_tokens += llm_counts['transformation'].get('total_tokens', 0)
+        
+        # Code LLM
+        if hasattr(agent, 'code_llm') and hasattr(agent.code_llm, 'get_token_counts'):
+            llm_counts['code'] = agent.code_llm.get_token_counts()
+            total_input += llm_counts['code'].get('input_tokens', 0)
+            total_output += llm_counts['code'].get('output_tokens', 0)
+            total_tokens += llm_counts['code'].get('total_tokens', 0)
 
-        if token_counts:
-            in_t = int(token_counts.get('input_tokens', 0))
-            out_t = int(token_counts.get('output_tokens', 0))
-            tot_t = int(token_counts.get('total_tokens', in_t + out_t))
+        if llm_counts:
+            # Add token counts to summary
+            summary['token_usage'] = {
+                'total_input_tokens': int(total_input),
+                'total_output_tokens': int(total_output),
+                'total_tokens': int(total_tokens),
+                'per_llm': {
+                    llm_type: {
+                        'input_tokens': int(counts.get('input_tokens', 0)),
+                        'output_tokens': int(counts.get('output_tokens', 0)),
+                        'total_tokens': int(counts.get('total_tokens', 0))
+                    }
+                    for llm_type, counts in llm_counts.items()
+                }
+            }
+            
+            print(f"Token usage summary (all LLMs combined):")
+            print(f"  Total input tokens : {int(total_input)}")
+            print(f"  Total output tokens: {int(total_output)}")
+            print(f"  Total tokens       : {int(total_tokens)}")
+            print()
+            
+            # Print per-LLM breakdown
+            for llm_type, counts in llm_counts.items():
+                in_t = int(counts.get('input_tokens', 0))
+                out_t = int(counts.get('output_tokens', 0))
+                tot_t = int(counts.get('total_tokens', in_t + out_t))
+                print(f"  {llm_type.capitalize()} LLM: {in_t} input, {out_t} output, {tot_t} total")
+            print()
 
-            print(f"Token usage summary:")
-            print(f"  Input tokens : {in_t}")
-            print(f"  Output tokens: {out_t}")
-            print(f"  Total tokens : {tot_t}")
-
-            # Pricing & cost estimate (if model_name provided)
-            if model_name:
-                pricing = get_pricing_for(model_name)
-                try:
-                    total_cost = estimate_cost(model_name, input_tokens=in_t, output_tokens=out_t)
-                except Exception:
-                    total_cost = None
-
-                if pricing:
-                    in_rate = float(pricing.get('input_per_m', 0.0))
-                    out_rate = float(pricing.get('output_per_m', 0.0))
-                    in_cost = (in_t / 1_000_000.0) * in_rate
-                    out_cost = (out_t / 1_000_000.0) * out_rate
-                    print(f"Pricing (USD per 1M tokens): input={in_rate:.6f} output={out_rate:.6f}")
-                    print(f"  Estimated input cost : ${in_cost:.6f}")
-                    print(f"  Estimated output cost: ${out_cost:.6f}")
-                    if total_cost is not None:
-                        print(f"  Estimated total cost : ${total_cost:.6f}")
-                else:
-                    if total_cost is not None:
-                        print(f"  Estimated total cost : ${total_cost:.6f} (model pricing unknown)" )
-                    else:
-                        print("  Pricing information not available for model")
+            # Calculate costs for each LLM if model names are available
+            total_cost = 0.0
+            cost_breakdown = {}
+            
+            # Use provided model names
+            models = {
+                'reasoning': reasoning_model,
+                'transformation': transformation_model,
+                'code': coding_model
+            }
+            
+            print(f"Cost breakdown by LLM:")
+            for llm_type, model in models.items():
+                if llm_type in llm_counts and model:
+                    counts = llm_counts[llm_type]
+                    in_t = int(counts.get('input_tokens', 0))
+                    out_t = int(counts.get('output_tokens', 0))
+                    
+                    try:
+                        cost = estimate_cost(model, input_tokens=in_t, output_tokens=out_t)
+                        if cost is not None:
+                            cost_breakdown[llm_type] = float(cost)
+                            total_cost += cost
+                            print(f"  {llm_type.capitalize()} LLM ({model}): ${cost:.6f}")
+                    except Exception:
+                        pass
+            
+            if total_cost > 0:
+                summary['cost_estimate'] = {
+                    'total_cost': float(total_cost),
+                    'per_llm': cost_breakdown
+                }
+                print(f"\n  Estimated TOTAL cost: ${total_cost:.6f}")
             else:
-                print("  Model name not provided — cannot estimate cost.")
+                print(f"\n  Cost estimation unavailable (pricing data not found)")
 
-    except Exception:
+    except Exception as e:
         # Fail silently on token/cost reporting so summary still prints
         pass
+    
+    # Save summary to JSON file
+    try:
+        summary_path = os.path.join(output_dir, "summary.json")
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        print(f"\nSummary saved to: {summary_path}")
+    except Exception as e:
+        print(f"\nWarning: Could not save summary.json: {e}")
+    
+    return summary
 
 
 def parse_arguments():
@@ -586,8 +781,11 @@ def parse_arguments():
                        help=f"Maximum attempts per task (default: {MAX_ATTEMPTS})")
     parser.add_argument("--random-seed", type=int, default=RANDOM_SEED,
                        help=f"Random seed for reproducibility (default: {RANDOM_SEED})")
+    parser.add_argument("--debug", action="store_true", default=DEBUG,
+                       help=f"Enable debug logging (shows LLM prompts/responses) (default: {DEBUG})")
     parser.add_argument("--workers", type=int, default=NUM_WORKERS,
                        help="Number of parallel workers for batch mode (default: 1 = sequential)")
+    
     # Year and file path overrides for ARC data
     parser.add_argument("--year", type=int, default=YEAR,
                        help=f"Year for ARC dataset directory (default: {YEAR})")
@@ -601,10 +799,9 @@ def parse_arguments():
                        help=f"Path to evaluation solutions JSON (default: {EVALUATION_SOLUTIONS_JSON})")
     parser.add_argument("--test-tasks-json", type=str, default=TEST_TASKS_JSON,
                        help=f"Path to test tasks JSON (default: {TEST_TASKS_JSON})")
-    parser.add_argument("--use-print-lock", action="store_true",
-                       help="Enable a thread-printing lock to serialize prints (default: disabled)")
     parser.add_argument("--use-vllm", action="store_true", default=USE_VLLM,
                        help="When set, initialize the LLM using vLLM/langchain_vllm (local) instead of other providers")
+    
     # Flags to override behaviour of the multi-solution agent
     parser.add_argument("--enable-parallel-eval", action="store_true",
                        default=ENABLE_PARALLEL_EVAL,
@@ -621,6 +818,7 @@ def parse_arguments():
     parser.add_argument("--enable-rag-hint", action="store_true",
                        default=ENABLE_RAG_HINT,
                        help=f"Enable retrieval-augmented generation hints from past traces (default: {ENABLE_RAG_HINT})")
+    
     # Numeric workflow configuration exposed as CLI flags
     parser.add_argument("--num-initial-solutions", type=int,
                         default=NUM_INITIAL_SOLUTIONS,
@@ -643,13 +841,20 @@ def parse_arguments():
     parser.add_argument("--num-solutions-per-fusion", type=int,
                         default=NUM_SOLUTIONS_PER_FUSION,
                         help=f"Solutions generated per fusion (default: {NUM_SOLUTIONS_PER_FUSION})")
+    parser.add_argument("--recursion-limit", type=int,
+                        default=RECURSION_LIMIT,
+                        help=f"LangGraph recursion limit (default: {RECURSION_LIMIT})")
+    parser.add_argument("--resume-run", type=str, default=RESUME_RUN,
+                       help="Optional resume run identifier: 'latest' or exact folder name under output/output_agent")
     
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
-    use_print_lock = getattr(args, 'use_print_lock', False)
+    
+    # Setup logging first so all subsequent operations can use it
+    setup_logging(debug=args.debug)
     
     # Initialize LLM (optionally using vLLM if requested)
     llm = TokenTrackingLLM(initialize_llm_from_config(args.reasoning_model, use_vllm=args.use_vllm))
@@ -666,7 +871,38 @@ def main():
     # components can reuse it, e.g. for Qdrant collection naming)
     run_timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
     output_dir = create_output_directory(run_timestamp)
-    print(f"Output directory: {output_dir}")
+
+    # If requested, allow resuming an existing run instead of using the
+    # newly created timestamped folder.
+    if getattr(args, 'resume_run', None):
+        resume_val = args.resume_run
+        base_root = os.path.join("output", "output_agent")
+        if resume_val == 'latest':
+            # pick latest modified directory under base_root
+            try:
+                entries = [os.path.join(base_root, d) for d in os.listdir(base_root) if os.path.isdir(os.path.join(base_root, d))]
+                if not entries:
+                    print("No previous runs found to resume.")
+                    return 1
+                latest = max(entries, key=os.path.getmtime)
+                output_dir = latest
+                # Extract timestamp from directory name for Qdrant collection naming
+                run_timestamp = os.path.basename(output_dir)
+                print(f"Resuming latest run: {output_dir}")
+            except Exception as e:
+                print(f"Failed to locate latest run to resume: {e}")
+                return 1
+        else:
+            candidate = os.path.join(base_root, resume_val)
+            if not os.path.isdir(candidate):
+                print(f"Requested resume run '{resume_val}' not found under {base_root}")
+                return 1
+            output_dir = candidate
+            # Extract timestamp from directory name for Qdrant collection naming
+            run_timestamp = os.path.basename(output_dir)
+            print(f"Resuming specified run: {output_dir}")
+    else:
+        print(f"Output directory: {output_dir}")
     
     # Load tasks and solutions
     try:
@@ -710,8 +946,19 @@ def main():
     save_task_ids(output_dir, training_tasks, evaluation_tasks, test_tasks)
 
     # Initialize Qdrant Vector Store database if they are available
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    atexit.register(cleanup_qdrant)
+    
     if args.enable_rag_hint:
-        initialize_qdrant_vector_store(database_dir=os.path.join(output_dir, "qdrant_db"), timestamp=run_timestamp)
+        # Determine if we're resuming an existing run
+        is_resuming = bool(getattr(args, 'resume_run', None))
+        initialize_qdrant_vector_store(
+            database_dir=os.path.join(output_dir, "qdrant_db"), 
+            timestamp=run_timestamp,
+            resume=is_resuming
+        )
 
     # Create a MultiSolution agent for this run (use parsed flags to override defaults)
     print(f"Initialize the multi-solution LangGraph agent...")
@@ -730,7 +977,10 @@ def main():
         enable_visual_cue=args.enable_visual_cue,
         enable_rag_hint=args.enable_rag_hint,
         enable_code_predict=args.enable_code_predict,
-        enable_llm_predict=args.enable_llm_predict)
+        enable_llm_predict=args.enable_llm_predict,
+        recursion_limit=getattr(args, 'recursion_limit', RECURSION_LIMIT),
+        qdrant_client=QDRANT_CLIENT,
+        qdrant_collection_name=QDRANT_COLLECTION_NAME)
 
     all_results = []
     task_ids_processed = []
@@ -755,8 +1005,10 @@ def main():
         
         print(f"Testing single task: {task_id}")
         
+        # Compute per-task folder and run LangGraph agent with max attempts
+        task_folder = os.path.join(output_dir, task_id)
         # Run LangGraph agent with max attempts (reuse shared agent)
-        langgraph_result = agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
+        langgraph_result = agent.solve_task(task_id, task_data, task_folder, task_solution, max_attempts=args.max_attempts)
 
         # Compute training/testing priority & average scores
         try:
@@ -767,8 +1019,8 @@ def main():
         all_results.append(langgraph_result)
         task_ids_processed.append(task_id)
 
-        # Save individual task result
-        save_task_result(output_dir, task_id, langgraph_result)
+        # Save individual task result into the per-task output folder
+        save_task_result(task_folder, langgraph_result)
 
         # Print summary using helper
         summarize_and_print_result(langgraph_result, task_id=task_id)
@@ -781,12 +1033,9 @@ def main():
         selected_task_ids = random.sample(list(active_tasks.keys()),
                         min(args.num_tasks, len(active_tasks)))
 
-        # Create optional print lock if requested (used only for parallel workers)
-        print_lock = threading.Lock() if use_print_lock else None
-
         # Helper to run a single task (creates a fresh agent to avoid shared-state issues)
 
-        def run_single_task(task_id: str):
+        def run_single_task(task_id: str, progress_info: str = ""):
             task_data = active_tasks[task_id]
             task_solution = active_solutions.get(task_id, None)
 
@@ -806,10 +1055,16 @@ def main():
                 enable_visual_cue=args.enable_visual_cue,
                 enable_rag_hint=args.enable_rag_hint,
                 enable_code_predict=args.enable_code_predict,
-                enable_llm_predict=args.enable_llm_predict)
+                enable_llm_predict=args.enable_llm_predict,
+                recursion_limit=getattr(args, 'recursion_limit', RECURSION_LIMIT),
+                qdrant_client=QDRANT_CLIENT,
+                qdrant_collection_name=QDRANT_COLLECTION_NAME)
+
+            # Compute per-task folder for this task
+            task_folder = os.path.join(output_dir, task_id)
 
             start_time = time.time()
-            result = local_agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
+            result = local_agent.solve_task(task_id, task_data, task_folder, task_solution, max_attempts=args.max_attempts)
             result.setdefault("execution_time", time.time() - start_time)
 
             # Compute training/testing priority & average scores for this result
@@ -818,30 +1073,28 @@ def main():
             except Exception as e:
                 print(f"Warning: could not calculate scores for task {task_id}: {e}")
 
+            # Save result to file
+            save_task_result(task_folder, result)
+
+            # Print concise result summary
+            summarize_and_print_result(result, task_id=task_id, progress=progress_info)
+
             return task_id, result
 
         if args.workers and args.workers > 1:
             # Parallel execution using threads
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-                future_to_task = {executor.submit(run_single_task, tid): tid for tid in selected_task_ids}
-                completed = 0
+                # Submit all tasks with progress info
+                future_to_task = {
+                    executor.submit(run_single_task, tid, f"({i+1}/{len(selected_task_ids)})"): tid 
+                    for i, tid in enumerate(selected_task_ids)
+                }
+                
+                # Collect results as they complete
                 for future in concurrent.futures.as_completed(future_to_task):
                     tid, langgraph_result = future.result()
-                    completed += 1
-
                     all_results.append(langgraph_result)
                     task_ids_processed.append(tid)
-
-                    # Save result
-                    save_task_result(output_dir, tid, langgraph_result)
-
-                    # Print concise result summary
-                    # Use helper to print full concise summary (with progress)
-                    if print_lock:
-                        with print_lock:
-                            summarize_and_print_result(langgraph_result, task_id=tid, progress=f"({completed}/{len(selected_task_ids)})")
-                    else:
-                        summarize_and_print_result(langgraph_result, task_id=tid, progress=f"({completed}/{len(selected_task_ids)})")
 
         else:
             # Sequential execution (workers==1) — reuse the shared agent for efficiency
@@ -853,8 +1106,10 @@ def main():
                 task_data = active_tasks[task_id]
                 task_solution = active_solutions.get(task_id)
 
+                # Compute per-task folder and run LangGraph agent with max attempts
+                task_folder = os.path.join(output_dir, task_id)
                 # Run LangGraph agent with max attempts (reuse shared agent)
-                langgraph_result = agent.solve_task(task_id, task_data, task_solution, max_attempts=args.max_attempts)
+                langgraph_result = agent.solve_task(task_id, task_data, task_folder, task_solution, max_attempts=args.max_attempts)
 
                 # Compute training/testing priority & average scores
                 try:
@@ -865,14 +1120,20 @@ def main():
                 all_results.append(langgraph_result)
                 task_ids_processed.append(task_id)
 
-                # Save individual task result
-                save_task_result(output_dir, task_id, langgraph_result)
+                # Save individual task result in the per-task output folder
+                save_task_result(task_folder, langgraph_result)
 
                 # Display concise summary via helper
                 summarize_and_print_result(langgraph_result, task_id=task_id)
     
-    # Save summary (include model name so we can estimate cost)
-    print_summary(agent, all_results, task_ids_processed, model_name=args.reasoning_model)
+    # Save summary (include model names so we can estimate costs)
+    print_summary(agent, all_results, task_ids_processed, output_dir,
+                  reasoning_model=args.reasoning_model,
+                  transformation_model=args.transformation_steps_model,
+                  coding_model=args.coding_model)
+    
+    # Cleanup Qdrant before exiting
+    cleanup_qdrant()
     return 0
 
 

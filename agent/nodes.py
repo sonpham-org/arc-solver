@@ -9,6 +9,8 @@ import copy
 from typing import List, Dict, Optional, Any
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import json
 
 
 # Import schema and node-facing types
@@ -137,6 +139,11 @@ def generate_code_node(state: AgentState, llm, transformation_llm, code_llm) -> 
     This node uses the available helper functions and analyzes the training
     examples to generate a solution using the provided language model.
     """
+    tid = state.get('task_id', 'unknown')
+    print(f"Task {tid} [generate_code_node]: Generating initial code solutions...")
+
+    # Deep copy the state to avoid mutating caller's object
+    new_state = copy.deepcopy(state)
     task_data = state["task_data"]
     num_initial_solutions = state["num_initial_solutions"]
 
@@ -147,7 +154,7 @@ def generate_code_node(state: AgentState, llm, transformation_llm, code_llm) -> 
     # Read visual cue flag from node state and pass through to generation
     enable_visual_cue = state.get('enable_visual_cue', False)
 
-    python_codes, reasoning_trace, transformation_solutions_list, rag_entry = create_solutions_with_reasoning(
+    python_codes, reasoning_trace, transformation_solutions_list, rag_entry, reasoning_retries, transformation_retries = create_solutions_with_reasoning(
         llm,
         transformation_llm,
         code_llm,
@@ -169,15 +176,22 @@ def generate_code_node(state: AgentState, llm, transformation_llm, code_llm) -> 
         solutions_list.append(solution)
 
     # Update state
-    new_state = copy.deepcopy(state)
     new_state["seed_solutions_list"] = solutions_list
     new_state["fused_solutions_list"] = []
     new_state["mutated_solutions_list"] = []
+    new_state["num_retries"] += reasoning_retries + transformation_retries
     return new_state
 
 
 def evolve_code_node(state, llm, transformation_llm, code_llm):
     """Module-level evolve node: increment generation and re-run generator."""
+
+    tid = state.get('task_id', 'unknown')
+    print(f"Task {tid} [evolve_code_node]: Evolving code solutions for generation {state.get('current_generation')}...")
+
+    # Deep copy the state to avoid mutating caller's object
+    new_state = copy.deepcopy(state)
+    
     # Get necessary variables
     training_examples = state["task_data"]["train"]
     enable_visual_cue = state.get("enable_visual_cue", False)
@@ -189,7 +203,6 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
     num_solutions_per_fusion = state["num_solutions_per_fusion"]
 
     # Make a deep copy of the incoming state to avoid mutating caller's object
-    new_state = copy.deepcopy(state)
     new_state["current_loop"] = state.get("current_loop") + 1
 
     # 1) Extract seed solutions from the current solutions_list
@@ -203,13 +216,18 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
         "average_training_success_rate": sum(sol.get("training_success_rate", 0.0) for sol in state.get("solutions_list") or []) / max(len(state.get("solutions_list") or []), 1),
         "average_training_overlap_score": sum(sol.get("training_overlap_average", 0.0) for sol in state.get("solutions_list") or []) / max(len(state.get("solutions_list") or []), 1),
         "average_training_error_rate": sum(sol.get("training_error_rate", 0.0) for sol in state.get("solutions_list") or []) / max(len(state.get("solutions_list") or []), 1),
+        "max_training_success_rate": max((sol.get("training_success_rate", 0.0) for sol in state.get("solutions_list") or []), default=0.0),
+        "max_training_overlap_score": max((sol.get("training_overlap_average", 0.0) for sol in state.get("solutions_list") or []), default=0.0),
+        "max_training_error_rate": max((sol.get("training_error_rate", 0.0) for sol in state.get("solutions_list") or []), default=0.0),
+
         "average_testing_success_rate": sum(sol.get("testing_success_rate", 0.0) for sol in state.get("solutions_list") or []) / max(len(state.get("solutions_list") or []), 1),
         "average_testing_overlap_score": sum(sol.get("testing_overlap_average", 0.0) for sol in state.get("solutions_list") or []) / max(len(state.get("solutions_list") or []), 1),
         "average_testing_error_rate": sum(sol.get("testing_error_rate", 0.0) for sol in state.get("solutions_list") or []) / max(len(state.get("solutions_list") or []), 1),
+        "max_testing_success_rate": max((sol.get("testing_success_rate", 0.0) for sol in state.get("solutions_list") or []), default=0.0),
+        "max_testing_overlap_score": max((sol.get("testing_overlap_average", 0.0) for sol in state.get("solutions_list") or []), default=0.0),
+        "max_testing_error_rate": max((sol.get("testing_error_rate", 0.0) for sol in state.get("solutions_list") or []), default=0.0),
     }
-    generations = new_state.get("generations", [])
-    generations.append(generation_entry)
-    new_state["generations"] = generations
+    new_state["generations"].append(generation_entry)
 
     # increment generation counter and clear solutions_list for next generation
     new_state["current_generation"] = current_generation + 1
@@ -237,7 +255,7 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
 
             # Randomly select two distinct partner solutions. Sample without replacement
             sola, solb = random.sample(seed_solutions, 2)
-            python_codes, reasoning_trace, transformation_solutions_list, rag_entry = fuse_solutions_with_reasoning(
+            python_codes, reasoning_trace, transformation_solutions_list, rag_entry, reasoning_retries, transformation_retries = fuse_solutions_with_reasoning(
                 llm,
                 transformation_llm,
                 code_llm,
@@ -260,11 +278,12 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
                 }
                 sol_arr.append(solution)
             fused_solutions.append(sol_arr)
+            new_state["num_retries"] += reasoning_retries + transformation_retries
 
         # 6) Mutation (self-reflection)
         for i, solution in enumerate(seed_solutions[:num_refinements]):
             sol_arr = []
-            python_codes, reasoning_trace, transformation_solutions_list, rag_entry = refine_solutions_with_reasoning(
+            python_codes, reasoning_trace, transformation_solutions_list, rag_entry, reasoning_retries, transformation_retries = refine_solutions_with_reasoning(
                 llm,
                 transformation_llm,
                 code_llm,
@@ -286,6 +305,7 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
                 }
                 sol_arr.append(solution)
             mutated_solutions.append(sol_arr)
+            new_state["num_retries"] += reasoning_retries + transformation_retries
 
     # 7) Assemble new solutions_list: original seed_solutions + fused + mutated
     new_state["seed_solutions_list"] = seed_solutions
@@ -301,6 +321,10 @@ def test_code_node(state: AgentState, llm, transformation_llm, code_llm) -> Agen
     This node executes the current solution on all training examples
     and calculates the success rate.
     """
+
+    tid = state.get('task_id', 'unknown')
+    print(f"Task {tid} [test_code_node]: Testing code solutions...")
+
     # Deep copy the new state, and shove in the training results to previous_training_results
     # And then reset training results
     new_state = copy.deepcopy(state)
@@ -527,5 +551,31 @@ def finalize_node(state: AgentState) -> AgentState:
     """
     Finalize the workflow and prepare the final output.
     """
+    print(f"Task {state.get('task_id', 'unknown')} [finalize_node]: Finalizing workflow state...")
     new_state = copy.deepcopy(state)
     return new_state
+
+
+def save_state_node(state: AgentState) -> AgentState:
+    """Persist the latest workflow state to `latest_state.json` inside
+    the folder specified by `state['task_folder']`.
+
+    This node is tolerant of missing folders and exceptions; it logs
+    failures and returns the original (or possibly mutated) state.
+    """
+
+    tid = state.get('task_id', 'unknown')
+    print(f"Task {tid} [save_state_node]: Saving state to disk...")
+
+    task_folder = state.get('task_folder')
+    if not task_folder:
+        print("save_state_node: no task_folder in state; skipping save.")
+        return state
+    try:
+        os.makedirs(task_folder, exist_ok=True)
+        path = os.path.join(task_folder, "latest_state.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, default=str)
+    except Exception as e:
+        print(f"save_state_node: failed to save state to {task_folder}: {e}")
+    return state

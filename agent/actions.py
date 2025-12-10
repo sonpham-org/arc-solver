@@ -2720,6 +2720,7 @@ def fuse_solutions_with_reasoning(llm,
         python_codes_list = generate_code_from_reasoning_and_transformations(code_llm, fused_reasoning, fused_transformation_solutions, training_examples)
 
     # Step 4: Create rag entry if enabled
+    rag_entry = None
     if enable_rag_hint:
         distilled_reasoning = generate_distilled_reasoning(llm, fused_reasoning, fused_transformation_solutions, python_codes_list)
         distilled_text = f"Strategy: {distilled_reasoning.get('strategy', '')}\nConcepts: {', '.join(distilled_reasoning.get('concepts', []))}"

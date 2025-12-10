@@ -1,248 +1,96 @@
-# arc-solver — ARC Challenge Solver
+# ARC Solver
 
-This project provides tools to solve ARC (Abstraction and Reasoning Corpus) challenges using various LLMs, including local LLaMA models and Google Gemini API. The solver uses advanced prompting techniques with reflection, code repair, and smart routing to maximize ARC task performance.
+This repository contains tools for solving Abstract Reasoning Corpus (ARC) tasks using LangGraph-based AI agents.
 
-## Code Architecture and Flow
+## Main Scripts
 
-### Core Components
+### 1. run_langgraph_agent.py
 
-#### Main Entry Points
-- **`arc_prompt.py`**: Main execution script with comprehensive task processing, reflection, and retry logic
-- **`arc_baseline.py`**: Simplified baseline solver for direct test output prediction
-- **`model_configs.py`**: Model configuration and cost estimation
-- **`utils.py`**: Core utilities for task sanitization, result calculation, and file operations
+**Purpose:** This is the main script for running a multi-solution LangGraph agent on ARC tasks. It uses multiple AI models to generate, refine, and fuse solution strategies through iterative reasoning, code generation, and execution.
 
-#### Prompt System (`prompts/` directory)
-The prompt system has been modularized for better maintainability:
-- **`arc_prompt.py`**: Main ARC prompt for comprehensive task solving with reasoning and JSON output
-- **`apply_prompt.py`**: Strict rule application prompt for test inputs
-- **`apply_prompt_2.py`**: Flexible rule application with interpretation guidance
-- **`reflection_prompt.py`**: Rule refinement prompt based on failure analysis
-- **`code_repair_prompt.py`**: Python code debugging and repair prompts
-- **`arc_reflection_prompt.py`**: Task-level reflection for failed attempts
-- **`baseline_prompt.py`**: Minimal prompt for direct test output prediction
+**What it does:**
+- Runs AI agents to solve ARC challenges using configurable language models (GPT-4, Gemini, Llama, Qwen, etc.)
+- Supports both single task testing and batch processing with parallel workers
+- Generates multiple solution attempts per task through iterative refinement and fusion
+- Stores results in structured output directories under `output/output_agent/`
+- Supports resuming previous runs and evaluating existing solutions
+- Optional features include RAG hints, visual cues, and parallel evaluation
 
-#### Legacy Compatibility
-- **`prompts.py`**: Legacy interface that imports from the new modular prompt system
+**How to run:**
 
-### Execution Flow
+```bash
+# Basic usage - runs with default configuration
+python run_langgraph_agent.py
 
-#### 1. Task Processing Pipeline (`arc_prompt.py`)
-
-```
-Task Input → Sanitization (Optional) → Prompt Generation → Model Execution → JSON Extraction → Validation → Testing → Results
+# The script is configured via variables at the top of the file:
+# - REASONING_MODEL: Model for reasoning & reflection
+# - CODING_MODEL: Model for code generation
+# - MODE: "single" or "batch"
+# - NUM_TASKS: Number of tasks to process in batch mode
+# - RESUME_RUN: Set to "latest" or specific run ID to resume
 ```
 
-**Key Steps:**
-1. **Task Loading**: Load ARC tasks from JSON files (training/evaluation)
-2. **Task Selection**: Choose specific tasks by index, ID, or random sampling
-3. **Sanitization** (Optional): Clean task data and IDs for consistent processing
-4. **Prompt Generation**: Build comprehensive prompts with training examples and instructions
-5. **Model Execution**: Send prompts to selected LLM (Ollama, Gemini, etc.)
-6. **Smart Routing** (Optional): Enhance responses using reflection and continuation
-7. **JSON Extraction**: Parse structured transformation rules from model responses
-8. **Validation**: Verify JSON structure and completeness
-9. **Code Testing**: Execute Python code on training examples
-10. **Result Processing**: Test on evaluation examples and calculate metrics
+**Key configuration variables** (edit in the script):
+- `REASONING_MODEL`: Choose your reasoning model (e.g., "gemini-2.5-flash", "gpt-4o-mini")
+- `CODING_MODEL`: Choose your coding model
+- `MODE`: "single" for one task, "batch" for multiple tasks
+- `NUM_TASKS`: Number of tasks to process (in batch mode)
+- `NUM_WORKERS`: Number of parallel workers for batch processing
+- `RESUME_RUN`: Resume a previous run (set to run ID or "latest")
+- `EVALUATE_ONLY`: Only evaluate existing solutions without generating new ones
 
-#### 2. Advanced Features
+### 2. arc_visualizer.py
 
-**Smart Routing System:**
-- **Reasoning Completion Detection**: Analyzes if model response contains complete reasoning
-- **Automatic Continuation**: Requests continuation if reasoning appears incomplete
-- **JSON Regeneration**: Asks model to regenerate JSON if extraction fails
-- **Code Repair**: Fixes Python execution errors through targeted prompts
-- **Reflection Cycles**: Iterative improvement through failure analysis
+**Purpose:** A Flask-based web application for visualizing and inspecting ARC task solutions generated by the agent.
 
-**Retry and Recovery Logic:**
-- **Task Retries**: Retry failed tasks with different random seeds
-- **Code Repair Attempts**: Fix execution errors while preserving JSON structure
-- **Reflection Attempts**: Learn from failures and generate improved solutions
-- **Continuation Support**: Resume interrupted runs from existing output directories
+**What it does:**
+- Provides a web interface to browse all runs stored in `output/output_agent/`
+- Displays run summaries with accuracy statistics
+- Shows detailed visualizations of input/output grids for each task
+- Highlights differences between expected and predicted outputs
+- Allows inspection of individual solution attempts and their reasoning traces
 
-#### 3. Model Integration
+**How to run:**
 
-**Supported Providers:**
-- **Ollama**: Local model execution (llama3.1, qwen2.5, etc.)
-- **Google Gemini**: Cloud API with various model variants
-- **Other Models**: Extensible configuration system
+```bash
+# Install Flask if not already installed
+pip install flask
 
-**Model Configuration:**
-```python
-MODEL_CONFIGS = {
-    "model-name": {
-        "provider": "provider_name",
-        "input_cost": cost_per_1k_tokens,
-        "output_cost": cost_per_1k_tokens,
-        "max_tokens": limit
-    }
-}
+# Start the visualizer
+python arc_visualizer.py
+
+# Open your browser to http://localhost:5000
 ```
 
-#### 4. Output Format and Results
+**Features:**
+- Browse all completed runs sorted by date (newest first)
+- View task-level results with color-coded grid visualizations
+- Compare expected vs. predicted outputs with diff highlighting
+- Inspect solution code and reasoning for each attempt
 
-**Per-Task Results:**
-```json
-{
-  "trains": [
-    {
-      "input": ["grid_representation"],
-      "expected": ["expected_output"],
-      "predicted": ["model_prediction"],
-      "correct": boolean,
-      "overlap": percentage,
-      "iou": percentage,
-      "error": "error_message_if_any"
-    }
-  ],
-  "tests": [...],  // Similar structure for test examples
-  "transformations_json": {...},  // Extracted transformation rules
-  "total_tokens": count,
-  "estimated_cost": dollars
-}
-```
+## Requirements
 
-**Execution Summary:**
-- Task completion rates and accuracy metrics
-- Token usage and cost analysis
-- Error categorization and debugging information
-- Performance comparisons across different approaches
-
-#### 5. Baseline Solver (`arc_baseline.py`)
-
-Simplified pipeline for direct comparison:
-```
-Task Input → Minimal Prompt → Model Execution → Direct JSON Output → Evaluation
-```
-
-**Key Differences:**
-- No reasoning or step-by-step transformations
-- Direct test output prediction
-- Faster execution with lower complexity
-- Used for baseline performance measurement
-
-### Advanced Prompt Engineering
-
-#### Prompt Design Principles
-1. **Comprehensive Context**: Include all training examples with clear input/output relationships
-2. **Structured Guidelines**: Explicit rules for transformation inference and generalization
-3. **Output Constraints**: Strict JSON format requirements with executable Python code
-4. **Error Prevention**: Built-in validation and common pitfall warnings
-
-#### Reflection and Learning System
-1. **Failure Analysis**: Detailed examination of incorrect predictions vs. expected outputs
-2. **Pattern Recognition**: Identification of missed transformation rules or edge cases
-3. **Iterative Refinement**: Progressive improvement through multiple reflection cycles
-4. **Code Debugging**: Systematic approach to Python execution error resolution
-
-### Configuration and Customization
-
-#### Key Configuration Variables
-- **Task Selection**: Specific indices, random sampling, or complete dataset processing
-- **Model Parameters**: Temperature, token limits, and provider-specific settings
-- **Processing Options**: Sanitization, parallel execution, output verbosity
-- **Advanced Features**: Smart routing, reflection cycles, retry attempts
-
-#### Command Line Interface
-Extensive CLI options for all configuration aspects, with sensible defaults and parameter validation.
-
-## File Structure
-
-```
-arc-solver/
-├── arc_prompt.py          # Main execution script
-├── arc_baseline.py        # Baseline solver
-├── model_configs.py       # Model configurations
-├── utils.py              # Core utilities
-├── prompts.py            # Legacy prompt interface
-├── prompts/              # Modular prompt system
-│   ├── __init__.py
-│   ├── arc_prompt.py
-│   ├── apply_prompt.py
-│   ├── apply_prompt_2.py
-│   ├── reflection_prompt.py
-│   ├── code_repair_prompt.py
-│   ├── arc_reflection_prompt.py
-│   └── baseline_prompt.py
-├── data/                 # ARC datasets
-├── output/               # Results and logs
-└── requirements.txt      # Dependencies
-```
-
-## Quick Start with Docker
-
-1. Ensure you have Docker and Docker Compose installed.
-
-2. Set your `GEMINI_API_KEY` environment variable:
-
-   ```bash
-   export GEMINI_API_KEY="your_api_key_here"
-   ```
-
-3. Build the Docker image (optional, or use docker-compose which builds automatically):
-
-   ```bash
-   ./scripts/build_docker.sh
-   ```
-
-4. Run with Docker Compose:
-
-   ```bash
-   docker-compose up
-   ```
-
-   This will run the main solver on training challenges.
-
-   Or run directly with Docker:
-
-   ```bash
-   docker run --rm -it -e GEMINI_API_KEY=$GEMINI_API_KEY -v $(pwd)/output:/app/output arc-solver:latest python src/main.py --challenges data/arc-2024/arc-agi_training_challenges.json
-   ```
-
-## Manual Setup (Local LLaMA)
-
-1. Create a Python environment (3.10+ recommended).
-
-2. To run real models with Hugging Face + 4-bit compression on an RTX 4090, install:
-
-   ```bash
-   pip install -U pip
-   # install a torch wheel that matches your CUDA (example for CUDA 11.8)
-   pip install torch --index-url https://download.pytorch.org/whl/cu118
-   pip install -U transformers accelerate bitsandbytes
-   ```
-
-   Then run the tester:
-
-   ```bash
-   python src/local_llama.py --backend hf --model meta-llama/Llama-2-7b-chat-hf
-   ```
-
-   If you prefer a local ggml model and `llama-cpp-python`:
-
-   ```bash
-   pip install llama-cpp-python
-   python src/local_llama.py --backend llama_cpp --ggml /path/to/ggml-model-q4_0.bin
-   ```
-
-## Running Gemini Solver
-
-After installing dependencies:
-
+Install dependencies:
 ```bash
 pip install -r requirements.txt
-export GEMINI_API_KEY="your_api_key_here"
-python src/main.py --challenges data/arc-2024/arc-agi_training_challenges.json --solutions data/arc-2024/arc-agi_training_solutions.json
 ```
 
-## Running Tests
+Key dependencies include:
+- langchain & langgraph for agent orchestration
+- openai, anthropic, google-generativeai for LLM providers
+- flask for visualization
+- qdrant-client for optional RAG features
 
-```bash
-pip install -U pytest
-pytest -q
-```
+## Workflow
 
-## Notes
+1. **Run the agent** using `run_langgraph_agent.py` to generate solutions
+2. **Visualize results** using `arc_visualizer.py` to inspect and analyze the outputs
+3. **Iterate** by adjusting configuration parameters and re-running
 
-- The smoke tests mock ML packages so CI or local dev can run quickly. To test real models you must install the real packages and have enough disk space and GPU memory.
-- For GPU support in Docker, you may need to use `--gpus all` with `docker run` if using local models.
+## Output Structure
+
+Results are saved to `output/output_agent/<timestamp>/`:
+- Each task has its own subdirectory with detailed JSON output
+- `params.json`: Run configuration parameters
+- `training_task_ids.txt` / `evaluation_task_ids.txt`: Lists of processed tasks
+- Individual task folders contain solution attempts, code, and reasoning traces

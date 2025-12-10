@@ -290,6 +290,7 @@ def index():
                     max_testing_pct = 0.0
                     max_training_pct = 0.0
                     overlaps: List[float] = []
+                    generations_to_success = None
                     sols = data.get('solutions_list') or []
                     for sol in sols:
                         # --- testing success ---
@@ -315,6 +316,13 @@ def index():
                         tpct = (tf * 100.0) if tf <= 1.0 else tf
                         if tpct > max_training_pct:
                             max_training_pct = tpct
+                        
+                        # --- count generations to achieve 100% training success ---
+                        if generations_to_success is None and tpct >= 100.0 - 1e-6:
+                            try:
+                                generations_to_success = sol.get('solution_number')
+                            except Exception:
+                                pass
 
                         # --- gather overlap_percentage from example results ---
                         for key in ('training_results', 'testing_results'):
@@ -339,6 +347,7 @@ def index():
                     # expose computed metrics back into the task dict for template consumption
                     data['_testing_pct_max'] = max_testing_pct
                     data['_training_pct_max'] = max_training_pct
+                    data['_generations_to_success'] = generations_to_success
                     if overlaps:
                         data['_avg_overlap_pct'] = sum(overlaps) / len(overlaps)
                     else:

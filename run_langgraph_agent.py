@@ -70,9 +70,9 @@ except Exception:
 # For fast local debugging prefer an Ollama-hosted local model (free/local).
 # Reasoning model is used for reasoning & reflection
 # Coding model is used for code generation & execution
-REASONING_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
-TRANSFORMATION_STEPS_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
-CODING_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+REASONING_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+TRANSFORMATION_STEPS_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+CODING_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
 USE_VLLM = False
 
 # Test mode configuration
@@ -84,7 +84,7 @@ TASK_ID = None  # Specific task ID to test (for single mode)
 TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
-NUM_TASKS = 100  # Number of tasks for batch mode
+NUM_TASKS = 120  # Number of tasks for batch mode
 EVALUATE_ONLY = True
 
 # Processing configuration
@@ -96,7 +96,7 @@ ENABLE_PARALLEL_EVAL = False  # Whether to enable parallel evaluation of example
 ENABLE_CODE_PREDICT = True  # Whether to enable code-predicted outputs during testing
 ENABLE_LLM_PREDICT = False # Whether to enable LLM-predicted outputs during testing
 ENABLE_VISUAL_CUE = False  # When True, generate and pass input/output images to the LLM
-ENABLE_RAG_HINT = True  # When True, enable retrieval-augmented generation hints from past reasoning traces
+ENABLE_RAG_HINT = False  # When True, enable retrieval-augmented generation hints from past reasoning traces
 
 NUM_INITIAL_SOLUTIONS = 10
 NUM_LOOPS = 5
@@ -108,14 +108,14 @@ NUM_SOLUTIONS_PER_FUSION = 5
 RECURSION_LIMIT = 50  # LangGraph recursion limit (default is 25, increase for long workflows)
 
 # Year selection for ARC dataset directory (change to 2025 if using 2025 data)
-YEAR = 2024
+YEAR = 2025
  
 # Optional resume run identifier used when starting the script. If set to
 # 'latest' the runner will resume the most recent folder under
 # `output/output_agent`. If set to a specific folder name, the runner will
 # attempt to resume that folder. When `None`, a new timestamped output
 # folder is created for the run.
-RESUME_RUN = None
+RESUME_RUN = "2025-12-09T20-37-07-201093"
 
 # Default ARC JSON paths (will be exposed as argparse defaults)
 TRAINING_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_training_challenges.json"
@@ -769,7 +769,7 @@ def parse_arguments():
                         help=f"Model to use for transformation steps (e.g., gpt-4o-mini, gemini-2.0-flash) (default: {TRANSFORMATION_STEPS_MODEL})")
     parser.add_argument("--mode", type=str, choices=["single", "batch"], default=MODE,
                        help=f"Test mode: single task or batch (default: {MODE})")
-    parser.add_argument("--evaluate-only", action="store_true",
+    parser.add_argument("--evaluate-only", action="store_true", default=EVALUATE_ONLY,
                        help="When set, run ONLY on the evaluation dataset (applies to single or batch mode)")
     parser.add_argument("--task-id", type=str, default=TASK_ID,
                        help=f"Specific task ID to test (for single mode) (default: {TASK_ID})")

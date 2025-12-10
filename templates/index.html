@@ -57,9 +57,12 @@
                 {% set test_pct = (data.get('_testing_pct_max') or 0.0) | float %}
                 {% set train_pct = (data.get('_training_pct_max') or 0.0) | float %}
                 {% set avg_overlap = (data.get('_avg_overlap_pct') or 0.0) | float %}
+                {% set generations = data.get('_generations_to_success') %}
                 {% set is_lucky = (test_pct >= 100.0 and train_pct < 100.0) %}
                 <li class="list-group-item d-flex justify-content-between align-items-center" data-test-pct="{{ test_pct }}" data-overlap-pct="{{ avg_overlap }}" data-train-pct="{{ train_pct }}">
-                  <a href="?run={{ run_info.path.name }}&task={{ tid }}" class="{% if is_lucky %}task-lucky{% elif test_pct >= 100.0 %}task-success{% endif %}">{{ tid }}</a>
+                  <a href="?run={{ run_info.path.name }}&task={{ tid }}" class="{% if is_lucky %}task-lucky{% elif test_pct >= 100.0 %}task-success{% endif %}">
+                    {{ tid }}{% if generations %} (gen:{{ generations }}){% endif %}
+                  </a>
                   <span class="badge bg-secondary">{{ '%.1f'|format(avg_overlap) }}%</span>
                 </li>
               {% endfor %}

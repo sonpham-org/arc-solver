@@ -1,27 +1,38 @@
-# Requirements for arc-solver local LLaMA testing
-# NOTE: For GPU acceleration install a PyTorch wheel that matches your CUDA toolkit.
-# Example (CUDA 11.8):
-#   pip install torch --index-url https://download.pytorch.org/whl/cu118
-# Then install the remaining packages:
-#   pip install -r requirements.txt
+# ARC Solver - Unified Requirements
+# Install with: pip install -r requirements.txt
 
-torch
+# Core dependencies
+python-dotenv>=1.0.0
+
+# LLM Providers
+google-generativeai>=0.3.0
+google-cloud-storage>=2.0.0
+
+# LangChain ecosystem for agent workflows
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain>=0.3.0
+langchain-google-genai>=1.0.0
+langchain-google-vertexai>=1.0.0
+langchain-openai>=0.1.0
+langchain-anthropic>=0.1.0
+langchain-ollama>=0.1.0
+
+# Data processing and visualization
+numpy>=1.20.0
+pandas>=1.3.0
+matplotlib>=3.5.0
+
+# Web frameworks
+flask>=2.0.0
+gradio>=4.0.0
+
+# Local LLM support (optional - requires GPU for best performance)
+# For GPU acceleration, install PyTorch with CUDA support first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+torch>=2.0.0
 transformers>=4.30.0
 accelerate>=0.20.3
 bitsandbytes>=0.39.0
 llama-cpp-python>=0.1.51
 sentencepiece>=0.1.98
-python-dotenv
-google-generativeai
-google-cloud-storage
-
-# Additional requirements for ARC Visualizer
-gradio>=4.0.0
-matplotlib>=3.5.0
-pandas>=1.3.0
-numpy>=1.20.0
-
-# LangGraph for agent workflows
-langgraph>=0.2.0
-langchain-core>=0.3.0
-langchain>=0.3.0

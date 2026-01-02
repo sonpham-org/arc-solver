@@ -41,7 +41,7 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
 # Import the MultiSolution LangGraph agent
-from agent.agent import MultiSolutionARCLangGraphAgent
+from agentic.agent import ARCLangGraphAgent
 
 # Import model configurations and utilities
 from model_configs import MODEL_CONFIGS, find_model_key, get_pricing_for, estimate_cost

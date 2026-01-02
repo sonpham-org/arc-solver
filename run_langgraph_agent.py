@@ -44,7 +44,7 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
 # Import the MultiSolution LangGraph agent
-from agent.agent import ARCLangGraphAgent
+from agentic.agent import ARCLangGraphAgent
 
 # Import model configurations and utilities
 from model_configs import MODEL_CONFIGS, find_model_key, get_pricing_for, estimate_cost
@@ -84,13 +84,13 @@ TASK_ID = None  # Specific task ID to test (for single mode)
 TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
-NUM_TASKS = 120  # Number of tasks for batch mode
-EVALUATE_ONLY = True
+NUM_TASKS = 20  # Number of tasks for batch mode
+EVALUATE_ONLY = False
 
 # Processing configuration
 MAX_ATTEMPTS = 10  # Maximum attempts per task
 RANDOM_SEED = 42  # Random seed for reproducibility
-DEBUG = False  # Enable debug logging (prompts, responses, code generation)
+DEBUG = True  # Enable debug logging (prompts, responses, code generation)
 
 ENABLE_PARALLEL_EVAL = False  # Whether to enable parallel evaluation of examples
 ENABLE_CODE_PREDICT = True  # Whether to enable code-predicted outputs during testing
@@ -99,7 +99,7 @@ ENABLE_VISUAL_CUE = False  # When True, generate and pass input/output images to
 ENABLE_RAG_HINT = False  # When True, enable retrieval-augmented generation hints from past reasoning traces
 
 NUM_INITIAL_SOLUTIONS = 10
-NUM_LOOPS = 5
+NUM_LOOPS = 0
 NUM_SEED_SOLUTIONS = 10
 NUM_REFINEMENTS = 2
 NUM_SOLUTIONS_PER_REFINEMENT = 5
@@ -115,7 +115,7 @@ YEAR = 2025
 # `output/output_agent`. If set to a specific folder name, the runner will
 # attempt to resume that folder. When `None`, a new timestamped output
 # folder is created for the run.
-RESUME_RUN = "2025-12-09T20-37-07-201093"
+RESUME_RUN = None
 
 # Default ARC JSON paths (will be exposed as argparse defaults)
 TRAINING_TASKS_JSON = f"data/arc-{YEAR}/arc-agi_training_challenges.json"

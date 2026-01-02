@@ -68,8 +68,9 @@ def decide_setup(state):
 
 
 def setup_node(state):
-    """Setup node that handles optional resume from latest_state.json."""
+    """Setup node that handles optional resume from latest_state.json and creates augmented data."""
     from ..agent import load_latest_state
+    from ..augmentation import augment_task_data
     
     task_folder = state.get('task_folder')
     tid = state.get('task_id', 'unknown')
@@ -97,6 +98,8 @@ def setup_node(state):
                     "num_solutions_per_refinement": state.get('num_solutions_per_refinement'),
                     "num_fusions": state.get('num_fusions'),
                     "num_solutions_per_fusion": state.get('num_solutions_per_fusion'),
+                    "num_augmentations": state.get('num_augmentations'),
+                    "num_inloop_augmentations": state.get('num_inloop_augmentations'),
                     "max_generations": state.get('max_generations'),
                 }
                 state.clear()
@@ -111,6 +114,25 @@ def setup_node(state):
     except Exception as e:
         print(f"[setup_node] Error during setup: {e}")
         state['_resumed_from_latest'] = False
+    
+    # Generate augmented data if num_augmentations > 0 and not resuming
+    if not state.get('_resumed_from_latest'):
+        num_augmentations = state.get('num_augmentations', 0)
+        if num_augmentations > 0:
+            try:
+                task_data = state.get('task_data')
+                if task_data and 'train' in task_data:
+                    print(f"[setup_node] Generating {num_augmentations} augmented training examples...")
+                    augment_data = augment_task_data(task_data, num_augmentations)
+                    state['augment_data'] = augment_data
+                    print(f"[setup_node] Created {len(augment_data.get('train', []))} augmented examples")
+                else:
+                    state['augment_data'] = None
+            except Exception as e:
+                print(f"[setup_node] Error generating augmented data: {e}")
+                state['augment_data'] = None
+        else:
+            state['augment_data'] = None
     
     return state
 

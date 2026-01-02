@@ -96,6 +96,9 @@ class AgentState(TypedDict):
     task_id: str
     task_data: Annotated[Dict[str, Any], immutable_dict]
     task_folder: str
+    
+    # Augmented training data (created during setup if num_augmentations > 0)
+    augment_data: Optional[Dict[str, Any]]
 
     # Runtime visual flag: prefer the latest provided value (allow agent to set)
     enable_visual_cue: Annotated[bool, take_latest]
@@ -116,6 +119,10 @@ class AgentState(TypedDict):
     num_fusions: Annotated[Optional[int], take_latest]
     num_solutions_per_fusion: Annotated[Optional[int], take_latest]
     num_retries: int
+    
+    # Augmentation parameters
+    num_augmentations: Annotated[Optional[int], take_latest]
+    num_inloop_augmentations: Annotated[Optional[int], take_latest]
 
     # Generations of mutated solutions
     current_generation: Annotated[Optional[int], take_latest]

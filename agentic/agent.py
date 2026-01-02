@@ -260,6 +260,7 @@ def create_initial_state(task_id: str,
         "task_id": task_id,
         "task_data": task_data,
         "task_folder": task_folder,
+        "augment_data": None,
         "solutions_list": [],
         "metadata": {},
         "current_loop": 0,
@@ -270,6 +271,8 @@ def create_initial_state(task_id: str,
         "num_solutions_per_refinement": agent.num_solutions_per_refinement,
         "num_fusions": agent.num_fusions,
         "num_solutions_per_fusion": agent.num_solutions_per_fusion,
+        "num_augmentations": agent.num_augmentations,
+        "num_inloop_augmentations": agent.num_inloop_augmentations,
         "num_retries": 0,
         "enable_visual_cue": agent.enable_visual_cue,
         "enable_rag_hint": agent.enable_rag_hint,
@@ -299,6 +302,8 @@ class ARCLangGraphAgent(BaseARCAgent):
                  num_solutions_per_refinement: int = 3,
                  num_fusions: int = 5,
                  num_solutions_per_fusion: int = 3,
+                 num_augmentations: int = 0,
+                 num_inloop_augmentations: int = 0,
                  enable_parallel_eval: bool = False,
                  enable_code_predict: bool = True,
                  enable_llm_predict: bool = False,
@@ -322,6 +327,8 @@ class ARCLangGraphAgent(BaseARCAgent):
             num_solutions_per_refinement: Solutions generated per refinement
             num_fusions: Number of fusion operations
             num_solutions_per_fusion: Solutions generated per fusion
+            num_augmentations: Number of augmented training examples to generate before each task
+            num_inloop_augmentations: Number of augmented examples during each reasoning loop
             enable_parallel_eval: Whether to parallelize example evaluation
             enable_code_predict: Whether to enable code-predicted outputs
             enable_llm_predict: Whether to enable LLM-predicted outputs
@@ -371,6 +378,8 @@ class ARCLangGraphAgent(BaseARCAgent):
         self.num_solutions_per_refinement = num_solutions_per_refinement
         self.num_fusions = num_fusions
         self.num_solutions_per_fusion = num_solutions_per_fusion
+        self.num_augmentations = num_augmentations
+        self.num_inloop_augmentations = num_inloop_augmentations
         self.enable_code_predict = enable_code_predict
         self.enable_llm_predict = enable_llm_predict
         self.enable_parallel_eval = enable_parallel_eval

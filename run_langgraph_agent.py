@@ -105,6 +105,8 @@ NUM_REFINEMENTS = 2
 NUM_SOLUTIONS_PER_REFINEMENT = 5
 NUM_FUSIONS = 2
 NUM_SOLUTIONS_PER_FUSION = 5
+NUM_AUGMENTATIONS = 3  # Number of augmented training examples to generate before each task
+NUM_INLOOP_AUGMENTATIONS = 0  # Number of augmented examples to generate during each reasoning loop
 RECURSION_LIMIT = 50  # LangGraph recursion limit (default is 25, increase for long workflows)
 
 # Year selection for ARC dataset directory (change to 2025 if using 2025 data)
@@ -797,6 +799,12 @@ def parse_arguments():
                        help=f"Path to evaluation tasks JSON (default: {EVALUATION_TASKS_JSON})")
     parser.add_argument("--evaluation-solutions-json", type=str, default=EVALUATION_SOLUTIONS_JSON,
                        help=f"Path to evaluation solutions JSON (default: {EVALUATION_SOLUTIONS_JSON})")
+    
+    # Augmentation parameters
+    parser.add_argument("--num-augmentations", type=int, default=NUM_AUGMENTATIONS,
+                       help=f"Number of augmented training examples to generate before each task (default: {NUM_AUGMENTATIONS})")
+    parser.add_argument("--num-inloop-augmentations", type=int, default=NUM_INLOOP_AUGMENTATIONS,
+                       help=f"Number of augmented examples during each reasoning loop (default: {NUM_INLOOP_AUGMENTATIONS})")
     parser.add_argument("--test-tasks-json", type=str, default=TEST_TASKS_JSON,
                        help=f"Path to test tasks JSON (default: {TEST_TASKS_JSON})")
     parser.add_argument("--use-vllm", action="store_true", default=USE_VLLM,
@@ -973,6 +981,8 @@ def main():
         num_solutions_per_refinement=getattr(args, 'num_solutions_per_refinement', NUM_SOLUTIONS_PER_REFINEMENT),
         num_fusions=getattr(args, 'num_fusions', NUM_FUSIONS),
         num_solutions_per_fusion=getattr(args, 'num_solutions_per_fusion', NUM_SOLUTIONS_PER_FUSION),
+        num_augmentations=getattr(args, 'num_augmentations', NUM_AUGMENTATIONS),
+        num_inloop_augmentations=getattr(args, 'num_inloop_augmentations', NUM_INLOOP_AUGMENTATIONS),
         enable_parallel_eval=args.enable_parallel_eval,
         enable_visual_cue=args.enable_visual_cue,
         enable_rag_hint=args.enable_rag_hint,
@@ -1051,6 +1061,8 @@ def main():
                 num_solutions_per_refinement=getattr(args, 'num_solutions_per_refinement', NUM_SOLUTIONS_PER_REFINEMENT),
                 num_fusions=getattr(args, 'num_fusions', NUM_FUSIONS),
                 num_solutions_per_fusion=getattr(args, 'num_solutions_per_fusion', NUM_SOLUTIONS_PER_FUSION),
+                num_augmentations=getattr(args, 'num_augmentations', NUM_AUGMENTATIONS),
+                num_inloop_augmentations=getattr(args, 'num_inloop_augmentations', NUM_INLOOP_AUGMENTATIONS),
                 enable_parallel_eval=args.enable_parallel_eval,
                 enable_visual_cue=args.enable_visual_cue,
                 enable_rag_hint=args.enable_rag_hint,

@@ -149,6 +149,12 @@ def generate_code_node(state: AgentState, llm, transformation_llm, code_llm) -> 
 
     # Analyze the training examples (kept for node-level logging/analysis)
     training_examples = task_data["train"]
+    
+    # Add augmented data if available
+    augment_data = state.get('augment_data')
+    if augment_data and 'train' in augment_data:
+        training_examples = training_examples + augment_data['train']
+        print(f"Task {tid} [generate_code_node]: Using {len(task_data['train'])} original + {len(augment_data['train'])} augmented = {len(training_examples)} total training examples")
 
     # Generate code using the reasoning-first approach from actions
     # Read visual cue flag from node state and pass through to generation
@@ -194,6 +200,13 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
     
     # Get necessary variables
     training_examples = state["task_data"]["train"]
+    
+    # Add augmented data if available
+    augment_data = state.get('augment_data')
+    if augment_data and 'train' in augment_data:
+        training_examples = training_examples + augment_data['train']
+        print(f"Task {tid} [evolve_code_node]: Using {len(state['task_data']['train'])} original + {len(augment_data['train'])} augmented = {len(training_examples)} total training examples")
+    
     enable_visual_cue = state.get("enable_visual_cue", False)
     enable_rag_hint = state.get("enable_rag_hint", False)
     num_seed_solutions = state["num_seed_solutions"]
@@ -340,6 +353,13 @@ def test_code_node(state: AgentState, llm, transformation_llm, code_llm) -> Agen
     # Task information
     task_data = new_state.get("task_data", {})
     training_examples = task_data.get("train", [])
+    
+    # Add augmented data if available
+    augment_data = new_state.get('augment_data')
+    if augment_data and 'train' in augment_data:
+        training_examples = training_examples + augment_data['train']
+        print(f"Task {tid} [test_code_node]: Using {len(task_data.get('train', []))} original + {len(augment_data['train'])} augmented = {len(training_examples)} total training examples")
+    
     testing_examples = task_data.get("test", [])
     enable_parallel = new_state.get("enable_parallel_eval", False)
 

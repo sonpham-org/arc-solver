@@ -8,6 +8,52 @@ from typing import List, Dict, Optional, Any, Tuple
 
 from .code_generation import extract_python_solutions, ensure_imports_in_code
 from .utilities import format_grid_for_prompt
+from ..schema import ExampleResult
+
+
+def test_code_on_examples(code: str, examples: List[Dict], timeout_seconds: int = 5) -> List[ExampleResult]:
+    """Test code on a list of examples and return results.
+    
+    Args:
+        code: Python code containing transform function
+        examples: List of {'input': grid, 'output': grid} dicts
+        timeout_seconds: Timeout for each example execution
+    
+    Returns:
+        List of ExampleResult dictionaries
+    """
+    results = []
+    for i, example in enumerate(examples):
+        predicted_output, error_message = execute_transformation_code(code, example['input'])
+        
+        # Calculate overlap and matching size
+        matching_size = False
+        overlap_percentage = 0.0
+        code_success = False
+        
+        if predicted_output is not None and error_message is None:
+            expected_output = example['output']
+            matching_size, overlap_percentage = calculate_grid_results(predicted_output, expected_output)
+            code_success = matching_size and overlap_percentage >= 99.9
+        
+        result = ExampleResult(
+            example_index=i,
+            input=example['input'],
+            expected_output=example['output'],
+            predicted_output=predicted_output,
+            matching_size=matching_size,
+            overlap_percentage=overlap_percentage,
+            error_message=error_message,
+            code_success=code_success,
+            llm_predicted_output=None,
+            llm_matching_size=None,
+            llm_overlap_percentage=None,
+            llm_error_message=None,
+            llm_success=False,
+        )
+        results.append(result)
+    
+    return results
 
 
 def execute_transformation_code(main_code: str,

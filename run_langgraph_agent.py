@@ -99,14 +99,14 @@ ENABLE_VISUAL_CUE = False  # When True, generate and pass input/output images to
 ENABLE_RAG_HINT = False  # When True, enable retrieval-augmented generation hints from past reasoning traces
 
 NUM_INITIAL_SOLUTIONS = 10
-NUM_LOOPS = 0
+NUM_LOOPS = 1
 NUM_SEED_SOLUTIONS = 10
 NUM_REFINEMENTS = 2
 NUM_SOLUTIONS_PER_REFINEMENT = 5
 NUM_FUSIONS = 2
 NUM_SOLUTIONS_PER_FUSION = 5
-NUM_AUGMENTATIONS = 3  # Number of augmented training examples to generate before each task
-NUM_INLOOP_AUGMENTATIONS = 0  # Number of augmented examples to generate during each reasoning loop
+NUM_AUGMENTATIONS = 0  # Number of augmented training examples to generate before each task
+NUM_INLOOP_AUGMENTATIONS = 3  # Number of augmented examples to generate during each reasoning loop
 RECURSION_LIMIT = 50  # LangGraph recursion limit (default is 25, increase for long workflows)
 
 # Year selection for ARC dataset directory (change to 2025 if using 2025 data)

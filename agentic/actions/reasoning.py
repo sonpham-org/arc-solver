@@ -10,22 +10,49 @@ from ..schema import AgentState, CodeSolution, ExampleResult
 from .utilities import format_grid_for_prompt, format_grid_for_analysis, format_difference_map, _flatten_content
 
 
-def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Optional[List[Dict]] = None, max_retries: int = 3) -> Tuple[str, int]:
+def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Optional[List[Dict]] = None, num_inloop_augmentations: int = 0, max_retries: int = 3) -> Tuple[str, int]:
     """Generate detailed reasoning trace analyzing ARC patterns.
+    
+    Args:
+        num_inloop_augmentations: Number of augmented examples to generate during reasoning
     
     Returns:
         Tuple of (reasoning_trace, num_retries_used)
     """
+    from ..augmentation import augment_task_data
+    
+    # Generate in-loop augmentations if requested
+    augmented_examples = []
+    if num_inloop_augmentations > 0:
+        print(f"🔄 [Reasoning] Generating {num_inloop_augmentations} in-loop augmentations with random seeds...")
+        
+        # Create augmented data with different random seeds each time
+        aug_data = augment_task_data(
+            {"train": training_examples},
+            num_augmentations=num_inloop_augmentations
+        )
+        
+        if aug_data and "train" in aug_data:
+            augmented_examples = aug_data["train"]
+            print(f"✓ Created {len(augmented_examples)} augmented examples")
+    
+    # Combine original and augmented examples
+    all_training_examples = training_examples + augmented_examples
 
     def build_initial_reasoning_prompt(training_examples: List[Dict]) -> str:
         """Build prompt for generating detailed reasoning about ARC patterns."""
+        
+        # Add augmentation note if applicable
+        aug_note = ""
+        if num_inloop_augmentations > 0 and augmented_examples:
+            aug_note = f"\nNote: {len(augmented_examples)} augmented examples were generated using random transformations (rotations, flips, color permutations) to help identify the core pattern.\n"
         
         prompt_parts = [
             "You are an expert mathematician, logistician and pattern recognizier who is solving the"
             "Abstract Reasoning Corpus (ARC) problems.",
             "Your task is to deeply analyze the input-output examples and understand the underlying pattern.",
             "Focus on identifying the core transformation rule that maps inputs to outputs.",
-
+            aug_note,
             "YOUR GOAL:",
             "Given the training pairs and test inputs, infer a general transformation rule that:",
             "- Correctly maps every training input to its output.",
@@ -42,9 +69,11 @@ def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Op
             "TRAINING EXAMPLES:"
         ]
         
-        # Add training examples with detailed formatting
+        # Add training examples with detailed formatting (includes augmented)
         for i, example in enumerate(training_examples):
-            prompt_parts.append(f"\nExample {i+1}:")
+            is_augmented = i >= len(training_examples) - len(augmented_examples)
+            prefix = "[AUGMENTED] " if is_augmented else ""
+            prompt_parts.append(f"\n{prefix}Example {i+1}:")
             prompt_parts.append(f"Input Grid ({len(example['input'])}x{len(example['input'][0]) if example['input'] else 0}):")
             prompt_parts.append(format_grid_for_analysis(example['input']))
             prompt_parts.append(f"Output Grid ({len(example['output'])}x{len(example['output'][0]) if example['output'] else 0}):")
@@ -59,7 +88,7 @@ def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Op
         return "\n".join(prompt_parts)
     
 
-    prompt = build_initial_reasoning_prompt(training_examples)
+    prompt = build_initial_reasoning_prompt(all_training_examples)
     # If visual cues are provided and the llm driver supports image messages,
     # send a structured message containing the images (base64 data URLs).
     if visual_cues:
@@ -104,17 +133,60 @@ def generate_reflection_reasoning_trace(llm,
                                         training_results: List[ExampleResult],
                                         training_examples: List[Dict],
                                         enable_rag_hint: bool,
+                                        num_inloop_augmentations: int = 0,
                                         max_retries: int = 3) -> Tuple[str, int]:
     """Generate a reflection-focused reasoning trace using the ARC-style reflection prompt.
 
     This is intended for refinement: it asks the model to analyze failures, explain
     what went wrong, and produce a reasoning trace focused on correcting the logic.
     
+    Args:
+        num_inloop_augmentations: Number of augmented examples to generate and test during reflection
+    
     Returns:
         Tuple of (reasoning_trace, num_retries_used)
     """
     from .transformation import build_steps_text_from_transformation_steps
     from .rag import retrieve_similar_distillations
+    from ..augmentation import augment_task_data
+    from .code_execution import test_code_on_examples
+    import random
+    
+    # Generate in-loop augmentations if requested
+    augmented_results = []
+    augmented_examples = []
+    if num_inloop_augmentations > 0:
+        print(f"🔄 [Reflection] Generating {num_inloop_augmentations} in-loop augmentations with random seeds...")
+        
+        # Create augmented data with different random seeds each time
+        aug_data = augment_task_data(
+            {"train": training_examples},
+            num_augmentations=num_inloop_augmentations
+        )
+        
+        if aug_data and "train" in aug_data:
+            augmented_examples = aug_data["train"]
+            print(f"✓ Created {len(augmented_examples)} augmented examples")
+            
+            # Run current solution code on augmented examples
+            try:
+                aug_results = test_code_on_examples(
+                    current_solution["main_code"],
+                    augmented_examples,
+                    timeout_seconds=5
+                )
+                augmented_results = aug_results
+                
+                # Log augmentation results
+                success_count = sum(1 for r in aug_results if r.get('code_success', False))
+                print(f"✓ Tested code on augmented examples: {success_count}/{len(aug_results)} passed")
+            except Exception as e:
+                print(f"⚠️  Error testing code on augmented examples: {e}")
+                augmented_results = []
+    
+    # Combine original and augmented results
+    all_training_results = training_results + augmented_results
+    all_training_examples = training_examples + augmented_examples
     
     def build_refinement_reasoning_prompt() -> str:
         """Build reflection prompt based on ARC reflection prompt style for deep analysis."""
@@ -154,11 +226,17 @@ def generate_reflection_reasoning_trace(llm,
         # Format transformation steps
         steps_text = build_steps_text_from_transformation_steps(transformation_steps)
         
-        # Build detailed failure analysis
+        # Build detailed failure analysis (now includes augmented examples)
         failure_analysis = []
-        for test in training_results:
+        for test in all_training_results:
             example_idx = test.get("example_index", 0)
-            if example_idx < len(training_examples):
+            if example_idx < len(all_training_examples):
+                example = all_training_examples[example_idx]
+                
+                # Mark if this is an augmented example
+                original_count = len(training_examples)
+                is_augmented = example_idx >= original_count
+                prefix = "[AUGMENTED] " if is_augmented else ""
                 example = training_examples[example_idx]
                 
                 analysis = f"Training Example {example_idx + 1} - FAILED\\n"
@@ -201,9 +279,16 @@ def generate_reflection_reasoning_trace(llm,
         
         failures_block = "\\n".join(failure_analysis)
         
-        # Build training examples block
+        # Add augmentation note if applicable
+        aug_note = ""
+        if num_inloop_augmentations > 0 and augmented_examples:
+            aug_note = f"\nNote: {len(augmented_examples)} augmented examples were generated using random transformations (rotations, flips, color permutations) to test your solution's robustness.\n"
+        
+        # Build training examples block (includes augmented)
         examples_block = ""
-        for i, example in enumerate(training_examples, 1):
+        for i, example in enumerate(all_training_examples, 1):
+            is_augmented = i > len(training_examples)
+            prefix = "[AUGMENTED] " if is_augmented else ""
             examples_block += f"Training Example {i}\\n--\\n"
             examples_block += f"Input:\\n{format_grid_for_prompt(example['input'])}\\n\\n"
             examples_block += f"Output:\\n{format_grid_for_prompt(example['output'])}\\n\\n"
@@ -221,7 +306,7 @@ def generate_reflection_reasoning_trace(llm,
             "- If the code succeeds but the output doesn't match up, what are the difference between the intended output and your predicted output?",
             "- What is missing from your reasoning and solution that leads to these differences?",
             "- How to modify your reasoning and code to correct for these errors and ensure it solves the task fully?",
-            "",
+            aug_note,
             "------------------"
             "YOUR PREVIOUS CODE",
             "------------------",
@@ -283,12 +368,16 @@ def generate_fused_reasoning_trace(llm,
                                    training_results2: List[ExampleResult],
                                    training_examples: List[Dict],
                                    enable_rag_hint: bool,
+                                   num_inloop_augmentations: int = 0,
                                    max_retries: int = 3) -> Tuple[str, int]:
     """Generate a fused reasoning trace that reconciles two candidate solutions.
 
     The prompt includes both solutions' reasoning, transformation steps, code (if available),
     and the training results. The LLM is asked to produce a single, coherent reasoning
     trace that explains how to combine their strengths and address their failure modes.
+    
+    Args:
+        num_inloop_augmentations: Number of augmented examples to generate and test during fusion
     
     Returns:
         Tuple of (reasoning_trace, num_retries_used)
@@ -297,6 +386,60 @@ def generate_fused_reasoning_trace(llm,
     from .fusion import result_comparison_text
     from .rag import retrieve_similar_distillations
     from ..debug import print_prompt_and_response
+    from ..augmentation import augment_task_data
+    from .code_execution import test_code_on_examples
+    import random
+    
+    # Generate in-loop augmentations if requested
+    augmented_results1 = []
+    augmented_results2 = []
+    augmented_examples = []
+    if num_inloop_augmentations > 0:
+        print(f"🔄 [Fusion] Generating {num_inloop_augmentations} in-loop augmentations with random seeds...")
+        
+        # Create augmented data with different random seeds each time
+        aug_data = augment_task_data(
+            {"train": training_examples},
+            num_augmentations=num_inloop_augmentations
+        )
+        
+        if aug_data and "train" in aug_data:
+            augmented_examples = aug_data["train"]
+            print(f"✓ Created {len(augmented_examples)} augmented examples")
+            
+            # Run both solutions on augmented examples
+            # Test solution A
+            try:
+                aug_results1 = test_code_on_examples(
+                    sola.get("main_code", ""),
+                    augmented_examples,
+                    timeout_seconds=5
+                )
+                augmented_results1 = aug_results1
+                success_count = sum(1 for r in aug_results1 if r.get('code_success', False))
+                print(f"✓ Solution A on augmented: {success_count}/{len(aug_results1)} passed")
+            except Exception as e:
+                print(f"⚠️  Error testing Solution A on augmented examples: {e}")
+                augmented_results1 = []
+            
+            # Test solution B
+            try:
+                aug_results2 = test_code_on_examples(
+                    solb.get("main_code", ""),
+                    augmented_examples,
+                    timeout_seconds=5
+                )
+                augmented_results2 = aug_results2
+                success_count = sum(1 for r in aug_results2 if r.get('code_success', False))
+                print(f"✓ Solution B on augmented: {success_count}/{len(aug_results2)} passed")
+            except Exception as e:
+                print(f"⚠️  Error testing Solution B on augmented examples: {e}")
+                augmented_results2 = []
+    
+    # Combine original and augmented results
+    all_training_results1 = training_results1 + augmented_results1
+    all_training_results2 = training_results2 + augmented_results2
+    all_training_examples = training_examples + augmented_examples
     
     def build_fused_reasoning_trace_prompt():
         reasoning_a = sola.get('reasoning_trace') or "(no reasoning)"
@@ -307,7 +450,13 @@ def generate_fused_reasoning_trace(llm,
         steps_text_b = build_steps_text_from_transformation_steps(solb.get('step_by_step_transformation') or [])
         code_b = solb.get('main_code') or "(no code)"
 
-        training_results_text = result_comparison_text(training_results1, training_results2)
+        # Use augmented results in comparison
+        training_results_text = result_comparison_text(all_training_results1, all_training_results2)
+        
+        # Add augmentation note if applicable
+        aug_note = ""
+        if num_inloop_augmentations > 0 and augmented_examples:
+            aug_note = f"\nNote: {len(augmented_examples)} augmented examples (using rotations, flips, color permutations) were generated to test both solutions' robustness.\n"
 
         rag_concepts = set()
         rag_hints_parts = []
@@ -348,7 +497,7 @@ def generate_fused_reasoning_trace(llm,
         parts = [
             "You are an expert ARC solver. Two candidate solutions were produced for the same task.",
             "Your job is to reconcile them into a single solution that combines their strengths and remedies their weaknesses.",
-            "",
+            aug_note,
             "----------",
             "SOLUTION A",
             "----------",

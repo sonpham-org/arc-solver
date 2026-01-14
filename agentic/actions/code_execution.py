@@ -4,11 +4,103 @@ Code execution and evaluation functions for ARC agent.
 
 import ast
 import traceback
+import subprocess
+import sys
+import re
 from typing import List, Dict, Optional, Any, Tuple
 
 from .code_generation import extract_python_solutions, ensure_imports_in_code
 from .utilities import format_grid_for_prompt
 from ..schema import ExampleResult
+
+# Whitelist of safe scientific/data libraries that can be auto-installed
+SAFE_LIBRARIES = {
+    'scipy', 'scikit-learn', 'sklearn', 'networkx', 'sympy', 'statsmodels',
+    'seaborn', 'plotly', 'opencv-python', 'cv2', 'imageio', 'skimage',
+    'scikit-image', 'nltk', 'spacy', 'gensim', 'xgboost', 'lightgbm',
+    'catboost', 'pulp', 'cvxpy', 'ortools', 'numba', 'dask', 'joblib'
+}
+
+# Map common import names to their pip package names
+IMPORT_TO_PACKAGE = {
+    'cv2': 'opencv-python',
+    'sklearn': 'scikit-learn',
+    'skimage': 'scikit-image',
+}
+
+# Track which libraries we've already asked about this session
+_ASKED_LIBRARIES = set()
+
+
+def is_safe_library(module_name: str) -> bool:
+    """Check if a module is in the safe library whitelist."""
+    # Extract base module name (e.g., 'scipy.stats' -> 'scipy')
+    base_module = module_name.split('.')[0]
+    return base_module.lower() in SAFE_LIBRARIES
+
+
+def get_package_name(module_name: str) -> str:
+    """Get the pip package name for a given module import name."""
+    base_module = module_name.split('.')[0]
+    return IMPORT_TO_PACKAGE.get(base_module, base_module)
+
+
+def attempt_library_installation(module_name: str, auto_install: bool = False) -> bool:
+    """Attempt to install a missing library with user confirmation.
+    
+    Args:
+        module_name: The module that failed to import
+        auto_install: If True, install without asking (use with caution)
+    
+    Returns:
+        True if installation succeeded, False otherwise
+    """
+    # Skip if we've already asked about this library
+    if module_name in _ASKED_LIBRARIES:
+        return False
+    
+    _ASKED_LIBRARIES.add(module_name)
+    
+    # Check if it's a safe library
+    if not is_safe_library(module_name):
+        print(f"\n⚠️  Missing library '{module_name}' is not in the safe library list.")
+        print(f"   For security reasons, automatic installation is not available.")
+        print(f"   Please install manually if needed: pip install {module_name}")
+        return False
+    
+    package_name = get_package_name(module_name)
+    
+    if not auto_install:
+        print(f"\n📦 Missing library detected: '{module_name}'")
+        print(f"   This is a recognized scientific library and safe to install.")
+        response = input(f"   Install '{package_name}' now? [y/N]: ").strip().lower()
+        if response not in ('y', 'yes'):
+            print(f"   Skipping installation. Code requiring '{module_name}' will fail.")
+            return False
+    
+    print(f"\n📥 Installing {package_name}...")
+    try:
+        # Use subprocess to install the package
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", package_name],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        
+        if result.returncode == 0:
+            print(f"✅ Successfully installed {package_name}")
+            return True
+        else:
+            print(f"❌ Failed to install {package_name}")
+            print(f"   Error: {result.stderr[:200]}")
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"❌ Installation of {package_name} timed out")
+        return False
+    except Exception as e:
+        print(f"❌ Installation error: {e}")
+        return False
 
 
 def test_code_on_examples(code: str, examples: List[Dict], timeout_seconds: int = 5) -> List[ExampleResult]:
@@ -98,6 +190,50 @@ def execute_transformation_code(main_code: str,
 
         # Execute the main code
         exec(main_code, namespace)
+
+    except (ImportError, ModuleNotFoundError) as import_err:
+        # Handle missing library imports
+        error_msg = str(import_err)
+        # Extract module name from error message (e.g., "No module named 'scipy'")
+        match = re.search(r"No module named ['\"]([^'\"]+)['\"]|cannot import name .+ from ['\"]([^'\"]+)['\"]|No module named: ([^\s]+)", error_msg)
+        if match:
+            module_name = match.group(1) or match.group(2) or match.group(3)
+            print(f"\n⚠️  Code execution failed: Missing module '{module_name}'")
+            
+            # Attempt to install the library
+            if attempt_library_installation(module_name):
+                # Retry execution after successful installation
+                print(f"\n🔄 Retrying code execution after installing {module_name}...")
+                try:
+                    namespace = {"__builtins__": __builtins__}
+                    exec(main_code, namespace)
+                    
+                    # Call transform function if execution succeeded
+                    if "transform" in namespace:
+                        try:
+                            result = namespace["transform"](input_grid)
+                            return result, None
+                        except Exception as inner_e:
+                            tb = traceback.format_exc()
+                            print(f"Error while running transform(): {inner_e}\n{tb}")
+                            return None, str(inner_e) + "\n" + tb
+                    else:
+                        err = "transform function not found in executed code"
+                        print(err)
+                        return None, err
+                except Exception as retry_e:
+                    tb = traceback.format_exc()
+                    print(f"Error executing code after library installation: {retry_e}\n{tb}")
+                    return None, str(retry_e) + "\n" + tb
+            else:
+                # Installation failed or was declined
+                tb = traceback.format_exc()
+                return None, f"Missing required library: {module_name}\n" + tb
+        else:
+            # Couldn't parse module name from error
+            tb = traceback.format_exc()
+            print(f"Import error (could not determine module): {import_err}\n{tb}")
+            return None, str(import_err) + "\n" + tb
 
         # Call the transform function
         if "transform" in namespace:

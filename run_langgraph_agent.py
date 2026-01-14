@@ -70,9 +70,9 @@ except Exception:
 # For fast local debugging prefer an Ollama-hosted local model (free/local).
 # Reasoning model is used for reasoning & reflection
 # Coding model is used for code generation & execution
-REASONING_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
-TRANSFORMATION_STEPS_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
-CODING_MODEL = "gemini-2.5-flash"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+REASONING_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+TRANSFORMATION_STEPS_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
+CODING_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash", "llama3.1", "qwen2.5:32b"
 USE_VLLM = False
 
 # Test mode configuration

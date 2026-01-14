@@ -66,7 +66,7 @@ TASK_ID = None  # Specific task ID to test (for single mode)
 TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
-NUM_TASKS = 120  # Number of tasks for batch mode
+NUM_TASKS = 20  # Number of tasks for batch mode
 
 # Processing configuration
 MAX_ATTEMPTS = 3  # Maximum attempts per task

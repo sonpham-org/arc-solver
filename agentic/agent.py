@@ -309,6 +309,11 @@ class ARCLangGraphAgent(BaseARCAgent):
                  enable_llm_predict: bool = False,
                  enable_visual_cue: bool = False,
                  enable_rag_hint: bool = False,
+                 llm_as_judge_verification: bool = False,
+                 cove_verification: bool = False,
+                 adversarial_verification: bool = False,
+                 verification_confidence_threshold: float = 0.75,
+                 verification_num_augmentations: int = 10,
                  max_generations: int = 3,
                  recursion_limit: int = 200,
                  qdrant_client=None,
@@ -334,6 +339,11 @@ class ARCLangGraphAgent(BaseARCAgent):
             enable_llm_predict: Whether to enable LLM-predicted outputs
             enable_visual_cue: Whether to pass visual cues to LLM
             enable_rag_hint: Whether to use RAG hints from past traces
+            llm_as_judge_verification: Whether to enable LLM-as-judge verification
+            cove_verification: Whether to enable Chain of Verification
+            adversarial_verification: Whether to enable adversarial testing
+            verification_confidence_threshold: Minimum confidence to accept verified solution
+            verification_num_augmentations: Number of augmented cases for verification
             max_generations: Maximum generations for workflow
             recursion_limit: LangGraph recursion limit
             qdrant_client: Optional Qdrant client for RAG storage
@@ -366,6 +376,11 @@ class ARCLangGraphAgent(BaseARCAgent):
             enable_llm_predict=enable_llm_predict,
             enable_visual_cue=enable_visual_cue,
             enable_rag_hint=enable_rag_hint,
+            llm_as_judge_verification=llm_as_judge_verification,
+            cove_verification=cove_verification,
+            adversarial_verification=adversarial_verification,
+            verification_confidence_threshold=verification_confidence_threshold,
+            verification_num_augmentations=verification_num_augmentations,
             max_generations=max_generations,
             recursion_limit=recursion_limit
         )

@@ -98,6 +98,13 @@ ENABLE_LLM_PREDICT = False # Whether to enable LLM-predicted outputs during test
 ENABLE_VISUAL_CUE = False  # When True, generate and pass input/output images to the LLM
 ENABLE_RAG_HINT = False  # When True, enable retrieval-augmented generation hints from past reasoning traces
 
+# Verification configuration
+LLM_AS_JUDGE_VERIFICATION = False  # Whether to enable LLM-as-judge verification for perfect solutions
+COVE_VERIFICATION = False  # Whether to enable Chain of Verification (self-questioning) for perfect solutions
+ADVERSARIAL_VERIFICATION = False  # Whether to enable adversarial edge case testing for perfect solutions
+VERIFICATION_CONFIDENCE_THRESHOLD = 0.75  # Minimum confidence (0-1) to accept a verified solution
+VERIFICATION_NUM_AUGMENTATIONS = 10  # Number of augmented test cases to generate for verification
+
 NUM_INITIAL_SOLUTIONS = 10
 NUM_LOOPS = 1
 NUM_SEED_SOLUTIONS = 10
@@ -827,6 +834,23 @@ def parse_arguments():
                        default=ENABLE_RAG_HINT,
                        help=f"Enable retrieval-augmented generation hints from past traces (default: {ENABLE_RAG_HINT})")
     
+    # Verification flags
+    parser.add_argument("--llm-as-judge-verification", action="store_true",
+                       default=LLM_AS_JUDGE_VERIFICATION,
+                       help=f"Enable LLM-as-judge verification for perfect solutions (default: {LLM_AS_JUDGE_VERIFICATION})")
+    parser.add_argument("--cove-verification", action="store_true",
+                       default=COVE_VERIFICATION,
+                       help=f"Enable Chain of Verification (self-questioning) for perfect solutions (default: {COVE_VERIFICATION})")
+    parser.add_argument("--adversarial-verification", action="store_true",
+                       default=ADVERSARIAL_VERIFICATION,
+                       help=f"Enable adversarial edge case testing for perfect solutions (default: {ADVERSARIAL_VERIFICATION})")
+    parser.add_argument("--verification-confidence-threshold", type=float,
+                       default=VERIFICATION_CONFIDENCE_THRESHOLD,
+                       help=f"Minimum confidence (0-1) to accept a verified solution (default: {VERIFICATION_CONFIDENCE_THRESHOLD})")
+    parser.add_argument("--verification-num-augmentations", type=int,
+                       default=VERIFICATION_NUM_AUGMENTATIONS,
+                       help=f"Number of augmented test cases for verification (default: {VERIFICATION_NUM_AUGMENTATIONS})")
+    
     # Numeric workflow configuration exposed as CLI flags
     parser.add_argument("--num-initial-solutions", type=int,
                         default=NUM_INITIAL_SOLUTIONS,
@@ -988,6 +1012,11 @@ def main():
         enable_rag_hint=args.enable_rag_hint,
         enable_code_predict=args.enable_code_predict,
         enable_llm_predict=args.enable_llm_predict,
+        llm_as_judge_verification=args.llm_as_judge_verification,
+        cove_verification=args.cove_verification,
+        adversarial_verification=args.adversarial_verification,
+        verification_confidence_threshold=args.verification_confidence_threshold,
+        verification_num_augmentations=args.verification_num_augmentations,
         recursion_limit=getattr(args, 'recursion_limit', RECURSION_LIMIT),
         qdrant_client=QDRANT_CLIENT,
         qdrant_collection_name=QDRANT_COLLECTION_NAME)
@@ -1068,6 +1097,11 @@ def main():
                 enable_rag_hint=args.enable_rag_hint,
                 enable_code_predict=args.enable_code_predict,
                 enable_llm_predict=args.enable_llm_predict,
+                llm_as_judge_verification=args.llm_as_judge_verification,
+                cove_verification=args.cove_verification,
+                adversarial_verification=args.adversarial_verification,
+                verification_confidence_threshold=args.verification_confidence_threshold,
+                verification_num_augmentations=args.verification_num_augmentations,
                 recursion_limit=getattr(args, 'recursion_limit', RECURSION_LIMIT),
                 qdrant_client=QDRANT_CLIENT,
                 qdrant_collection_name=QDRANT_COLLECTION_NAME)

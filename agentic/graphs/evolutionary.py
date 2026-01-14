@@ -16,7 +16,8 @@ from ..nodes import (
     test_code_node,
     finalize_node,
     evolve_code_node,
-    save_state_node
+    save_state_node,
+    verify_solutions_node
 )
 
 
@@ -169,6 +170,10 @@ class EvolutionaryGraphBuilder(BaseGraphBuilder):
                          lambda state: test_code_node(state, self.llm,
                                                       self.transformation_llm,
                                                       self.code_llm))
+        workflow.add_node("verify_solutions",
+                         lambda state: verify_solutions_node(state, self.llm,
+                                                            self.transformation_llm,
+                                                            self.code_llm))
         workflow.add_node("finalize", finalize_node)
         workflow.add_node("save_state", save_state_node)
         workflow.add_node("decide", lambda state: state)
@@ -179,6 +184,7 @@ class EvolutionaryGraphBuilder(BaseGraphBuilder):
         workflow.add_edge("test_code", "save_state")
         workflow.add_edge("save_state", "decide")
         workflow.add_edge("evolve_code", "test_code")
+        workflow.add_edge("verify_solutions", "finalize")
         workflow.add_edge("finalize", END)
         
         # Conditional routing from setup
@@ -189,11 +195,21 @@ class EvolutionaryGraphBuilder(BaseGraphBuilder):
         
         # Conditional routing from decide
         def decide_next(state):
-            if out_of_loops(state):
-                return "finalize"
+            # First check if we have a perfect solution
             if one_solution_succeeded(state):
+                # Check if we haven't verified yet or verification failed
+                if not state.get('verification_passed'):
+                    return "verify_solutions"
+                else:
+                    # Verification passed, finalize
+                    return "finalize"
+            
+            # Check if out of loops
+            if out_of_loops(state):
+                # Out of loops - select best solution and finalize
                 return "finalize"
             
+            # Continue evolution
             solutions_list = state.get('solutions_list', [])
             if not solutions_list:
                 return "generate_code"
@@ -203,7 +219,8 @@ class EvolutionaryGraphBuilder(BaseGraphBuilder):
         workflow.add_conditional_edges("decide", decide_next, {
             "finalize": "finalize",
             "generate_code": "generate_code",
-            "evolve_code": "evolve_code"
+            "evolve_code": "evolve_code",
+            "verify_solutions": "verify_solutions"
         })
         
         return workflow.compile()
@@ -248,6 +265,12 @@ class EvolutionaryGraphBuilder(BaseGraphBuilder):
             "enable_code_predict": self.get_config_param('enable_code_predict', True),
             "enable_llm_predict": self.get_config_param('enable_llm_predict', False),
             "enable_parallel_eval": self.get_config_param('enable_parallel_eval', False),
+            "llm_as_judge_verification": self.get_config_param('llm_as_judge_verification', False),
+            "cove_verification": self.get_config_param('cove_verification', False),
+            "adversarial_verification": self.get_config_param('adversarial_verification', False),
+            "verification_confidence_threshold": self.get_config_param('verification_confidence_threshold', 0.75),
+            "verification_num_augmentations": self.get_config_param('verification_num_augmentations', 10),
+            "verification_passed": False,
             "generations": [],
             "current_generation": 0,
             "max_generations": self.get_config_param('max_generations', max_attempts),

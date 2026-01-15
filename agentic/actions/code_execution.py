@@ -541,8 +541,13 @@ def test_and_fix_code_from_trial_run(code_llm, python_codes_list: List[str], tra
         return python_codes_list, trial_run_results
 
     # Normalize by ensuring imports are present and return
+    try:
+        fixed_solutions = [ensure_imports_in_code(s) for s in fixed_solutions]
+    except Exception as e:
+        print(f"test_and_fix_code_from_trial_run: Failed to normalize fixed solutions: {e}")
+        return python_codes_list, trial_run_results
+    
     fixed_idx = 0
-    fixed_solutions = [ensure_imports_in_code(s) for s in fixed_solutions]
     for r in trial_run_results:
         idx = r.get('index', 0)
         if r.get('error'):

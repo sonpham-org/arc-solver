@@ -69,7 +69,9 @@ def create_solutions_with_reasoning(llm, transformation_llm, code_llm,
     # in `test_and_fix_code_from_trial_run` which returns possibly-updated
     # candidates and the trial run diagnostics.
     try:
-        python_codes_list, trial_run_results = test_and_fix_code_from_trial_run(code_llm, python_codes_list, training_examples)
+        result = test_and_fix_code_from_trial_run(code_llm, python_codes_list, training_examples)
+        if result is not None:
+            python_codes_list, trial_run_results = result
     except Exception as e:
         print(f"Warning: test_and_fix_code_from_trial_run failed: {e}")
     
@@ -124,7 +126,6 @@ def fuse_solutions_with_reasoning(llm,
     Returns a tuple: (python_codes_list, fused_reasoning_trace, fused_transformation_solutions_list)
     """
     from .reasoning import generate_fused_reasoning_trace
-    from .transformation import generate_fused_transformation_steps
     from .code_generation import generate_code_from_reasoning, generate_code_from_reasoning_and_transformations
     from .rag import extract_helpers_from_python_codes
     

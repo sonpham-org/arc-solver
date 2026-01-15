@@ -7,7 +7,7 @@ import textwrap
 from typing import List, Dict, Optional, Any, Tuple
 
 from ..schema import AgentState, CodeSolution, ExampleResult
-from .utilities import format_grid_for_prompt, format_grid_for_analysis, format_difference_map, _flatten_content
+from .utilities import format_grid_for_prompt, format_grid_for_analysis, format_difference_map, _flatten_content, build_steps_text_from_transformation_steps
 
 
 def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Optional[List[Dict]] = None, num_inloop_augmentations: int = 0, max_retries: int = 3) -> Tuple[str, int]:
@@ -382,7 +382,6 @@ def generate_fused_reasoning_trace(llm,
     Returns:
         Tuple of (reasoning_trace, num_retries_used)
     """
-    from .transformation import build_steps_text_from_transformation_steps
     from .fusion import result_comparison_text
     from .rag import retrieve_similar_distillations
     from ..debug import print_prompt_and_response

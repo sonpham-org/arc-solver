@@ -12,6 +12,7 @@ from typing import List, Dict, Optional, Any, Tuple
 from .code_generation import extract_python_solutions, ensure_imports_in_code
 from .utilities import format_grid_for_prompt
 from ..schema import ExampleResult
+from agentic.debug import print_prompt_and_response
 
 # Whitelist of safe scientific/data libraries that can be auto-installed
 SAFE_LIBRARIES = {
@@ -235,24 +236,24 @@ def execute_transformation_code(main_code: str,
             print(f"Import error (could not determine module): {import_err}\n{tb}")
             return None, str(import_err) + "\n" + tb
 
-        # Call the transform function
-        if "transform" in namespace:
-            try:
-                result = namespace["transform"](input_grid)
-                return result, None
-            except Exception as inner_e:
-                tb = traceback.format_exc()
-                print(f"Error while running transform(): {inner_e}\n{tb}")
-                return None, str(inner_e) + "\n" + tb
-        else:
-            err = "transform function not found in executed code"
-            print(err)
-            return None, err
-
     except Exception as e:
         tb = traceback.format_exc()
         print(f"Error executing transformation code: {e}\n{tb}")
         return None, str(e) + "\n" + tb
+
+    # Call the transform function (executes when exec succeeded without exceptions)
+    if "transform" in namespace:
+        try:
+            result = namespace["transform"](input_grid)
+            return result, None
+        except Exception as inner_e:
+            tb = traceback.format_exc()
+            print(f"Error while running transform(): {inner_e}\n{tb}")
+            return None, str(inner_e) + "\n" + tb
+    else:
+        err = "transform function not found in executed code"
+        print(err)
+        return None, err
 
 
 def calculate_grid_results(predicted: List[List[int]], expected: List[List[int]]) -> Tuple[bool, float]:
@@ -531,7 +532,7 @@ def test_and_fix_code_from_trial_run(code_llm, python_codes_list: List[str], tra
     try:
         response = code_llm.invoke(prompt, temperature=0.2)
         response_text = response.content if hasattr(response, 'content') else str(response)
-        # print_prompt_and_response(prompt, response_text)
+        print_prompt_and_response(prompt, response_text)
     except Exception as e:
         print(f"test_and_fix_code_from_trial_run: LLM invocation failed: {e}")
         return python_codes_list, trial_run_results

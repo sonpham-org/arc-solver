@@ -7,6 +7,7 @@ import json
 from typing import List, Dict, Tuple
 
 from .utilities import format_grid_for_prompt, parse_transformation_steps
+from agentic.debug import print_prompt_and_response
 
 
 def generate_transformation_steps(llm, reasoning_trace: str, training_examples: List[Dict], num_solutions: int, max_retries: int = 3) -> Tuple[List[Dict], int]:
@@ -73,7 +74,7 @@ def generate_transformation_steps(llm, reasoning_trace: str, training_examples: 
             response = llm.invoke(prompt, temperature=0.7)
             response_text = response.content if hasattr(response, 'content') else str(response)
             
-            # print_prompt_and_response(prompt, response_text)
+            print_prompt_and_response(prompt, response_text)
 
             solutions = parse_transformation_steps(response_text)
             if solutions:

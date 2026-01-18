@@ -10,6 +10,7 @@ from ..schema import CodeSolution, ExampleResult, ReasoningTraceRecord
 from .utilities import format_grid_for_prompt, format_difference_map, parse_transformation_steps, build_steps_text_from_transformation_steps
 from .reasoning import generate_distilled_reasoning
 from .rag import retrieve_similar_distillations, store_record, generate_embedding_from_distilled_reasoning
+from agentic.debug import print_prompt_and_response
 
 
 def create_solutions_with_reasoning(llm, transformation_llm, code_llm, 
@@ -120,7 +121,8 @@ def fuse_solutions_with_reasoning(llm,
                                   training_examples: List[Dict],
                                   num_fused_solutions: int,
                                   enable_visual_cue: bool = False,
-                                  enable_rag_hint: bool = False) -> Tuple[List[str], str, List[Dict]]:
+                                  enable_rag_hint: bool = False,
+                                  num_inloop_augmentations: int = 0) -> Tuple[List[str], str, List[Dict]]:
     """Attempt to fuse two CodeSolution candidates into a stronger combined solution.
 
     Returns a tuple: (python_codes_list, fused_reasoning_trace, fused_transformation_solutions_list)
@@ -139,7 +141,7 @@ def fuse_solutions_with_reasoning(llm,
     trb = solb.get('training_results') or []
 
     # 1) Generate fused reasoning trace
-    fused_reasoning, reasoning_retries = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples, enable_rag_hint)
+    fused_reasoning, reasoning_retries = generate_fused_reasoning_trace(llm, sola, solb, tra, trb, training_examples, enable_rag_hint, num_inloop_augmentations)
 
     # 2) Generate fused transformation steps
     fused_transformation_solutions, transformation_retries = generate_fused_transformation_steps(transformation_llm, fused_reasoning, sola, solb, tra, trb, training_examples, num_fused_solutions)
@@ -314,7 +316,7 @@ def generate_fused_transformation_steps(llm,
         try:
             response = llm.invoke(prompt, temperature=0.7)
             response_text = response.content if hasattr(response, 'content') else str(response)
-            # print_prompt_and_response(prompt, response_text)
+            print_prompt_and_response(prompt, response_text)
             solutions = parse_transformation_steps(response_text)
             
             if solutions:

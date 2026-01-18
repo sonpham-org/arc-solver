@@ -11,6 +11,7 @@ from .reasoning import generate_reflection_reasoning_trace, generate_distilled_r
 from .code_generation import generate_code_from_reasoning, generate_code_from_reasoning_and_transformations
 from .rag import generate_embedding_from_distilled_reasoning, extract_helpers_from_python_codes, store_record
 from .utilities import format_grid_for_prompt, format_difference_map, parse_transformation_steps
+from agentic.debug import print_prompt_and_response
 
 
 def generate_refined_transformation_steps(llm, reasoning_trace: str, sol: Dict, training_examples: List[Dict], num_solutions: int, max_retries: int = 3) -> Tuple[List[Dict], int]:
@@ -120,7 +121,7 @@ def generate_refined_transformation_steps(llm, reasoning_trace: str, sol: Dict, 
             response = llm.invoke(prompt, temperature=0.7)
             response_text = response.content if hasattr(response, 'content') else str(response)
 
-            # print_prompt_and_response(prompt, response_text)
+            print_prompt_and_response(prompt, response_text)
 
             solutions = parse_transformation_steps(response_text)
             if solutions:

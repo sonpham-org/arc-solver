@@ -7,6 +7,7 @@ import ast
 from typing import List, Dict, Tuple, Union
 
 from .utilities import format_grid_for_prompt
+from agentic.debug import print_prompt_and_response
 
 
 def generate_code_from_reasoning(code_llm, reasoning_trace: str, training_examples: List[Dict], num_solutions: int, max_retries: int = 3) -> Tuple[List[str], int]:
@@ -87,7 +88,7 @@ def generate_code_from_reasoning(code_llm, reasoning_trace: str, training_exampl
         try:
             response = code_llm.invoke(prompt, temperature=0.3)
             response_text = response.content if hasattr(response, 'content') else str(response)
-            # print_prompt_and_response(prompt, response_text)
+            print_prompt_and_response(prompt, response_text)
             
             # Extract candidate python solutions (may be multiple)
             candidate_codes = extract_python_solutions(response_text)
@@ -202,7 +203,7 @@ def generate_code_from_reasoning_and_transformations(code_llm, reasoning_trace: 
         response = code_llm.invoke(prompt, temperature=0.3)
         response_text = response.content if hasattr(response, 'content') else str(response)
 
-        # print_prompt_and_response(prompt, response_text)
+        print_prompt_and_response(prompt, response_text)
         
         # Extract candidate python solutions (may be multiple)
         candidate_codes = extract_python_solutions(response_text)

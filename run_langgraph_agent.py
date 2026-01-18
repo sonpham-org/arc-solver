@@ -76,7 +76,7 @@ CODING_MODEL = "gemini-2.5-flash-lite"  # e.g., "gpt-4o-mini", "gemini-2.0-flash
 USE_VLLM = False
 
 # Test mode configuration
-MODE = "batch"  # "single" or "batch"
+MODE = "single"  # "single" or "batch"
 NUM_WORKERS = 8  # Number of parallel workers for batch mode
 
 # Task selection for single mode
@@ -85,7 +85,7 @@ TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
 NUM_TASKS = 20  # Number of tasks for batch mode
-EVALUATE_ONLY = False
+EVALUATE_ONLY = True
 
 # Processing configuration
 MAX_ATTEMPTS = 10  # Maximum attempts per task

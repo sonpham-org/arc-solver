@@ -4,6 +4,7 @@ Example showing how to use logging in your agent modules.
 This demonstrates the key benefit: no need to pass debug flags around!
 """
 import logging
+from agentic.debug import print_prompt_and_response
 
 # Get a logger for this module - each module gets its own logger
 logger = logging.getLogger(__name__)
@@ -41,9 +42,6 @@ def generate_transformation(pattern):
 
 def call_llm(prompt):
     """Example showing LLM interaction logging."""
-    
-    # Import the debug helper that respects log level
-    from agentic.debug import print_prompt_and_response
     
     # Simulate LLM call
     response = "Sample LLM response"

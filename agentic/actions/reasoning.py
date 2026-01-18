@@ -8,7 +8,7 @@ from typing import List, Dict, Optional, Any, Tuple
 
 from ..schema import AgentState, CodeSolution, ExampleResult
 from .utilities import format_grid_for_prompt, format_grid_for_analysis, format_difference_map, _flatten_content, build_steps_text_from_transformation_steps
-
+from agentic.debug import print_prompt_and_response
 
 def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Optional[List[Dict]] = None, num_inloop_augmentations: int = 0, max_retries: int = 3) -> Tuple[str, int]:
     """Generate detailed reasoning trace analyzing ARC patterns.
@@ -105,7 +105,7 @@ def generate_reasoning_trace(llm, training_examples: List[Dict], visual_cues: Op
                 resp_content = response
             
             response_text = _flatten_content(resp_content)
-            # print_prompt_and_response(prompt, response_text)
+            print_prompt_and_response(prompt, response_text)
 
             # Extract reasoning from response
             reasoning = extract_reasoning_content(response_text)
@@ -146,7 +146,6 @@ def generate_reflection_reasoning_trace(llm,
     Returns:
         Tuple of (reasoning_trace, num_retries_used)
     """
-    from .transformation import build_steps_text_from_transformation_steps
     from .rag import retrieve_similar_distillations
     from ..augmentation import augment_task_data
     from .code_execution import test_code_on_examples

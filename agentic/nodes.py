@@ -216,6 +216,7 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
     num_solutions_per_refinement = state["num_solutions_per_refinement"]
     num_fusions = state["num_fusions"]
     num_solutions_per_fusion = state["num_solutions_per_fusion"]
+    num_inloop_augmentations = state["num_inloop_augmentations"]
 
     # Make a deep copy of the incoming state to avoid mutating caller's object
     new_state["current_loop"] = state.get("current_loop") + 1
@@ -280,7 +281,7 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
                 num_fused_solutions=num_solutions_per_fusion,
                 enable_visual_cue=enable_visual_cue,
                 enable_rag_hint=enable_rag_hint,
-            )
+                num_inloop_augmentations=num_inloop_augmentations)
 
             for transformation, code in zip(transformation_solutions_list, python_codes):
                 solution = {

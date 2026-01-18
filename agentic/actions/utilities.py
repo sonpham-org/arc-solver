@@ -5,10 +5,13 @@ Pure utility functions for ARC agent.
 import re
 import json
 from typing import List, Dict, Optional, Any, Tuple
+from agentic.debug import print_prompt_and_response
 
 
 def format_grid_for_prompt(grid: List[List[int]], indent: int = 0) -> str:
     """Format grid for display in prompts."""
+    if grid is None:
+        grid = []
     indentation = " " * indent
     return "\n".join(indentation + " ".join(map(str, row)) for row in grid)
 
@@ -142,7 +145,7 @@ def generate_llm_predicted_output(llm,
         response = llm.invoke(prompt)
         response_text = response.content if hasattr(response, 'content') else str(response)
 
-        # print_prompt_and_response(prompt, response_text)
+        print_prompt_and_response(prompt, response_text)
 
         # Prefer a fenced block labelled ```llm_predicted_output``` containing
         # the grid as lines of numbers (space-separated or run-together digits).

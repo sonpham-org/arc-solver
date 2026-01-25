@@ -17,6 +17,8 @@ import re
 # Import schema and node-facing types
 from .debug import print_python_code
 from .schema import AgentState, CodeSolution, ExampleResult, Grid
+from langchain_core.messages import HumanMessage, AIMessage
+
 
 # Import actions (helpers, prompts, execution, refinement)
 from .actions import (
@@ -108,18 +110,44 @@ def _calculate_stats_from_results(results: List[ExampleResult]) -> Dict[str, flo
     }
 
 
-def calculate_solution_statistics(solution: CodeSolution) -> CodeSolution:
+def calculate_solution_statistics(solution: CodeSolution, num_original_train: Optional[int] = None) -> CodeSolution:
     """Populate statistic fields for a `CodeSolution` (mutates in-place).
 
     Uses the typed `training_results`/`testing_results` lists to compute
     success rates, overlap averages and error rates for code and LLM predictions.
+
+    If `num_original_train` is provided, it splits the `training_results` list
+    into original training results and augmented training results.
     """
-    train_results: List[ExampleResult] = solution.get("training_results", []) or []
+    total_train_results: List[ExampleResult] = solution.get("training_results", []) or []
     test_results: List[ExampleResult] = solution.get("testing_results", []) or []
 
-    train_stats = _calculate_stats_from_results(train_results)
+    if num_original_train is not None and len(total_train_results) > num_original_train:
+        train_results = total_train_results[:num_original_train]
+        augment_results = total_train_results[num_original_train:]
+        
+        # Calculate stats for original training
+        train_stats = _calculate_stats_from_results(train_results)
+        
+        # Calculate stats for augmented training
+        augment_stats = _calculate_stats_from_results(augment_results)
+        
+        solution["augment_training_results"] = augment_results
+        solution["augment_training_success_rate"] = augment_stats["success_rate"]
+        solution["augment_training_overlap_average"] = augment_stats["overlap_average"]
+        solution["augment_training_error_rate"] = augment_stats["error_rate"]
+    else:
+        train_results = total_train_results
+        train_stats = _calculate_stats_from_results(train_results)
+        
+        solution["augment_training_results"] = []
+        solution["augment_training_success_rate"] = 0.0
+        solution["augment_training_overlap_average"] = 0.0
+        solution["augment_training_error_rate"] = 0.0
+
     test_stats = _calculate_stats_from_results(test_results)
 
+    solution["training_results"] = train_results # Update to only include original
     solution["training_success_rate"] = train_stats["success_rate"]
     solution["training_overlap_average"] = train_stats["overlap_average"]
     solution["training_error_rate"] = train_stats["error_rate"]
@@ -149,11 +177,18 @@ def generate_code_node(state: AgentState, llm, transformation_llm, code_llm) -> 
     task_data = state["task_data"]
     num_initial_solutions = state["num_initial_solutions"]
 
+    # Handle preloop randomization: if in preloop mode, generate fresh augmentations
+    num_augmentations = state.get("num_augmentations", 0)
+    mode = state.get("augmentation_randomization_mode", "pretask")
+    if num_augmentations > 0 and mode == "preloop":
+        print(f"Task {tid} [generate_code_node]: Dynamic augmentation (preloop). Generating {num_augmentations} fresh examples...")
+        new_state['augment_data'] = augment_task_data(task_data, num_augmentations)
+
     # Analyze the training examples (kept for node-level logging/analysis)
     training_examples = task_data["train"]
     
-    # Add augmented data if available
-    augment_data = state.get('augment_data')
+    # Add augmented data if available (from new_state in case of preloop update)
+    augment_data = new_state.get('augment_data')
     if augment_data and 'train' in augment_data:
         training_examples = training_examples + augment_data['train']
         print(f"Task {tid} [generate_code_node]: Using {len(task_data['train'])} original + {len(augment_data['train'])} augmented = {len(training_examples)} total training examples")
@@ -161,6 +196,23 @@ def generate_code_node(state: AgentState, llm, transformation_llm, code_llm) -> 
     # Generate code using the reasoning-first approach from actions
     # Read visual cue flag from node state and pass through to generation
     enable_visual_cue = state.get('enable_visual_cue', False)
+    num_inreasoning_augmentations = state.get("num_inreasoning_augmentations", 0)
+    
+    # NEW: Handle LLM Memory
+    memory_type = state.get("llm_memory_type", "none")
+    memory_context = ""
+    
+    if memory_type == "message_history":
+        messages = state.get("messages", [])
+        if messages:
+            memory_context = "\n\n### Previous Task Context ###\n"
+            for m in messages:
+                role = "Assistant" if isinstance(m, AIMessage) else "User"
+                memory_context += f"[{role}]: {m.content}\n"
+    elif memory_type == "summary":
+        summary = state.get("task_memory_summary", "")
+        if summary:
+            memory_context = f"\n\n### Task Learning Summary ###\n{summary}\n"
 
     python_codes, reasoning_trace, transformation_solutions_list, rag_entry, reasoning_retries, transformation_retries = create_solutions_with_reasoning(
         llm,
@@ -168,8 +220,18 @@ def generate_code_node(state: AgentState, llm, transformation_llm, code_llm) -> 
         code_llm,
         training_examples,
         num_solutions=num_initial_solutions,
-        enable_visual_cue=enable_visual_cue
+        enable_visual_cue=enable_visual_cue,
+        num_inreasoning_augmentations=num_inreasoning_augmentations,
+        memory_context=memory_context  # Pass memory context
     )
+
+    # After generation, Update memory if using message_history
+    if memory_type == "message_history":
+        # We add the first solution's reasoning as representative history
+        new_state["messages"] = [
+            HumanMessage(content=f"Attempt {state.get('current_loop', 0)}: solve ARC task"),
+            AIMessage(content=reasoning_trace)
+        ]
 
     solutions_list = []
     for transformation, code in zip(transformation_solutions_list, python_codes):
@@ -199,15 +261,23 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
 
     # Deep copy the state to avoid mutating caller's object
     new_state = copy.deepcopy(state)
+    task_data = state["task_data"]
     
+    # Handle preloop randomization: if in preloop mode, generate fresh augmentations
+    num_augmentations = state.get("num_augmentations", 0)
+    mode = state.get("augmentation_randomization_mode", "pretask")
+    if num_augmentations > 0 and mode == "preloop":
+        print(f"Task {tid} [evolve_code_node]: Dynamic augmentation (preloop). Generating {num_augmentations} fresh examples...")
+        new_state['augment_data'] = augment_task_data(task_data, num_augmentations)
+
     # Get necessary variables
-    training_examples = state["task_data"]["train"]
+    training_examples = task_data["train"]
     
-    # Add augmented data if available
-    augment_data = state.get('augment_data')
+    # Add augmented data if available (from new_state in case of preloop update)
+    augment_data = new_state.get('augment_data')
     if augment_data and 'train' in augment_data:
         training_examples = training_examples + augment_data['train']
-        print(f"Task {tid} [evolve_code_node]: Using {len(state['task_data']['train'])} original + {len(augment_data['train'])} augmented = {len(training_examples)} total training examples")
+        print(f"Task {tid} [evolve_code_node]: Using {len(task_data['train'])} original + {len(augment_data['train'])} augmented = {len(training_examples)} total training examples")
     
     enable_visual_cue = state.get("enable_visual_cue", False)
     enable_rag_hint = state.get("enable_rag_hint", False)
@@ -216,7 +286,7 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
     num_solutions_per_refinement = state["num_solutions_per_refinement"]
     num_fusions = state["num_fusions"]
     num_solutions_per_fusion = state["num_solutions_per_fusion"]
-    num_inloop_augmentations = state["num_inloop_augmentations"]
+    num_inreasoning_augmentations = state["num_inreasoning_augmentations"]
 
     # Make a deep copy of the incoming state to avoid mutating caller's object
     new_state["current_loop"] = state.get("current_loop") + 1
@@ -252,10 +322,22 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
     # 3) Sort seed solutions by training success rate then training overlap average (descending)
     # Use safe defaults if fields are missing
     def _sort_key(sol: Dict[str, Any]):
-        return (
-            sol.get("training_success_rate", 0.0),
-            sol.get("training_overlap_average", 0.0),
-        )
+        weight = state.get('augmented_example_weight', 0.5)
+        s_rate = sol.get("training_success_rate", 0.0)
+        a_rate = sol.get("augment_training_success_rate", 0.0)
+        s_overlap = sol.get("training_overlap_average", 0.0)
+        a_overlap = sol.get("augment_training_overlap_average", 0.0)
+        
+        has_augment = sol.get("augment_training_results") is not None and len(sol.get("augment_training_results")) > 0
+        if has_augment:
+            # Combined weighted score
+            weighted_success = (s_rate + a_rate * weight) / (1.0 + weight)
+            weighted_overlap = (s_overlap + a_overlap * weight) / (1.0 + weight)
+        else:
+            weighted_success = s_rate
+            weighted_overlap = s_overlap
+            
+        return (weighted_success, weighted_overlap)
     # Sort by score (descending). If scores are equal, use a random
     # tie-breaker so equal-scoring solutions are ordered randomly.
     seed_solutions.sort(key=lambda s: (_sort_key(s), random.random()), reverse=True)
@@ -265,7 +347,45 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
     fused_solutions: List[Dict[str, Any]] = []
     mutated_solutions: List[Dict[str, Any]] = []
 
+    # NEW: Memory Update for 'summary' mode if we just failures
+    memory_type = state.get("llm_memory_type", "none")
+    if memory_type == "summary":
+        # Extract lessons from previous generation failures
+        prev_sols = state.get("solutions_list", [])
+        if prev_sols:
+            best_prev = max(prev_sols, key=_sort_key)
+            if best_prev.get("training_success_rate", 0.0) < 1.0:
+                summary_prompt = f"""Review the previous failed solution and summarize what was learned.
+                Reasoning: {best_prev.get('reasoning_trace', '')}
+                Success Rate: {best_prev.get('training_success_rate', 0.0):.1%}
+                
+                Keep the summary extremely concise (max 3 bullet points) focusing on what failed and what to try next."""
+                try:
+                    summary_resp = llm.invoke(summary_prompt)
+                    new_summary = f"{state.get('task_memory_summary', '')}\nLoop {state.get('current_loop')}: {summary_resp.content}"
+                    new_state["task_memory_summary"] = new_summary
+                except Exception:
+                    pass
+
     if seed_solutions:
+        # Prepare memory context for fusion/refinement
+        memory_context = ""
+        if memory_type == "message_history":
+            messages = state.get("messages", [])
+            for m in messages:
+                role = "Assistant" if isinstance(m, AIMessage) else "User"
+                memory_context += f"[{role}]: {m.content}\n"
+        elif memory_type == "summary":
+            memory_context = state.get("task_memory_summary", "")
+
+        # NEW: Update message history with best previous results for next step
+        if memory_type == "message_history" and state.get("solutions_list"):
+            best_prev = max(state["solutions_list"], key=_sort_key)
+            new_state["messages"] = [
+                HumanMessage(content=f"Loop {state.get('current_loop', 0)} best result: {best_prev.get('training_success_rate', 0.0):.1%} success"),
+                AIMessage(content=best_prev.get('reasoning_trace', ''))
+            ]
+
         for _ in range(num_fusions):
             sol_arr = []
 
@@ -281,7 +401,8 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
                 num_fused_solutions=num_solutions_per_fusion,
                 enable_visual_cue=enable_visual_cue,
                 enable_rag_hint=enable_rag_hint,
-                num_inloop_augmentations=num_inloop_augmentations)
+                num_inreasoning_augmentations=num_inreasoning_augmentations,
+                memory_context=memory_context) # Pass memory context
 
             for transformation, code in zip(transformation_solutions_list, python_codes):
                 solution = {
@@ -308,6 +429,8 @@ def evolve_code_node(state, llm, transformation_llm, code_llm):
                 num_solutions_per_refinement,
                 enable_visual_cue=enable_visual_cue,
                 enable_rag_hint=enable_rag_hint,
+                num_inreasoning_augmentations=num_inreasoning_augmentations,
+                memory_context=memory_context, # Pass memory context
             )
 
             for transformation, code in zip(transformation_solutions_list, python_codes):
@@ -356,12 +479,13 @@ def test_code_node(state: AgentState, llm, transformation_llm, code_llm) -> Agen
     # Task information
     task_data = new_state.get("task_data", {})
     training_examples = task_data.get("train", [])
+    num_original_train = len(training_examples)
     
     # Add augmented data if available
     augment_data = new_state.get('augment_data')
     if augment_data and 'train' in augment_data:
         training_examples = training_examples + augment_data['train']
-        print(f"Task {tid} [test_code_node]: Using {len(task_data.get('train', []))} original + {len(augment_data['train'])} augmented = {len(training_examples)} total training examples")
+        print(f"Task {tid} [test_code_node]: Using {num_original_train} original + {len(augment_data['train'])} augmented = {len(training_examples)} total training examples")
     
     testing_examples = task_data.get("test", [])
     enable_parallel = new_state.get("enable_parallel_eval", False)
@@ -518,7 +642,7 @@ def test_code_node(state: AgentState, llm, transformation_llm, code_llm) -> Agen
         # Update state: attach result lists and compute statistics
         solution["training_results"] = training_results
         solution["testing_results"] = testing_results
-        calculate_solution_statistics(solution)
+        calculate_solution_statistics(solution, num_original_train=num_original_train)
         solution["evaluated"] = True
 
     # Build the canonical `solutions_list` for this state:
@@ -526,10 +650,22 @@ def test_code_node(state: AgentState, llm, transformation_llm, code_llm) -> Agen
     # 2) for each group in fused_solutions_list (list-of-lists), pick the best solution
     # 3) for each group in mutated_solutions_list (list-of-lists), pick the best solution
     def _sort_key(sol: Dict[str, Any]):
-        return (
-            sol.get("training_success_rate", 0.0),
-            sol.get("training_overlap_average", 0.0),
-        )
+        weight = new_state.get('augmented_example_weight', 0.5)
+        s_rate = sol.get("training_success_rate", 0.0)
+        a_rate = sol.get("augment_training_success_rate", 0.0)
+        s_overlap = sol.get("training_overlap_average", 0.0)
+        a_overlap = sol.get("augment_training_overlap_average", 0.0)
+        
+        has_augment = sol.get("augment_training_results") is not None and len(sol.get("augment_training_results")) > 0
+        if has_augment:
+            # Combined weighted score
+            weighted_success = (s_rate + a_rate * weight) / (1.0 + weight)
+            weighted_overlap = (s_overlap + a_overlap * weight) / (1.0 + weight)
+        else:
+            weighted_success = s_rate
+            weighted_overlap = s_overlap
+            
+        return (weighted_success, weighted_overlap)
 
     assembled_solutions: List[CodeSolution] = []
 

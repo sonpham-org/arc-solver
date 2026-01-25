@@ -10,7 +10,7 @@ import re
 from typing import List, Dict, Optional, Any, Tuple
 
 from .code_generation import extract_python_solutions, ensure_imports_in_code
-from .utilities import format_grid_for_prompt
+from .utilities import format_grid_for_prompt, generate_llm_predicted_output
 from ..schema import ExampleResult
 from agentic.debug import print_prompt_and_response
 
@@ -321,7 +321,6 @@ def evaluate_example(llm,
 
     Returns a result dict compatible with `nodes.test_code_node` usage.
     """
-    from .utilities import generate_llm_predicted_output
     
     # Execute the code only if enabled
     exec_predicted_output = None

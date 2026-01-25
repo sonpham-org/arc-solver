@@ -8,8 +8,6 @@ to maintain backward compatibility with existing imports.
 # Reasoning functions
 from .reasoning import (
     generate_reasoning_trace,
-    generate_reflection_reasoning_trace,
-    generate_fused_reasoning_trace,
     generate_distilled_reasoning,
     extract_reasoning_content,
     extract_reasoning_from_reflection,
@@ -23,13 +21,15 @@ from .transformation import (
 )
 
 # Refinement-specific transformation function
-from .refinement import (
+from .refine import (
     generate_refined_transformation_steps,
+    generate_reflection_reasoning_trace,
 )
 
 # Fusion-specific transformation function
-from .fusion import (
+from .fuse import (
     generate_fused_transformation_steps,
+    generate_fused_reasoning_trace,
 )
 
 # Utility functions for transformations
@@ -55,15 +55,19 @@ from .code_execution import (
     test_and_fix_code_from_trial_run,
 )
 
-# Fusion functions
-from .fusion import (
-    fuse_solutions_with_reasoning,
+# Creation functions
+from .create import (
     create_solutions_with_reasoning,
+)
+
+# Fusion functions
+from .fuse import (
+    fuse_solutions_with_reasoning,
     result_comparison_text,
 )
 
 # Refinement functions
-from .refinement import (
+from .refine import (
     refine_solutions_with_reasoning,
     analyze_failures,
 )

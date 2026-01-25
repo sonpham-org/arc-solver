@@ -272,7 +272,7 @@ def create_initial_state(task_id: str,
         "num_fusions": agent.num_fusions,
         "num_solutions_per_fusion": agent.num_solutions_per_fusion,
         "num_augmentations": agent.num_augmentations,
-        "num_inloop_augmentations": agent.num_inloop_augmentations,
+        "num_inreasoning_augmentations": agent.num_inreasoning_augmentations,
         "num_retries": 0,
         "enable_visual_cue": agent.enable_visual_cue,
         "enable_rag_hint": agent.enable_rag_hint,
@@ -303,7 +303,10 @@ class ARCLangGraphAgent(BaseARCAgent):
                  num_fusions: int = 5,
                  num_solutions_per_fusion: int = 3,
                  num_augmentations: int = 0,
-                 num_inloop_augmentations: int = 0,
+                 num_inreasoning_augmentations: int = 0,
+                 augmentation_randomization_mode: str = "pretask",
+                 augmented_example_weight: float = 0.5,
+                 llm_memory_type: str = "none",
                  enable_parallel_eval: bool = False,
                  enable_code_predict: bool = True,
                  enable_llm_predict: bool = False,
@@ -333,7 +336,9 @@ class ARCLangGraphAgent(BaseARCAgent):
             num_fusions: Number of fusion operations
             num_solutions_per_fusion: Solutions generated per fusion
             num_augmentations: Number of augmented training examples to generate before each task
-            num_inloop_augmentations: Number of augmented examples during each reasoning loop
+            num_inreasoning_augmentations: Number of augmented examples during each reasoning loop
+            augmentation_randomization_mode: Augmentation randomization mode (pretask or preloop)
+            augmented_example_weight: Weight of augmented examples relative to original training examples
             enable_parallel_eval: Whether to parallelize example evaluation
             enable_code_predict: Whether to enable code-predicted outputs
             enable_llm_predict: Whether to enable LLM-predicted outputs
@@ -371,6 +376,11 @@ class ARCLangGraphAgent(BaseARCAgent):
             num_solutions_per_refinement=num_solutions_per_refinement,
             num_fusions=num_fusions,
             num_solutions_per_fusion=num_solutions_per_fusion,
+            num_augmentations=num_augmentations,
+            num_inreasoning_augmentations=num_inreasoning_augmentations,
+            augmentation_randomization_mode=augmentation_randomization_mode,
+            augmented_example_weight=augmented_example_weight,
+            llm_memory_type=llm_memory_type,
             enable_parallel_eval=enable_parallel_eval,
             enable_code_predict=enable_code_predict,
             enable_llm_predict=enable_llm_predict,
@@ -394,7 +404,10 @@ class ARCLangGraphAgent(BaseARCAgent):
         self.num_fusions = num_fusions
         self.num_solutions_per_fusion = num_solutions_per_fusion
         self.num_augmentations = num_augmentations
-        self.num_inloop_augmentations = num_inloop_augmentations
+        self.num_inreasoning_augmentations = num_inreasoning_augmentations
+        self.augmentation_randomization_mode = augmentation_randomization_mode
+        self.augmented_example_weight = augmented_example_weight
+        self.llm_memory_type = llm_memory_type
         self.enable_code_predict = enable_code_predict
         self.enable_llm_predict = enable_llm_predict
         self.enable_parallel_eval = enable_parallel_eval
@@ -438,24 +451,99 @@ class ARCLangGraphAgent(BaseARCAgent):
         
         # Create initial state with custom max_attempts and helper functions
 
-        initial_state = create_initial_state(task_id, task_data, task_folder, self)
+        builder = self._create_default_graph_builder()
+        initial_state = builder.create_initial_state(task_id, task_data, task_folder, task_solution, max_attempts)
         
-        # Propagate runtime flags into the workflow state so nodes can read them
-        initial_state['enable_code_predict'] = bool(self.enable_code_predict)
-        initial_state['enable_llm_predict'] = bool(self.enable_llm_predict)
+        # Configure thread for checkpointer if enabled
+        # Also preserve recursion limit
+        thread_config = {"configurable": {"thread_id": task_id}, "recursion_limit": self.recursion_limit}
+        
+        # Run graph
+        try:
+            # Compiled graph is stored in self.builder.app after first build()
+            if not hasattr(self, 'graph'):
+                self.graph = builder.build()
+                
+            final_state = self.graph.invoke(initial_state, config=thread_config)
+            
+            # Prepare output
+            solutions = final_state.get("solutions_list", [])
+            weight = final_state.get('augmented_example_weight', 0.5)
+            
+            best_idx = None
+            best_weighted_priority = -1.0
+            best_weighted_overlap = -1.0
+            
+            best_priority = -1.0
+            best_overlap = -1.0
+            best_testing_priority = -1.0
+            best_testing_overlap = -1.0
 
-        # New: allow nodes to enable parallelized evaluation
-        initial_state['enable_parallel_eval'] = bool(self.enable_parallel_eval)
+            def compute_scores(entries):
+                if not entries:
+                    return 0.0, 0.0
+                total = len(entries)
+                num_correct = sum(1 for e in entries if bool(e.get('code_success', False)))
+                priority = (num_correct / total) * 100.0 if total > 0 else 0.0
+                matching_entries = [e for e in entries if e.get('matching_size')]
+                if matching_entries:
+                    overlaps = [float(e.get('overlap_percentage', 0.0)) for e in matching_entries]
+                    average = sum(overlaps) / len(overlaps)
+                else:
+                    average = 0.0
+                return priority, average
 
-        # Generation counters for refinement loop
-        initial_state['current_generation'] = int(initial_state.get('current_generation', 0))
-        initial_state['max_generations'] = int(getattr(self, 'max_generations', 0))
+            for idx, solution in enumerate(solutions):
+                s_train = solution.get('training_results') or []
+                s_augment = solution.get('augment_training_results') or []
+                s_test = solution.get('testing_results') or []
+                
+                s_tpriority, s_toverlap = compute_scores(s_train)
+                s_apriority, s_aoverlap = compute_scores(s_augment)
+                s_tepriority, s_teoverlap = compute_scores(s_test)
 
-        # Run the workflow with custom recursion limit
-        final_state = self.workflow.invoke(
-            initial_state,
-            config={"recursion_limit": self.recursion_limit}
-        )
+                if s_augment:
+                    rank_priority = (s_tpriority + s_apriority * weight) / (1.0 + weight)
+                    rank_overlap = (s_toverlap + s_aoverlap * weight) / (1.0 + weight)
+                else:
+                    rank_priority = s_tpriority
+                    rank_overlap = s_toverlap
+
+                if (rank_priority > best_weighted_priority) or (rank_priority == best_weighted_priority and rank_overlap > best_weighted_overlap):
+                    best_idx = idx
+                    best_weighted_priority = rank_priority
+                    best_weighted_overlap = rank_overlap
+                    best_priority = s_tpriority
+                    best_overlap = s_toverlap
+                    best_testing_priority = s_tepriority
+                    best_testing_overlap = s_teoverlap
+
+            return {
+                "task_id": task_id,
+                "workflow_completed": True,
+                "solutions_list": solutions,
+                "highest_solution_index": best_idx,
+                "highest_training_solution_priority_score": best_priority,
+                "highest_training_solution_overlap_score": best_overlap,
+                "highest_testing_solution_priority_score": best_testing_priority,
+                "highest_testing_solution_overlap_score": best_testing_overlap,
+                "num_loops": final_state.get("current_loop", 0),
+                "execution_time": time.time() - start_time
+            }
+        except Exception as e:
+            print(f"Error solving task {task_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "task_id": task_id,
+                "workflow_completed": False,
+                "solutions_list": [],
+                "highest_solution_index": 0,
+                "highest_training_solution_priority_score": 0.0,
+                "highest_training_solution_overlap_score": 0.0,
+                "attempts": 0,
+                "execution_time": time.time() - start_time
+            }
         execution_time = time.time() - start_time
 
         # Print per-generation summary (including the current generation)
@@ -511,11 +599,17 @@ class ARCLangGraphAgent(BaseARCAgent):
 
         # Build WorkflowOutput-compatible dict (matches schema.WorkflowOutput)
         solutions_list = final_state.get("solutions_list", [])
+        weight = final_state.get('augmented_example_weight', 0.5)
+        
         best_idx = None
+        best_weighted_priority = -1.0
+        best_weighted_overlap = -1.0
+        
         best_priority = -1.0
         best_overlap = -1.0
         best_testing_priority = -1.0
         best_testing_overlap = -1.0
+
         def compute_scores(entries):
             if not entries:
                 return 0.0, 0.0
@@ -529,22 +623,32 @@ class ARCLangGraphAgent(BaseARCAgent):
             else:
                 average = 0.0
             return priority, average
-        for idx, solution in enumerate(solutions_list):
 
+        for idx, solution in enumerate(solutions_list):
             s_train = solution.get('training_results') or []
+            s_augment = solution.get('augment_training_results') or []
             s_test = solution.get('testing_results') or []
+            
             s_tpriority, s_toverlap = compute_scores(s_train)
+            s_apriority, s_aoverlap = compute_scores(s_augment)
             s_tepriority, s_teoverlap = compute_scores(s_test)
 
-            rank_priority = s_tpriority
-            rank_overlap = s_toverlap
+            if s_augment:
+                rank_priority = (s_tpriority + s_apriority * weight) / (1.0 + weight)
+                rank_overlap = (s_toverlap + s_aoverlap * weight) / (1.0 + weight)
+            else:
+                rank_priority = s_tpriority
+                rank_overlap = s_toverlap
 
-            if (rank_priority > best_priority) or (rank_priority == best_priority and rank_overlap > best_overlap):
+            if (rank_priority > best_weighted_priority) or (rank_priority == best_weighted_priority and rank_overlap > best_weighted_overlap):
                 best_idx = idx
-                best_priority = rank_priority
-                best_overlap = rank_overlap
+                best_weighted_priority = rank_priority
+                best_weighted_overlap = rank_overlap
+                best_priority = s_tpriority
+                best_overlap = s_toverlap
                 best_testing_priority = s_tepriority
                 best_testing_overlap = s_teoverlap
+        
         output: WorkflowOutput = {
             "task_id": task_id,
             "workflow_completed": True,

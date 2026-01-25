@@ -49,9 +49,6 @@ python run_arc_baseline.py
 # 2. Run LangGraph agent
 python run_langgraph_agent.py
 
-# 3. Run multi-solution LangGraph agent
-python run_multi_solution_langgraph_agent.py
-
 # 4. Run ARC visualizer
 python arc_visualizer.py
 ```

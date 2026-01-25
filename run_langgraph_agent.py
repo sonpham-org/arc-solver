@@ -85,7 +85,7 @@ TASK_INDEX = None  # Task index to test (for single mode)
 
 # Batch mode configuration
 NUM_TASKS = 20  # Number of tasks for batch mode
-EVALUATE_ONLY = True
+EVALUATE_ONLY = False
 
 # Processing configuration
 MAX_ATTEMPTS = 10  # Maximum attempts per task
@@ -106,14 +106,17 @@ VERIFICATION_CONFIDENCE_THRESHOLD = 0.75  # Minimum confidence (0-1) to accept a
 VERIFICATION_NUM_AUGMENTATIONS = 10  # Number of augmented test cases to generate for verification
 
 NUM_INITIAL_SOLUTIONS = 10
-NUM_LOOPS = 1
+NUM_LOOPS = 5
 NUM_SEED_SOLUTIONS = 10
 NUM_REFINEMENTS = 2
 NUM_SOLUTIONS_PER_REFINEMENT = 5
 NUM_FUSIONS = 2
 NUM_SOLUTIONS_PER_FUSION = 5
-NUM_AUGMENTATIONS = 0  # Number of augmented training examples to generate before each task
-NUM_INLOOP_AUGMENTATIONS = 3  # Number of augmented examples to generate during each reasoning loop
+NUM_AUGMENTATIONS = 4  # Number of augmented training examples to generate before each task
+AUGMENTATION_RANDOMIZATION_MODE = "pretask"  # "pretask" or "preloop"
+AUGMENTED_EXAMPLE_WEIGHT = 0.5  # Weight of augmented examples relative to original training examples
+NUM_INREASONING_AUGMENTATIONS = 0  # Number of augmented examples to generate during each reasoning loop
+LLM_MEMORY_TYPE = "none"  # "none", "message_history", "summary", or "checkpointer"
 RECURSION_LIMIT = 50  # LangGraph recursion limit (default is 25, increase for long workflows)
 
 # Year selection for ARC dataset directory (change to 2025 if using 2025 data)
@@ -521,8 +524,14 @@ def calculate_average_score(result: Dict[str, Any]) -> None:
     # If the workflow produced multiple candidate solutions, compute per-solution scores.
     # Each solution is expected to be a dict with `training_results` and `testing_results`.
     solutions = result.get('solutions_list') or []
+    # Try to find weight from result, fallback to a default
+    weight = result.get('augmented_example_weight', 0.5)
+
     if solutions:
         best_idx = None
+        best_weighted_priority = -1.0
+        best_weighted_overlap = -1.0
+        
         best_priority = -1.0
         best_overlap = -1.0
         best_testing_priority = -1.0
@@ -530,23 +539,29 @@ def calculate_average_score(result: Dict[str, Any]) -> None:
 
         for idx, sol in enumerate(solutions):
             s_train = sol.get('training_results') or []
+            s_augment = sol.get('augment_training_results') or []
             s_test = sol.get('testing_results') or []
 
             s_tpriority, s_toverlap = compute_scores(s_train)
+            s_apriority, s_aoverlap = compute_scores(s_augment)
             s_tepriority, s_teoverlap = compute_scores(s_test)
 
-            # Choose the metric for ranking solutions: prefer training priority/overlap,
-            # fall back to testing priority/overlap if training has zero entries.
-            rank_priority = s_tpriority
-            rank_overlap = s_toverlap
+            if s_augment:
+                rank_priority = (s_tpriority + s_apriority * weight) / (1.0 + weight)
+                rank_overlap = (s_toverlap + s_aoverlap * weight) / (1.0 + weight)
+            else:
+                rank_priority = s_tpriority
+                rank_overlap = s_toverlap
 
-            # Compare to current best: priority first, overlap as tiebreaker
-            if (rank_priority > best_priority) or (
-                rank_priority == best_priority and rank_overlap > best_overlap
+            # Compare to current best: weighted priority first, weighted overlap as tiebreaker
+            if (rank_priority > best_weighted_priority) or (
+                rank_priority == best_weighted_priority and rank_overlap > best_weighted_overlap
             ):
                 best_idx = idx
-                best_priority = rank_priority
-                best_overlap = rank_overlap
+                best_weighted_priority = rank_priority
+                best_weighted_overlap = rank_overlap
+                best_priority = s_tpriority
+                best_overlap = s_toverlap
                 best_testing_priority = s_tepriority
                 best_testing_overlap = s_teoverlap
 
@@ -596,6 +611,21 @@ def summarize_and_print_result(result: Dict[str, Any], task_id: Optional[str] = 
             if err_str:
                 line += f"  err='{err_str}'"
             print(line)
+
+        augment_results = solutions_list[hs_idx].get('augment_training_results', [])
+        if augment_results:
+            print(f"    --- Augmented Training Results (weight={result.get('augmented_example_weight', 0.5)}) ---")
+            for i, aug_example in enumerate(augment_results):
+                overlap = aug_example.get('overlap_percentage')
+                matching_size = aug_example.get('matching_size')
+                err = aug_example.get('error_message')
+                ov_str = f"{float(overlap):.1f}%" if overlap is not None else "N/A"
+                ms_str = str(matching_size)
+                err_str = shorten_error(err)
+                line = f"    Augment {i+1}: matching_size={ms_str} overlap={ov_str}"
+                if err_str:
+                    line += f"  err='{err_str}'"
+                print(line)
 
         testing_results = solutions_list[hs_idx].get('testing_results', [])
         for i, test_example in enumerate(testing_results):
@@ -810,8 +840,14 @@ def parse_arguments():
     # Augmentation parameters
     parser.add_argument("--num-augmentations", type=int, default=NUM_AUGMENTATIONS,
                        help=f"Number of augmented training examples to generate before each task (default: {NUM_AUGMENTATIONS})")
-    parser.add_argument("--num-inloop-augmentations", type=int, default=NUM_INLOOP_AUGMENTATIONS,
-                       help=f"Number of augmented examples during each reasoning loop (default: {NUM_INLOOP_AUGMENTATIONS})")
+    parser.add_argument("--augmentation-randomization-mode", type=str, choices=["pretask", "preloop"], default=AUGMENTATION_RANDOMIZATION_MODE,
+                       help=f"Augmentation randomization mode: pretask or preloop (default: {AUGMENTATION_RANDOMIZATION_MODE})")
+    parser.add_argument("--num-inreasoning-augmentations", type=int, default=NUM_INREASONING_AUGMENTATIONS,
+                       help=f"Number of augmented examples during each reasoning loop (default: {NUM_INREASONING_AUGMENTATIONS})")
+    parser.add_argument("--augmented-example-weight", type=float, default=AUGMENTED_EXAMPLE_WEIGHT,
+                       help=f"Weight of augmented examples for scoring (default: {AUGMENTED_EXAMPLE_WEIGHT})")
+    parser.add_argument("--llm-memory-type", type=str, choices=["none", "message_history", "summary", "checkpointer"], default=LLM_MEMORY_TYPE,
+                       help=f"Type of LLM memory: none, message_history, summary, or checkpointer (default: {LLM_MEMORY_TYPE})")
     parser.add_argument("--test-tasks-json", type=str, default=TEST_TASKS_JSON,
                        help=f"Path to test tasks JSON (default: {TEST_TASKS_JSON})")
     parser.add_argument("--use-vllm", action="store_true", default=USE_VLLM,
@@ -1006,7 +1042,9 @@ def main():
         num_fusions=getattr(args, 'num_fusions', NUM_FUSIONS),
         num_solutions_per_fusion=getattr(args, 'num_solutions_per_fusion', NUM_SOLUTIONS_PER_FUSION),
         num_augmentations=getattr(args, 'num_augmentations', NUM_AUGMENTATIONS),
-        num_inloop_augmentations=getattr(args, 'num_inloop_augmentations', NUM_INLOOP_AUGMENTATIONS),
+        num_inreasoning_augmentations=getattr(args, 'num_inreasoning_augmentations', NUM_INREASONING_AUGMENTATIONS),
+        augmented_example_weight=getattr(args, 'augmented_example_weight', AUGMENTED_EXAMPLE_WEIGHT),
+        llm_memory_type=getattr(args, 'llm_memory_type', LLM_MEMORY_TYPE),
         enable_parallel_eval=args.enable_parallel_eval,
         enable_visual_cue=args.enable_visual_cue,
         enable_rag_hint=args.enable_rag_hint,
@@ -1091,7 +1129,8 @@ def main():
                 num_fusions=getattr(args, 'num_fusions', NUM_FUSIONS),
                 num_solutions_per_fusion=getattr(args, 'num_solutions_per_fusion', NUM_SOLUTIONS_PER_FUSION),
                 num_augmentations=getattr(args, 'num_augmentations', NUM_AUGMENTATIONS),
-                num_inloop_augmentations=getattr(args, 'num_inloop_augmentations', NUM_INLOOP_AUGMENTATIONS),
+                num_inreasoning_augmentations=getattr(args, 'num_inreasoning_augmentations', NUM_INREASONING_AUGMENTATIONS),
+                augmented_example_weight=getattr(args, 'augmented_example_weight', AUGMENTED_EXAMPLE_WEIGHT),
                 enable_parallel_eval=args.enable_parallel_eval,
                 enable_visual_cue=args.enable_visual_cue,
                 enable_rag_hint=args.enable_rag_hint,

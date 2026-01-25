@@ -8,6 +8,8 @@ throughout the LangGraph workflow for ARC problem solving.
 from dataclasses import dataclass
 from typing import TypedDict, List, Dict, Any, Optional, Union, Annotated
 from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
 
 # Define a reducer that takes the first value (for immutable fields)
 def take_first(left, right):
@@ -68,6 +70,12 @@ class CodeSolution(TypedDict):
     training_success_rate: float
     training_overlap_average: float
     training_error_rate: float
+
+    augment_training_results: Optional[List[ExampleResult]]
+    augment_training_success_rate: Optional[float]
+    augment_training_overlap_average: Optional[float]
+    augment_training_error_rate: Optional[float]
+
     llm_training_success_rate: float
     llm_training_overlap_average: float
     testing_results: List[ExampleResult]
@@ -100,6 +108,11 @@ class AgentState(TypedDict):
     # Augmented training data (created during setup if num_augmentations > 0)
     augment_data: Optional[Dict[str, Any]]
 
+    # Task persistent memory
+    messages: Annotated[List[BaseMessage], add_messages]
+    task_memory_summary: str
+    llm_memory_type: Annotated[str, take_latest]
+
     # Runtime visual flag: prefer the latest provided value (allow agent to set)
     enable_visual_cue: Annotated[bool, take_latest]
     
@@ -109,8 +122,10 @@ class AgentState(TypedDict):
     mutated_solutions_list: Optional[List[List[CodeSolution]]]
     solutions_list: Optional[List[CodeSolution]]
 
-    # Evolulionary test time compute metrics
+    # Loop counter
     current_loop: int
+
+    # Arguments
     num_initial_solutions: Annotated[Optional[int], take_latest]
     num_loops: Annotated[Optional[int], take_latest]
     num_seed_solutions: Annotated[Optional[int], take_latest]
@@ -119,10 +134,10 @@ class AgentState(TypedDict):
     num_fusions: Annotated[Optional[int], take_latest]
     num_solutions_per_fusion: Annotated[Optional[int], take_latest]
     num_retries: int
-    
-    # Augmentation parameters
     num_augmentations: Annotated[Optional[int], take_latest]
-    num_inloop_augmentations: Annotated[Optional[int], take_latest]
+    num_inreasoning_augmentations: Annotated[Optional[int], take_latest]
+    augmentation_randomization_mode: Annotated[Optional[str], take_latest]
+    augmented_example_weight: Annotated[Optional[float], take_latest]
 
     # Generations of mutated solutions
     current_generation: Annotated[Optional[int], take_latest]

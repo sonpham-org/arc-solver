@@ -47,6 +47,13 @@ MODEL_CONFIGS: Dict[str, Dict[str, object]] = {
         "pricing": {"input_per_m": 2.00, "output_per_m": 12.00},
         "hf_model": None,
     },
+    # Gemini 3 Flash (fast newer generation)
+    "gemini-3-flash-preview": {
+        "provider": "google",
+        "description": "Gemini 3 Flash (fast multimodal)",
+        "pricing": {"input_per_m": 0.35, "output_per_m": 2.80},
+        "hf_model": None,
+    },
     # Gemini 2.0 Flash
     "gemini-2.0-flash": {
         "provider": "google",

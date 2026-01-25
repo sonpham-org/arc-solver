@@ -4,6 +4,7 @@ Pure utility functions for ARC agent.
 
 import re
 import json
+import io
 from typing import List, Dict, Optional, Any, Tuple
 from agentic.debug import print_prompt_and_response
 
@@ -107,7 +108,6 @@ def _grid_to_image_bytes(grid: List[List[int]], cell_size: int = 24, padding: in
             y1 = y0 + cell_size - 1
             draw.rectangle([x0, y0, x1, y1], fill=color, outline=(100, 100, 100))
 
-    import io
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     return buf.getvalue()

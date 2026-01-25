@@ -8,6 +8,7 @@ workflow with multiple loops of solution generation, refinement, and fusion.
 import os
 from typing import Dict, Any
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 
 from .base import BaseGraphBuilder
 from ..schema import AgentState
@@ -100,7 +101,9 @@ def setup_node(state):
                     "num_fusions": state.get('num_fusions'),
                     "num_solutions_per_fusion": state.get('num_solutions_per_fusion'),
                     "num_augmentations": state.get('num_augmentations'),
-                    "num_inloop_augmentations": state.get('num_inloop_augmentations'),
+                    "num_inreasoning_augmentations": state.get('num_inreasoning_augmentations'),
+                    "augmentation_randomization_mode": state.get('augmentation_randomization_mode'),
+                    "llm_memory_type": state.get('llm_memory_type'),
                     "max_generations": state.get('max_generations'),
                 }
                 state.clear()
@@ -116,14 +119,15 @@ def setup_node(state):
         print(f"[setup_node] Error during setup: {e}")
         state['_resumed_from_latest'] = False
     
-    # Generate augmented data if num_augmentations > 0 and not resuming
+    # Generate augmented data if num_augmentations > 0 and not resuming and mode is "pretask"
     if not state.get('_resumed_from_latest'):
         num_augmentations = state.get('num_augmentations', 0)
-        if num_augmentations > 0:
+        mode = state.get('augmentation_randomization_mode', "pretask")
+        if num_augmentations > 0 and mode == "pretask":
             try:
                 task_data = state.get('task_data')
                 if task_data and 'train' in task_data:
-                    print(f"[setup_node] Generating {num_augmentations} augmented training examples...")
+                    print(f"[setup_node] [pretask] Generating {num_augmentations} augmented training examples...")
                     augment_data = augment_task_data(task_data, num_augmentations)
                     state['augment_data'] = augment_data
                     print(f"[setup_node] Created {len(augment_data.get('train', []))} augmented examples")
@@ -223,7 +227,11 @@ class EvolutionaryGraphBuilder(BaseGraphBuilder):
             "verify_solutions": "verify_solutions"
         })
         
-        return workflow.compile()
+        # Add checkpointer if memory_type is 'checkpointer'
+        memory_type = self.get_config_param('llm_memory_type', "none")
+        checkpointer = MemorySaver() if memory_type == "checkpointer" else None
+        
+        return workflow.compile(checkpointer=checkpointer)
     
     def create_initial_state(self,
                            task_id: str,
@@ -259,6 +267,13 @@ class EvolutionaryGraphBuilder(BaseGraphBuilder):
             "num_solutions_per_refinement": self.get_config_param('num_solutions_per_refinement', 3),
             "num_fusions": self.get_config_param('num_fusions', 5),
             "num_solutions_per_fusion": self.get_config_param('num_solutions_per_fusion', 3),
+            "num_augmentations": self.get_config_param('num_augmentations', 3),
+            "num_inreasoning_augmentations": self.get_config_param('num_inreasoning_augmentations', 0),
+            "augmentation_randomization_mode": self.get_config_param('augmentation_randomization_mode', "pretask"),
+            "augmented_example_weight": self.get_config_param('augmented_example_weight', 0.5),
+            "llm_memory_type": self.get_config_param('llm_memory_type', "none"),
+            "messages": [],
+            "task_memory_summary": "",
             "num_retries": 0,
             "enable_visual_cue": self.get_config_param('enable_visual_cue', False),
             "enable_rag_hint": self.get_config_param('enable_rag_hint', False),
